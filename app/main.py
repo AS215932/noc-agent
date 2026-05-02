@@ -1,4 +1,5 @@
 import sys
+import os
 from fastapi import FastAPI, BackgroundTasks, Request
 from pydantic import BaseModel
 import uvicorn
@@ -10,11 +11,13 @@ from app.tools.mcp_client import HyruleMCPClient
 
 # Global client
 mcp_client = None
+xo_mcp_client = None
 
 # Standard context manager for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mcp_client
+    global xo_mcp_client
     print("NOC Agent starting up...")
     
     # Path to the actual MCP server script. Depending on the environment, we run the python module.
@@ -38,10 +41,41 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Failed to connect to MCP: {e}")
 
+    # ===== XOA MCP Integration =====
+    xo_cmd = ["npx", "-y", "@xen-orchestra/mcp"]
+    xo_mcp_client = HyruleMCPClient(xo_cmd)
+    
+    # We patch the client connect to use custom environment variables for xo_env
+    # Defaults provided - in production this handles credentials for Xen Orchestra.
+    original_env = os.environ.copy()
+    if 'XO_URL' not in os.environ:
+        os.environ['XO_URL'] = 'https://xoa.as215932.net'
+    
+    # Expose write operations like EmergencyShutdownPool, HardShutdownVm, etc.
+    if 'XO_MCP_ENABLE_ACTIONS' not in os.environ:
+        os.environ['XO_MCP_ENABLE_ACTIONS'] = '1'
+
+    try:
+        await xo_mcp_client.connect()
+        xo_tools = await xo_mcp_client.get_tools()
+        for t in xo_tools:
+            noc_triage_agent._function_toolset.add_tool(t)
+            print(f"Loaded XO MCP Tool: {t.name}")
+    except Exception as e:
+        print(f"Warning: Failed to connect to Xen Orchestra MCP: {e}")
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+
     yield
     
     if mcp_client:
         await mcp_client.disconnect()
+    
+    if xo_mcp_client:
+        await xo_mcp_client.disconnect()
+
+    print("NOC Agent shutting down...")
     print("NOC Agent shutting down...")
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
