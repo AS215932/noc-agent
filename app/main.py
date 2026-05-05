@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from app.agent import noc_triage_agent
 from app.discord import send_discord_notification
+from app.mail import process_mailbox_once
 from app.tools.mcp_client import HyruleMCPClient
 
 # Global client
@@ -19,6 +20,11 @@ async def lifespan(app: FastAPI):
     global mcp_client
     global xo_mcp_client
     print("NOC Agent starting up...")
+
+    if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
+        yield
+        print("NOC Agent shutting down...")
+        return
     
     # Path to the actual MCP server script. Depending on the environment, we run the python module.
     # To run locally we'll point to our Dev/hyrule-mcp folder.
@@ -92,6 +98,10 @@ class AlertManagerPayload(BaseModel):
     groupKey: str
     truncatedAlerts: int = 0
 
+class MailPollResponse(BaseModel):
+    status: str
+    message: str
+
 async def investigate_alert(alert_payload: dict, model=None):
     print(f"Starting investigation for alert: {alert_payload.get('status')} - {alert_payload.get('groupLabels')}")
     
@@ -146,6 +156,14 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
     # Run the investigation in the background to avoid blocking the webhook response
     background_tasks.add_task(investigate_alert, payload.model_dump())
     return {"status": "accepted", "message": "Alert received and agent triggered"}
+
+@app.post("/mail/poll", response_model=MailPollResponse)
+async def poll_mailbox(background_tasks: BackgroundTasks):
+    """
+    Poll the shared NOC mailbox and store draft replies for human approval.
+    """
+    background_tasks.add_task(process_mailbox_once)
+    return {"status": "accepted", "message": "Mailbox poll queued; drafts require human approval"}
 
 @app.get("/health")
 async def health_check():

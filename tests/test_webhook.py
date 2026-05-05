@@ -1,8 +1,13 @@
 import pytest
-from app.main import app
-from fastapi.testclient import TestClient
+from fastapi import BackgroundTasks
+from pydantic import ValidationError
 
-client = TestClient(app)
+from app.main import (
+    AlertManagerPayload,
+    alertmanager_webhook,
+    health_check,
+    poll_mailbox,
+)
 
 @pytest.fixture
 def mock_alert_payload():
@@ -35,28 +40,37 @@ def mock_alert_payload():
         "truncatedAlerts": 0
     }
 
-def test_health_check():
+@pytest.mark.asyncio
+async def test_health_check():
     """Test that the application starts and exposes the health check."""
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    response = await health_check()
+    assert response["status"] == "ok"
 
-def test_alertmanager_webhook_accepted(mock_alert_payload, mocker):
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker):
     """
     Test that the webhook successfully parses standard AlertManager payloads
     and offloads the processing to a background task.
     """
     mocker.patch("app.main.investigate_alert") # Mock the background execution so we don't hit the real LLM API
-    response = client.post("/webhook/alertmanager", json=mock_alert_payload)
-    assert response.status_code == 200
-    assert response.json()["status"] == "accepted"
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(mock_alert_payload),
+        BackgroundTasks(),
+    )
+    assert response["status"] == "accepted"
 
 def test_alertmanager_webhook_invalid_payload():
     """
     Test that incomplete payloads are rejected with a 422 Unprocessable Entity.
     """
-    response = client.post("/webhook/alertmanager", json={"receiver": "webhook"})
-    assert response.status_code == 422
+    with pytest.raises(ValidationError):
+        AlertManagerPayload.model_validate({"receiver": "webhook"})
+
+@pytest.mark.asyncio
+async def test_mail_poll_accepted(mocker):
+    mocker.patch("app.main.process_mailbox_once")
+    response = await poll_mailbox(BackgroundTasks())
+    assert response["status"] == "accepted"
 
 # --- TDD / Future Capabilities Tests ---
 

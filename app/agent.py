@@ -17,11 +17,21 @@ class ActionPlan(BaseModel):
     automated_actions_proposed: list[str] = Field(description="Steps the agent will take to resolve or mitigate the issue")
     human_escalation_reason: str | None = Field(default=None, description="Reason for escalating to a human, if applicable")
 
+class MailDraftPlan(BaseModel):
+    classification: str = Field(description="Operational category such as noc, abuse, peering, dh, billing, or unknown")
+    urgency: str = Field(description="Urgency of the message: HIGH, MEDIUM, or LOW")
+    summary: str = Field(description="Short operational summary of the inbound email")
+    requires_human: bool = Field(default=True, description="Always true for v1 draft-and-approve handling")
+    suggested_reply_subject: str = Field(description="Subject line for the draft response")
+    suggested_reply_body: str = Field(description="Plain-text draft response for human review")
+    internal_notes: list[str] = Field(default_factory=list, description="Notes for the operator reviewing the draft")
+
 # NOC Triage Agent
 # Evaluates alerts and metrics to diagnose issues and form a plan.
 noc_triage_agent = Agent(
     'google-gla:gemini-3.1-pro',
     output_type=ActionPlan,
+    defer_model_check=True,
     system_prompt=(
         "You are an expert Senior NOC Engineer for AS215932, a modern ISP. "
         "Your mission is to autonomously triage, diagnose, and resolve network and infrastructure alerts. "
@@ -29,5 +39,21 @@ noc_triage_agent = Agent(
         "When an alert comes in, analyze the context, use tools to gather telemetry, form a diagnosis, and decide on an ActionPlan. "
         "If you are confident (>0.85) and the required actions are safe (e.g., restarting a stranded service, clearing caches), you can propose automated fixes. "
         "If the issue is highly destructive, complex, or you have low confidence, you MUST escalate to a human engineer."
+    )
+)
+
+noc_mail_agent = Agent(
+    'google-gla:gemini-3.1-pro',
+    output_type=MailDraftPlan,
+    defer_model_check=True,
+    system_prompt=(
+        "You are the AS215932 operational email assistant. "
+        "You handle mail sent to noc@as215932.net, abuse@as215932.net, "
+        "peering@as215932.net, and dh@as215932.net. "
+        "Classify the email, summarize what is being requested, and draft a concise professional reply. "
+        "Do not claim that an action was completed unless the email context proves it. "
+        "For abuse reports, preserve evidence references and avoid admitting liability. "
+        "For peering requests, ask for or confirm ASN, PeeringDB, locations, sessions, and max-prefix details as needed. "
+        "For v1, every response MUST require human approval and MUST NOT be sent automatically."
     )
 )
