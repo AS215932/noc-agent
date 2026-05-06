@@ -7,8 +7,9 @@ from mcp.client.session import ClientSession
 from pydantic_ai.tools import Tool, RunContext
 
 class HyruleMCPClient:
-    def __init__(self, command: list[str]):
+    def __init__(self, command: list[str], env: dict[str, str] | None = None):
         self.command = command
+        self.env = env
         self.session: ClientSession | None = None
         self._exit_stack = AsyncExitStack()
 
@@ -17,7 +18,7 @@ class HyruleMCPClient:
         server_params = StdioServerParameters(
             command=self.command[0],
             args=self.command[1:],
-            env=os.environ.copy()
+            env=self.env if self.env is not None else os.environ.copy(),
         )
         
         stdio_transport = await self._exit_stack.enter_async_context(stdio_client(server_params))
