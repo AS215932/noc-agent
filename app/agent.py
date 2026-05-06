@@ -28,8 +28,10 @@ class MailDraftPlan(BaseModel):
 
 # NOC Triage Agent
 # Evaluates alerts and metrics to diagnose issues and form a plan.
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "google-gla:gemini-3.1-pro")
+
 noc_triage_agent = Agent(
-    'google-gla:gemini-3.1-pro',
+    AGENT_MODEL,
     output_type=ActionPlan,
     defer_model_check=True,
     system_prompt=(
@@ -43,7 +45,7 @@ noc_triage_agent = Agent(
 )
 
 noc_mail_agent = Agent(
-    'google-gla:gemini-3.1-pro',
+    AGENT_MODEL,
     output_type=MailDraftPlan,
     defer_model_check=True,
     system_prompt=(
