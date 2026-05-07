@@ -207,7 +207,7 @@ async def test_tool_runner_swallows_exceptions_into_text():
     result = await tool.function(host="h", command="c")
 
     assert "MCP tool execution failed" in result
-    assert "connection reset" in result
+    assert "connection reset" not in result
 
 
 # --- get_tools wiring ---------------------------------------------------------

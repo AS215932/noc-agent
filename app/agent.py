@@ -58,10 +58,12 @@ import imaplib
 import time
 from email.message import EmailMessage
 from app.discord import notify_start, notify_finish
+from app.model_config import build_agent_model
+from app.safe_errors import classify_exception, log_exception
 
 # NOC Triage Agent
 # Evaluates alerts and metrics to diagnose issues and form a plan.
-AGENT_MODEL = os.environ.get("AGENT_MODEL", "google-gla:gemini-3.1-pro")
+AGENT_MODEL = build_agent_model()
 
 noc_triage_agent = Agent(
     AGENT_MODEL,
@@ -108,8 +110,15 @@ async def create_email_draft(ctx: RunContext, to_address: str, subject: str, tex
         else:
             return "Failed to save draft: MAIL_IMAP_PASSWORD not provided."
     except Exception as e:
-        await notify_finish("Email Drafting", f"Failed saving draft: {e}", is_error=True)
-        return f"Failed to save IMAP draft: {e}"
+        safe = classify_exception(e)
+        log_exception("email_draft_save_failed", e, category=safe.category, provider=safe.provider)
+        await notify_finish(
+            "Email Drafting",
+            safe.discord_description("Email draft storage"),
+            is_error=True,
+            safe_category=safe.category,
+        )
+        return "Failed to save IMAP draft: infrastructure issue. A human operator should review mail health."
 
 noc_mail_agent = Agent(
     AGENT_MODEL,

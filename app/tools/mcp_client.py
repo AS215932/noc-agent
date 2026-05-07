@@ -6,6 +6,8 @@ from mcp.client.stdio import StdioServerParameters
 from mcp.client.session import ClientSession
 from pydantic_ai.tools import Tool
 
+from app.safe_errors import classify_exception, log_exception
+
 EMPTY_OBJECT_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 
 
@@ -72,7 +74,9 @@ class HyruleMCPClient:
                         out += block.text + "\n"
                 return out.strip() if out else "Executed successfully."
             except Exception as e:
-                return f"MCP tool execution failed: {str(e)}"
+                safe = classify_exception(e)
+                log_exception("mcp_tool_execution_failed", e, category=safe.category, tool=mcp_tool.name)
+                return "MCP tool execution failed because a diagnostic backend is unavailable. Ask the operator to verify `/health/mcp`."
 
         tool_runner.__name__ = mcp_tool.name
         tool_runner.__doc__ = mcp_tool.description

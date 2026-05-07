@@ -105,7 +105,8 @@ async def test_health_mail_reports_failures(mocker):
     response = await health_mail(http_response)
 
     assert response["status"] == "degraded"
-    assert "bad imap" in response["error"]
+    assert "infrastructure issue" in response["error"]
+    assert "bad imap" not in response["error"]
     assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
 @pytest.mark.asyncio

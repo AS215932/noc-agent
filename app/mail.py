@@ -12,6 +12,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from app.agent import MailDraftPlan, noc_mail_agent
+from app.model_metrics import record_failure, record_success, start_run
+from app.safe_errors import classify_exception, log_exception
 
 
 ROLE_ADDRESSES = {
@@ -127,8 +129,16 @@ async def draft_reply_for_message(message: InboundMail, model=None) -> StoredDra
         f"Subject: {message.subject}\n"
         f"Body:\n{message.text_body}"
     )
-    result = await noc_mail_agent.run(prompt, model=model)
-    plan = result.data if hasattr(result, "data") else result.output
+    run_started = start_run("mail")
+    try:
+        result = await noc_mail_agent.run(prompt, model=model)
+        plan = result.data if hasattr(result, "data") else result.output
+        record_success("mail", run_started, result)
+    except Exception as exc:
+        safe = classify_exception(exc)
+        record_failure("mail", run_started, safe)
+        log_exception("mail_draft_model_failed", exc, category=safe.category, provider=safe.provider, model=safe.model_name)
+        raise
     plan.requires_human = True
 
     draft_id = _draft_id(message)
@@ -160,7 +170,8 @@ def _save_draft_to_imap(draft: StoredDraft, settings: MailSettings):
             client.login(settings.imap_user, settings.imap_password)
             client.append("Drafts", r"(\Draft \Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
     except Exception as e:
-        print(f"Failed to save IMAP draft: {e}")
+        safe = classify_exception(e)
+        log_exception("mail_imap_draft_save_failed", e, category=safe.category)
 
 def store_draft(draft: StoredDraft, settings: MailSettings) -> Path:
     path = Path(settings.draft_dir)
@@ -191,7 +202,14 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
             await notify_finish("Mailbox Poll", "No new messages.", level=Verbosity.DEBUG)
         return drafts
     except Exception as e:
-        await notify_finish("Mailbox Poll", f"Error: {e}", is_error=True)
+        safe = classify_exception(e)
+        log_exception("mailbox_poll_failed", e, category=safe.category)
+        await notify_finish(
+            "Mailbox Poll",
+            safe.discord_description("Mailbox polling"),
+            is_error=True,
+            safe_category=safe.category,
+        )
         raise
 
 

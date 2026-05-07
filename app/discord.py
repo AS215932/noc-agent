@@ -3,6 +3,9 @@ import httpx
 from typing import Any
 import enum
 
+from app.model_metrics import record_sanitized_discord_failure
+from app.safe_errors import classify_exception, log_exception
+
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 class Verbosity(enum.IntEnum):
@@ -42,7 +45,8 @@ async def send_discord_notification(title: str, description: str, color: int = 0
             response = await client.post(DISCORD_WEBHOOK_URL, json=payload)
             response.raise_for_status()
         except httpx.HTTPError as e:
-            print(f"Error sending Discord notification: {e}")
+            safe = classify_exception(e)
+            log_exception("discord_notification_failed", e, category=safe.category)
 
 async def notify_start(task_name: str, description: str):
     await send_discord_notification(
@@ -52,7 +56,15 @@ async def notify_start(task_name: str, description: str):
         level=Verbosity.DEBUG
     )
 
-async def notify_finish(task_name: str, description: str, is_error: bool = False, level: Verbosity | None = None):
+async def notify_finish(
+    task_name: str,
+    description: str,
+    is_error: bool = False,
+    level: Verbosity | None = None,
+    safe_category: str | None = None,
+):
+    if is_error:
+        record_sanitized_discord_failure(safe_category or "unknown_infrastructure")
     level = level or (Verbosity.ERROR if is_error else Verbosity.INFO)
     await send_discord_notification(
         title=f"{'❌ Failed' if is_error else '✅ Finished'}: {task_name}",

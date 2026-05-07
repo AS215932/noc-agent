@@ -10,6 +10,11 @@ from contextlib import asynccontextmanager, suppress
 from app.agent import noc_triage_agent, noc_mail_agent
 from app.discord import send_discord_notification, notify_start, notify_finish
 from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
+from app.model_config import load_model_config
+from app.model_metrics import STATE as MODEL_STATE
+from app.model_metrics import metrics_response, record_failure, record_success, start_run
+from app.quota import check_gemini_quota
+from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.tools.mcp_client import HyruleMCPClient
 
 mcp_client = None
@@ -56,7 +61,8 @@ async def _mail_poll_loop(lock_fd: int):
             try:
                 await process_mailbox_once()
             except Exception as e:
-                print(f"Error in mail poll loop: {e}")
+                safe = classify_exception(e)
+                log_exception("mail_poll_loop_failed", e, category=safe.category)
             await asyncio.sleep(300)
     finally:
         _release_mail_poller_lock(lock_fd)
@@ -79,7 +85,8 @@ async def lifespan(app: FastAPI):
                 noc_triage_agent._function_toolset.add_tool(t)
                 print(f"Loaded MCP Tool: {t.name}")
         except Exception as e:
-            print(f"Warning: Failed to connect to hyrule-mcp: {e}")
+            safe = classify_exception(e)
+            log_exception("hyrule_mcp_connect_failed", e, category=safe.category)
 
         xo_cmd = shlex.split(os.environ["XO_MCP_CMD"])
         xo_env = os.environ.copy()
@@ -93,7 +100,8 @@ async def lifespan(app: FastAPI):
                 noc_triage_agent._function_toolset.add_tool(t)
                 print(f"Loaded XO MCP Tool: {t.name}")
         except Exception as e:
-            print(f"Warning: Failed to connect to Xen Orchestra MCP: {e}")
+            safe = classify_exception(e)
+            log_exception("xo_mcp_connect_failed", e, category=safe.category)
 
     if os.getenv("MAIL_IMAP_PASSWORD"):
         mail_poller_lock_fd = _try_acquire_mail_poller_lock()
@@ -315,12 +323,28 @@ async def investigate_alert(alert_payload: dict, model=None):
     await notify_start(f"NOC Triage: Alert from {title_source}", "Initializing investigation and collecting telemetry...")
 
     prompt = f"We received the following Prometheus AlertManager payload. Please investigate.\n\nPayload: {alert_payload}"
+    run_started = start_run("triage")
     try:
         result = await noc_triage_agent.run(prompt, model=model)
         plan = result.data if hasattr(result, 'data') else result.output
+        record_success("triage", run_started, result)
     except Exception as e:
-        await notify_finish(f"NOC Triage: Alert from {title_source}", f"Investigation failed with error: {e}", is_error=True)
-        raise
+        safe = classify_exception(e)
+        record_failure("triage", run_started, safe)
+        log_exception(
+            "noc_triage_failed",
+            e,
+            category=safe.category,
+            provider=safe.provider,
+            model=safe.model_name,
+        )
+        await notify_finish(
+            f"NOC Triage: Alert from {title_source}",
+            safe.discord_description("NOC triage"),
+            is_error=True,
+            safe_category=safe.category,
+        )
+        return
 
     print("\n[INVESTIGATION COMPLETE]")
     print(f"Summary: {plan.diagnosis.issue_summary}")
@@ -423,12 +447,22 @@ async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
     """Run an arbitrary task on the NOC Triage agent (e.g. 'Draft email to LocIX')."""
     async def _run_task():
         await notify_start("Manual Task", f"Task: {request.prompt}")
+        run_started = start_run("manual_task")
         try:
             result = await noc_triage_agent.run(request.prompt)
             plan = result.data if hasattr(result, 'data') else result.output
+            record_success("manual_task", run_started, result)
             await notify_finish("Manual Task", f"Task completed: {plan.diagnosis.issue_summary}")
         except Exception as e:
-            await notify_finish("Manual Task", f"Task failed: {e}", is_error=True)
+            safe = classify_exception(e)
+            record_failure("manual_task", run_started, safe)
+            log_exception("manual_task_failed", e, category=safe.category, provider=safe.provider, model=safe.model_name)
+            await notify_finish(
+                "Manual Task",
+                safe.discord_description("Manual task"),
+                is_error=True,
+                safe_category=safe.category,
+            )
 
     background_tasks.add_task(_run_task)
     return {"status": "accepted", "message": "Task queued"}
@@ -469,15 +503,41 @@ async def health_config(response: Response):
     }
 
 
+@app.get("/health/model")
+async def health_model(response: Response):
+    config = load_model_config()
+    quota = check_gemini_quota()
+    health = MODEL_STATE.health()
+    if quota.status == "degraded":
+        health["status"] = "degraded"
+    if health["status"] != "ok":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        **health,
+        "primary_model": config.primary_model,
+        "fallback_models": config.fallback_models,
+        "quota_monitoring": quota.status,
+        "quota": quota.health_value(),
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    check_gemini_quota()
+    body, content_type = metrics_response()
+    return Response(content=body, media_type=content_type)
+
+
 @app.get("/health/mail")
 async def health_mail(response: Response):
     try:
         return check_mailbox_connection()
     except Exception as e:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        log_exception("mail_health_failed", e, category=classify_exception(e).category)
         return {
             "status": "degraded",
-            "error": str(e),
+            "error": safe_health_error(e),
         }
 
 
