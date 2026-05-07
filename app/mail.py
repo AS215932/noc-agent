@@ -142,23 +142,55 @@ async def draft_reply_for_message(message: InboundMail, model=None) -> StoredDra
     )
 
 
-def store_draft(draft: StoredDraft, draft_dir: str) -> Path:
-    path = Path(draft_dir)
+def _save_draft_to_imap(draft: StoredDraft, settings: MailSettings):
+    from email.message import EmailMessage
+    import time
+
+    msg = EmailMessage()
+    # If drafting reply, From should be us, To should be them. But here it's meant to be a Draft in our box.
+    msg["From"] = "noc@as215932.net"
+    msg["To"] = draft.sender # the original sender we are replying to
+    msg["Subject"] = draft.plan.suggested_reply_subject
+    msg.set_content(draft.plan.suggested_reply_body)
+
+    try:
+        with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port) as client:
+            client.login(settings.imap_user, settings.imap_password)
+            client.append("Drafts", r"(\Draft \Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+    except Exception as e:
+        print(f"Failed to save IMAP draft: {e}")
+
+def store_draft(draft: StoredDraft, settings: MailSettings) -> Path:
+    path = Path(settings.draft_dir)
     path.mkdir(parents=True, exist_ok=True)
     draft_path = path / f"{draft.draft_id}.json"
     draft_path.write_text(draft.model_dump_json(indent=2) + "\n")
+    if settings.imap_password:
+        _save_draft_to_imap(draft, settings)
     return draft_path
 
-
 async def process_mailbox_once(settings: MailSettings | None = None, model=None) -> list[StoredDraft]:
+    from app.discord import notify_start, notify_finish
+
     settings = settings or MailSettings.from_env()
-    messages = fetch_unseen_messages(settings)
-    drafts: list[StoredDraft] = []
-    for message in messages:
-        draft = await draft_reply_for_message(message, model=model)
-        store_draft(draft, settings.draft_dir)
-        drafts.append(draft)
-    return drafts
+    await notify_start("Mailbox Poll", "Checking for new NOC email...")
+
+    try:
+        messages = fetch_unseen_messages(settings)
+        drafts: list[StoredDraft] = []
+        for message in messages:
+            draft = await draft_reply_for_message(message, model=model)
+            store_draft(draft, settings)
+            drafts.append(draft)
+
+        await notify_finish(
+            "Mailbox Poll",
+            f"Processed {len(messages)} messages, created {len(drafts)} drafts." if messages else "No new messages."
+        )
+        return drafts
+    except Exception as e:
+        await notify_finish("Mailbox Poll", f"Error: {e}", is_error=True)
+        raise
 
 
 def _extract_text_body(message: Message) -> str:

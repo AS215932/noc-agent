@@ -4,10 +4,12 @@ from pydantic import ValidationError
 
 from app.main import (
     AlertManagerPayload,
+    _triage_fields,
     alertmanager_webhook,
     health_check,
     poll_mailbox,
 )
+from app.agent import ActionPlan
 
 @pytest.fixture
 def mock_alert_payload():
@@ -92,15 +94,33 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     
     # Run the test directly overriding the model logic for the scope of the method call
     await investigate_alert(mock_alert_payload, model=TestModel())
-        
+
     mock_discord.assert_called_once()
     args, kwargs = mock_discord.call_args
-    assert "NOC Triage:" in kwargs["title"]
+    assert "Detailed Report:" in kwargs["title"]
+
+def test_triage_fields_turn_internal_schema_failure_into_operator_guidance(mock_alert_payload):
+    plan = ActionPlan.model_validate({
+        "issue_summary": "node_exporter unreachable on rtr1",
+        "root_cause_analysis": "Prometheus has stopped scraping node_exporter.",
+        "confidence_score": 0.6,
+        "severity": "HIGH",
+        "requires_human": True,
+        "human_escalation_reason": "Unable to execute diagnostic SSH commands or Prometheus queries due to an internal system schema limitation.",
+    })
+
+    fields = _triage_fields(plan, mock_alert_payload)
+    action_plan = next(field["value"] for field in fields if field["name"] == "Action Plan")
+
+    assert "internal system schema limitation" not in action_plan
+    assert "Live diagnostics were not completed" in action_plan
+    assert "up{instance=\"rtr1.as215932.net:9100\"}" in action_plan
+    assert "systemctl status node_exporter" in action_plan
 
 @pytest.mark.asyncio
-async def test_webhook_triggers_prometheus_mcp_client(mocker):
+async def test_agent_uses_mcp_tools(mocker):
     """
-    [TDD Goal] The background task should eventually initialize the MCP client
+    [TDD Goal] The agent needs to be able to connect to hyrule-mcp via its command,
     and expose the hyrule-mcp tools to the Pydantic AI agent before running it.
     """
     # TODO: Implement MCP Context load in main.py and mock the load function

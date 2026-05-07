@@ -35,7 +35,9 @@ async def test_draft_reply_requires_human_approval(tmp_path):
     )
 
     draft = await draft_reply_for_message(message, model=TestModel())
-    path = store_draft(draft, str(tmp_path))
+    from app.mail import MailSettings
+    settings = MailSettings(draft_dir=str(tmp_path), imap_password="")
+    path = store_draft(draft, settings)
 
     assert draft.approval_required is True
     assert draft.sent is False

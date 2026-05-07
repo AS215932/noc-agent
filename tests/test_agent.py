@@ -1,6 +1,7 @@
 import pytest
 from pydantic_ai import models
 from pydantic_ai.models.test import TestModel
+import json
 
 from app.agent import noc_triage_agent, ActionPlan, DiagnosisResult
 
@@ -39,6 +40,33 @@ async def test_agent_diagnoses_and_proposes_action(test_model, mock_prometheus_a
     assert isinstance(plan.diagnosis, DiagnosisResult)
     assert hasattr(plan, "requires_human")
     assert hasattr(plan, "automated_actions_proposed")
+
+async def test_action_plan_schema_is_provider_friendly():
+    """
+    Gemini tool schemas are picky; keep the triage output schema flat so the
+    model can call diagnostic tools and still return structured output.
+    """
+    schema = ActionPlan.model_json_schema()
+    serialized = json.dumps(schema)
+
+    assert "$defs" not in schema
+    assert "$ref" not in serialized
+    assert "anyOf" not in serialized
+
+async def test_action_plan_accepts_legacy_nested_diagnosis():
+    plan = ActionPlan.model_validate({
+        "diagnosis": {
+            "issue_summary": "node exporter down",
+            "root_cause_analysis": "Prometheus cannot scrape the target.",
+            "confidence_score": 0.6,
+            "severity": "HIGH",
+        },
+        "requires_human": True,
+        "human_escalation_reason": "Needs host access.",
+    })
+
+    assert plan.diagnosis.issue_summary == "node exporter down"
+    assert plan.issue_summary == "node exporter down"
 
 # --- TDD / Future Capabilities Tests ---
 
