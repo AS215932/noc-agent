@@ -51,6 +51,7 @@ class MailDraftPlan(BaseModel):
     summary: str = Field(description="Short operational summary of the inbound email")
     requires_human: bool = Field(default=True, description="Always true for v1 draft-and-approve handling")
     suggested_reply_subject: str = Field(description="Subject line for the draft response")
+    reply_summary: str = Field(description="A brief summary of what the drafted response says")
     suggested_reply_body: str = Field(description="Plain-text draft response for human review")
     internal_notes: list[str] = Field(default_factory=list, description="Notes for the operator reviewing the draft")
 

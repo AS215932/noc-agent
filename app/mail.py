@@ -197,7 +197,14 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
             drafts.append(draft)
 
         if messages:
-            await notify_finish("Mailbox Poll", f"Processed {len(messages)} messages, created {len(drafts)} drafts.")
+            msg_details = "\n\n".join(
+                f"**From:** {d.sender}\n"
+                f"**Subject:** {d.subject}\n"
+                f"**Message Summary:** {d.plan.summary}\n"
+                f"**Draft Summary:** {d.plan.reply_summary}"
+                for d in drafts
+            )
+            await notify_finish("Mailbox Poll", f"Processed {len(messages)} messages, created {len(drafts)} drafts.\n\n{msg_details}")
         else:
             await notify_finish("Mailbox Poll", "No new messages.", level=Verbosity.DEBUG)
         return drafts
