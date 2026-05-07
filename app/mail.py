@@ -172,7 +172,7 @@ def store_draft(draft: StoredDraft, settings: MailSettings) -> Path:
     return draft_path
 
 async def process_mailbox_once(settings: MailSettings | None = None, model=None) -> list[StoredDraft]:
-    from app.discord import notify_start, notify_finish
+    from app.discord import Verbosity, notify_start, notify_finish
 
     settings = settings or MailSettings.from_env()
     await notify_start("Mailbox Poll", "Checking for new NOC email...")
@@ -185,10 +185,10 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
             store_draft(draft, settings)
             drafts.append(draft)
 
-        await notify_finish(
-            "Mailbox Poll",
-            f"Processed {len(messages)} messages, created {len(drafts)} drafts." if messages else "No new messages."
-        )
+        if messages:
+            await notify_finish("Mailbox Poll", f"Processed {len(messages)} messages, created {len(drafts)} drafts.")
+        else:
+            await notify_finish("Mailbox Poll", "No new messages.", level=Verbosity.DEBUG)
         return drafts
     except Exception as e:
         await notify_finish("Mailbox Poll", f"Error: {e}", is_error=True)

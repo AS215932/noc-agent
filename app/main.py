@@ -1,10 +1,11 @@
 import os
 import shlex
 import asyncio
+import fcntl
 from fastapi import FastAPI, BackgroundTasks, Response, status
 from pydantic import BaseModel, Field
 import uvicorn
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from app.agent import noc_triage_agent, noc_mail_agent
 from app.discord import send_discord_notification, notify_start, notify_finish
@@ -14,6 +15,8 @@ from app.tools.mcp_client import HyruleMCPClient
 mcp_client = None
 xo_mcp_client = None
 mail_poller_task = None
+mail_poller_lock_fd = None
+MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 
 REQUIRED_CONFIG = [
     "GEMINI_API_KEY",
@@ -26,20 +29,44 @@ REQUIRED_CONFIG = [
     "MAIL_IMAP_PASSWORD",
 ]
 
-async def _mail_poll_loop():
+def _try_acquire_mail_poller_lock() -> int | None:
+    os.makedirs(os.path.dirname(MAIL_POLLER_LOCK_PATH), exist_ok=True)
+    lock_fd = os.open(MAIL_POLLER_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o640)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return None
+    os.ftruncate(lock_fd, 0)
+    os.write(lock_fd, str(os.getpid()).encode())
+    return lock_fd
+
+
+def _release_mail_poller_lock(lock_fd: int | None):
+    if lock_fd is None:
+        return
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+
+
+async def _mail_poll_loop(lock_fd: int):
     print("Starting background mail polling loop (every 5 mins)...")
-    while True:
-        try:
-            await process_mailbox_once()
-        except Exception as e:
-            print(f"Error in mail poll loop: {e}")
-        await asyncio.sleep(300)
+    try:
+        while True:
+            try:
+                await process_mailbox_once()
+            except Exception as e:
+                print(f"Error in mail poll loop: {e}")
+            await asyncio.sleep(300)
+    finally:
+        _release_mail_poller_lock(lock_fd)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mcp_client
     global xo_mcp_client
     global mail_poller_task
+    global mail_poller_lock_fd
     print("NOC Agent starting up...")
 
     if os.getenv("NOC_AGENT_DISABLE_MCP") != "1":
@@ -69,7 +96,11 @@ async def lifespan(app: FastAPI):
             print(f"Warning: Failed to connect to Xen Orchestra MCP: {e}")
 
     if os.getenv("MAIL_IMAP_PASSWORD"):
-        mail_poller_task = asyncio.create_task(_mail_poll_loop())
+        mail_poller_lock_fd = _try_acquire_mail_poller_lock()
+        if mail_poller_lock_fd is None:
+            print("Mail polling disabled in this worker: another worker owns the poller lock.")
+        else:
+            mail_poller_task = asyncio.create_task(_mail_poll_loop(mail_poller_lock_fd))
     else:
         print("Mail polling disabled: MAIL_IMAP_PASSWORD not configured.")
 
@@ -77,6 +108,12 @@ async def lifespan(app: FastAPI):
 
     if mail_poller_task:
         mail_poller_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await mail_poller_task
+        mail_poller_task = None
+    elif mail_poller_lock_fd is not None:
+        _release_mail_poller_lock(mail_poller_lock_fd)
+    mail_poller_lock_fd = None
 
     if mcp_client:
         await mcp_client.disconnect()

@@ -52,10 +52,11 @@ async def notify_start(task_name: str, description: str):
         level=Verbosity.DEBUG
     )
 
-async def notify_finish(task_name: str, description: str, is_error: bool = False):
+async def notify_finish(task_name: str, description: str, is_error: bool = False, level: Verbosity | None = None):
+    level = level or (Verbosity.ERROR if is_error else Verbosity.INFO)
     await send_discord_notification(
         title=f"{'❌ Failed' if is_error else '✅ Finished'}: {task_name}",
         description=description,
         color=0xe74c3c if is_error else 0x2ecc71,
-        level=Verbosity.INFO
+        level=level
     )

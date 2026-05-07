@@ -4,6 +4,8 @@ from pydantic import ValidationError
 
 from app.main import (
     AlertManagerPayload,
+    _release_mail_poller_lock,
+    _try_acquire_mail_poller_lock,
     _triage_fields,
     alertmanager_webhook,
     health_config,
@@ -125,6 +127,23 @@ def test_alertmanager_webhook_invalid_payload():
     """
     with pytest.raises(ValidationError):
         AlertManagerPayload.model_validate({"receiver": "webhook"})
+
+def test_mail_poller_lock_allows_only_one_owner(tmp_path, monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(main, "MAIL_POLLER_LOCK_PATH", str(tmp_path / "mail-poller.lock"))
+    first_lock = _try_acquire_mail_poller_lock()
+    try:
+        assert first_lock is not None
+        assert _try_acquire_mail_poller_lock() is None
+    finally:
+        _release_mail_poller_lock(first_lock)
+
+    second_lock = _try_acquire_mail_poller_lock()
+    try:
+        assert second_lock is not None
+    finally:
+        _release_mail_poller_lock(second_lock)
 
 @pytest.mark.asyncio
 async def test_mail_poll_accepted(mocker):
