@@ -57,8 +57,10 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"Warning: Failed to connect to Xen Orchestra MCP: {e}")
 
-    # Start the background mail poller
-    mail_poller_task = asyncio.create_task(_mail_poll_loop())
+    if os.getenv("MAIL_IMAP_PASSWORD"):
+        mail_poller_task = asyncio.create_task(_mail_poll_loop())
+    else:
+        print("Mail polling disabled: MAIL_IMAP_PASSWORD not configured.")
 
     yield
 
