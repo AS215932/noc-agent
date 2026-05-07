@@ -6,10 +6,14 @@ from app.main import (
     AlertManagerPayload,
     _triage_fields,
     alertmanager_webhook,
+    health_config,
     health_check,
+    health_mail,
+    health_mcp,
     poll_mailbox,
 )
 from app.agent import ActionPlan
+from fastapi import Response, status
 
 @pytest.fixture
 def mock_alert_payload():
@@ -47,6 +51,60 @@ async def test_health_check():
     """Test that the application starts and exposes the health check."""
     response = await health_check()
     assert response["status"] == "ok"
+
+@pytest.mark.asyncio
+async def test_health_mcp_reports_degraded_when_tools_missing(mocker):
+    mocker.patch("app.main.mcp_client", None)
+    mocker.patch("app.main.xo_mcp_client", None)
+    http_response = Response()
+
+    response = await health_mcp(http_response)
+
+    assert response["status"] == "degraded"
+    assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+@pytest.mark.asyncio
+async def test_health_config_reports_missing_mail_password(monkeypatch):
+    for name in (
+        "GEMINI_API_KEY",
+        "DISCORD_WEBHOOK_URL",
+        "HYRULE_MCP_CMD",
+        "XO_MCP_CMD",
+        "XO_TOKEN",
+        "ICINGA_API_USER",
+        "ICINGA_API_PASSWORD",
+    ):
+        monkeypatch.setenv(name, "set")
+    monkeypatch.delenv("MAIL_IMAP_PASSWORD", raising=False)
+    http_response = Response()
+
+    response = await health_config(http_response)
+
+    assert response["status"] == "degraded"
+    assert "MAIL_IMAP_PASSWORD" in response["missing"]
+    assert response["mail_polling"] == "disabled"
+    assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+@pytest.mark.asyncio
+async def test_health_mail_checks_connection(mocker):
+    mocker.patch("app.main.check_mailbox_connection", return_value={"status": "ok"})
+    http_response = Response()
+
+    response = await health_mail(http_response)
+
+    assert response["status"] == "ok"
+    assert http_response.status_code == status.HTTP_200_OK
+
+@pytest.mark.asyncio
+async def test_health_mail_reports_failures(mocker):
+    mocker.patch("app.main.check_mailbox_connection", side_effect=RuntimeError("bad imap"))
+    http_response = Response()
+
+    response = await health_mail(http_response)
+
+    assert response["status"] == "degraded"
+    assert "bad imap" in response["error"]
+    assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker):

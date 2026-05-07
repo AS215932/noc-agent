@@ -52,6 +52,7 @@ class MailSettings:
     imap_port: int = 993
     imap_user: str = "noc"
     imap_password: str = ""
+    imap_timeout: float = 10.0
     smtp_host: str = "mail.as215932.net"
     smtp_port: int = 587
     smtp_user: str = "noc"
@@ -65,6 +66,7 @@ class MailSettings:
             imap_port=int(os.getenv("MAIL_IMAP_PORT", str(cls.imap_port))),
             imap_user=os.getenv("MAIL_IMAP_USER", cls.imap_user),
             imap_password=os.getenv("MAIL_IMAP_PASSWORD", ""),
+            imap_timeout=float(os.getenv("MAIL_IMAP_TIMEOUT", str(cls.imap_timeout))),
             smtp_host=os.getenv("MAIL_SMTP_HOST", cls.smtp_host),
             smtp_port=int(os.getenv("MAIL_SMTP_PORT", str(cls.smtp_port))),
             smtp_user=os.getenv("MAIL_SMTP_USER", os.getenv("MAIL_IMAP_USER", cls.smtp_user)),
@@ -95,7 +97,7 @@ def fetch_unseen_messages(settings: MailSettings) -> list[InboundMail]:
     if not settings.imap_password:
         raise RuntimeError("MAIL_IMAP_PASSWORD is required to poll the NOC mailbox")
 
-    with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port) as client:
+    with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port, timeout=settings.imap_timeout) as client:
         client.login(settings.imap_user, settings.imap_password)
         client.select(settings.mailbox)
         status, data = client.uid("search", None, "UNSEEN")
@@ -154,7 +156,7 @@ def _save_draft_to_imap(draft: StoredDraft, settings: MailSettings):
     msg.set_content(draft.plan.suggested_reply_body)
 
     try:
-        with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port) as client:
+        with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port, timeout=settings.imap_timeout) as client:
             client.login(settings.imap_user, settings.imap_password)
             client.append("Drafts", r"(\Draft \Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes())
     except Exception as e:
@@ -191,6 +193,33 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
     except Exception as e:
         await notify_finish("Mailbox Poll", f"Error: {e}", is_error=True)
         raise
+
+
+def check_mailbox_connection(settings: MailSettings | None = None) -> dict:
+    settings = settings or MailSettings.from_env()
+    if not settings.imap_password:
+        raise RuntimeError("MAIL_IMAP_PASSWORD is required to poll the NOC mailbox")
+
+    with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port, timeout=settings.imap_timeout) as client:
+        client.login(settings.imap_user, settings.imap_password)
+        status, data = client.select(settings.mailbox, readonly=True)
+        if status != "OK":
+            raise RuntimeError(f"IMAP select failed: {status}")
+        message_count = 0
+        if data and data[0]:
+            try:
+                message_count = int(data[0])
+            except (TypeError, ValueError):
+                message_count = 0
+        client.logout()
+
+    return {
+        "status": "ok",
+        "host": settings.imap_host,
+        "user": settings.imap_user,
+        "mailbox": settings.mailbox,
+        "message_count": message_count,
+    }
 
 
 def _extract_text_body(message: Message) -> str:

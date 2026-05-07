@@ -1,19 +1,30 @@
 import os
 import shlex
 import asyncio
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Response, status
 from pydantic import BaseModel, Field
 import uvicorn
 from contextlib import asynccontextmanager
 
 from app.agent import noc_triage_agent, noc_mail_agent
 from app.discord import send_discord_notification, notify_start, notify_finish
-from app.mail import process_mailbox_once, MailSettings
+from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
 from app.tools.mcp_client import HyruleMCPClient
 
 mcp_client = None
 xo_mcp_client = None
 mail_poller_task = None
+
+REQUIRED_CONFIG = [
+    "GEMINI_API_KEY",
+    "DISCORD_WEBHOOK_URL",
+    "HYRULE_MCP_CMD",
+    "XO_MCP_CMD",
+    "XO_TOKEN",
+    "ICINGA_API_USER",
+    "ICINGA_API_PASSWORD",
+    "MAIL_IMAP_PASSWORD",
+]
 
 async def _mail_poll_loop():
     print("Starting background mail polling loop (every 5 mins)...")
@@ -391,11 +402,46 @@ async def health_check():
 
 
 @app.get("/health/mcp")
-async def health_mcp():
-    return {
+async def health_mcp(response: Response):
+    health = {
         "hyrule": mcp_client is not None and mcp_client.session is not None,
         "xo": xo_mcp_client is not None and xo_mcp_client.session is not None,
     }
+    health["status"] = "ok" if all(health.values()) else "degraded"
+    if health["status"] != "ok":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return health
+
+
+@app.get("/health/config")
+async def health_config(response: Response):
+    missing = [name for name in REQUIRED_CONFIG if not os.getenv(name)]
+    disabled = []
+    if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
+        disabled.append("mcp")
+
+    health_status = "ok" if not missing and not disabled else "degraded"
+    if health_status != "ok":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return {
+        "status": health_status,
+        "missing": missing,
+        "disabled": disabled,
+        "mail_polling": "enabled" if os.getenv("MAIL_IMAP_PASSWORD") else "disabled",
+    }
+
+
+@app.get("/health/mail")
+async def health_mail(response: Response):
+    try:
+        return check_mailbox_connection()
+    except Exception as e:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "degraded",
+            "error": str(e),
+        }
 
 
 def main():
