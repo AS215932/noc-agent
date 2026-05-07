@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 from contextlib import asynccontextmanager, suppress
 
+from app import log
 from app.agent import noc_triage_agent, noc_mail_agent
 from app.discord import send_discord_notification, notify_start, notify_finish
 from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
@@ -55,7 +56,7 @@ def _release_mail_poller_lock(lock_fd: int | None):
 
 
 async def _mail_poll_loop(lock_fd: int):
-    print("Starting background mail polling loop (every 5 mins)...")
+    log.info("mail_poll_loop_starting", interval_seconds=300)
     try:
         while True:
             try:
@@ -73,7 +74,7 @@ async def lifespan(app: FastAPI):
     global xo_mcp_client
     global mail_poller_task
     global mail_poller_lock_fd
-    print("NOC Agent starting up...")
+    log.info("startup_begin")
 
     if os.getenv("NOC_AGENT_DISABLE_MCP") != "1":
         hyrule_cmd = shlex.split(os.environ["HYRULE_MCP_CMD"])
@@ -83,7 +84,7 @@ async def lifespan(app: FastAPI):
             tools = await mcp_client.get_tools()
             for t in tools:
                 noc_triage_agent._function_toolset.add_tool(t)
-                print(f"Loaded MCP Tool: {t.name}")
+                log.info("mcp_tool_loaded", source="hyrule", name=t.name)
         except Exception as e:
             safe = classify_exception(e)
             log_exception("hyrule_mcp_connect_failed", e, category=safe.category)
@@ -98,7 +99,7 @@ async def lifespan(app: FastAPI):
             xo_tools = await xo_mcp_client.get_tools()
             for t in xo_tools:
                 noc_triage_agent._function_toolset.add_tool(t)
-                print(f"Loaded XO MCP Tool: {t.name}")
+                log.info("mcp_tool_loaded", source="xo", name=t.name)
         except Exception as e:
             safe = classify_exception(e)
             log_exception("xo_mcp_connect_failed", e, category=safe.category)
@@ -106,11 +107,11 @@ async def lifespan(app: FastAPI):
     if os.getenv("MAIL_IMAP_PASSWORD"):
         mail_poller_lock_fd = _try_acquire_mail_poller_lock()
         if mail_poller_lock_fd is None:
-            print("Mail polling disabled in this worker: another worker owns the poller lock.")
+            log.info("mail_polling_disabled", reason="lock-held-by-other-worker")
         else:
             mail_poller_task = asyncio.create_task(_mail_poll_loop(mail_poller_lock_fd))
     else:
-        print("Mail polling disabled: MAIL_IMAP_PASSWORD not configured.")
+        log.info("mail_polling_disabled", reason="MAIL_IMAP_PASSWORD-not-set")
 
     yield
 
@@ -129,7 +130,7 @@ async def lifespan(app: FastAPI):
     if xo_mcp_client:
         await xo_mcp_client.disconnect()
 
-    print("NOC Agent shutting down...")
+    log.info("shutdown")
 
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
@@ -319,7 +320,11 @@ def _triage_fields(plan, alert_payload: dict) -> list[dict]:
 
 async def investigate_alert(alert_payload: dict, model=None):
     title_source = alert_payload.get("groupLabels") or alert_payload.get("source") or alert_payload.get("host_name")
-    print(f"Starting investigation for alert: {alert_payload.get('status')} - {title_source}")
+    log.info(
+        "investigation_started",
+        alert_status=alert_payload.get("status"),
+        title_source=str(title_source),
+    )
     await notify_start(f"NOC Triage: Alert from {title_source}", "Initializing investigation and collecting telemetry...")
 
     prompt = f"We received the following Prometheus AlertManager payload. Please investigate.\n\nPayload: {alert_payload}"
@@ -346,17 +351,15 @@ async def investigate_alert(alert_payload: dict, model=None):
         )
         return
 
-    print("\n[INVESTIGATION COMPLETE]")
-    print(f"Summary: {plan.diagnosis.issue_summary}")
-    print(f"Confidence: {plan.diagnosis.confidence_score}")
-    print(f"Escalate to Human: {plan.requires_human}")
-
-    if plan.requires_human:
-        print(f"ESCALATION REASON: {plan.human_escalation_reason}")
-    else:
-        print("Proposed Auto-actions:")
-        for action in plan.automated_actions_proposed:
-            print(f"- {action}")
+    log.info(
+        "investigation_complete",
+        summary=plan.diagnosis.issue_summary,
+        confidence=plan.diagnosis.confidence_score,
+        severity=plan.diagnosis.severity,
+        requires_human=plan.requires_human,
+        escalation_reason=plan.human_escalation_reason if plan.requires_human else None,
+        proposed_actions=list(plan.automated_actions_proposed) if not plan.requires_human else [],
+    )
 
     color = _severity_color(plan.diagnosis.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)

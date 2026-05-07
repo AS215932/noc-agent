@@ -26,7 +26,13 @@ async def send_discord_notification(title: str, description: str, color: int = 0
         return
 
     if not DISCORD_WEBHOOK_URL:
-        print(f"[{level.name}] {title}: {description}")
+        from app import log
+        log.warn(
+            "discord_webhook_unset",
+            level=level.name,
+            title=title,
+            description=description,
+        )
         return
 
     payload = {
