@@ -7,6 +7,8 @@ from prometheus_client import Gauge
 
 
 DEFAULT_GEMINI_QUOTA_METRIC = "generativelanguage.googleapis.com/generate_requests_per_model_per_day"
+DEFAULT_GEMINI_QUOTA_SERVICE = "generativelanguage.googleapis.com"
+DEFAULT_GEMINI_QUOTA_USAGE_METRIC_TYPE = "serviceruntime.googleapis.com/quota/rate/net_usage"
 
 GEMINI_QUOTA_CONFIGURED = Gauge(
     "noc_agent_gemini_quota_configured",
@@ -48,12 +50,14 @@ class QuotaStatus:
 
 def check_gemini_quota() -> QuotaStatus:
     project_id = os.getenv("GEMINI_QUOTA_PROJECT_ID", "").strip()
-    metric = os.getenv("GEMINI_QUOTA_METRIC", DEFAULT_GEMINI_QUOTA_METRIC).strip()
+    quota_metric = os.getenv("GEMINI_QUOTA_METRIC", DEFAULT_GEMINI_QUOTA_METRIC).strip()
+    service = os.getenv("GEMINI_QUOTA_SERVICE", DEFAULT_GEMINI_QUOTA_SERVICE).strip()
+    usage_metric_type = os.getenv("GEMINI_QUOTA_USAGE_METRIC_TYPE", DEFAULT_GEMINI_QUOTA_USAGE_METRIC_TYPE).strip()
     if not project_id:
         status = QuotaStatus(
             status="not_configured",
             message="GEMINI_QUOTA_PROJECT_ID is not configured.",
-            metric=metric,
+            metric=quota_metric,
         )
         _publish(status)
         return status
@@ -64,7 +68,7 @@ def check_gemini_quota() -> QuotaStatus:
         status = QuotaStatus(
             status="degraded",
             message="google-cloud-monitoring is not installed; configure Cloud Monitoring alerts or add the optional library.",
-            metric=metric,
+            metric=quota_metric,
             project_id=project_id,
         )
         _publish(status)
@@ -81,7 +85,11 @@ def check_gemini_quota() -> QuotaStatus:
         )
         request = monitoring_v3.ListTimeSeriesRequest(
             name=f"projects/{project_id}",
-            filter=f'metric.type = "{metric}"',
+            filter=_build_usage_filter(
+                usage_metric_type=usage_metric_type,
+                service=service,
+                quota_metric=quota_metric,
+            ),
             interval=interval,
             view=monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
         )
@@ -105,7 +113,7 @@ def check_gemini_quota() -> QuotaStatus:
         status_value = QuotaStatus(
             status=status,
             message="Gemini quota metric query completed.",
-            metric=metric,
+            metric=quota_metric,
             project_id=project_id,
             usage=usage,
             remaining=remaining,
@@ -116,11 +124,26 @@ def check_gemini_quota() -> QuotaStatus:
         status_value = QuotaStatus(
             status="degraded",
             message=f"Gemini quota metric query failed safely: {type(exc).__name__}",
-            metric=metric,
+            metric=quota_metric,
             project_id=project_id,
         )
         _publish(status_value)
         return status_value
+
+
+def _build_usage_filter(*, usage_metric_type: str, service: str, quota_metric: str) -> str:
+    return " ".join(
+        [
+            f'metric.type = "{_monitoring_filter_value(usage_metric_type)}"',
+            'resource.type = "consumer_quota"',
+            f'resource.label.service = "{_monitoring_filter_value(service)}"',
+            f'metric.label.quota_metric = "{_monitoring_filter_value(quota_metric)}"',
+        ]
+    )
+
+
+def _monitoring_filter_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _float_env(name: str, default: float | None = None) -> float | None:
