@@ -54,12 +54,12 @@ async def send_discord_notification(title: str, description: str, color: int = 0
             safe = classify_exception(e)
             log_exception("discord_notification_failed", e, category=safe.category)
 
-async def notify_start(task_name: str, description: str):
+async def notify_start(task_name: str, description: str, level: Verbosity = Verbosity.DEBUG):
     await send_discord_notification(
         title=f"⏳ Starting: {task_name}",
         description=description,
         color=0xf39c12, # Orange
-        level=Verbosity.DEBUG
+        level=level
     )
 
 async def notify_finish(

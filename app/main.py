@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager, suppress
 
 from app import log
 from app.agent import noc_triage_agent, noc_mail_agent
-from app.discord import send_discord_notification, notify_start, notify_finish
+from app.discord import Verbosity, send_discord_notification, notify_start, notify_finish
 from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
@@ -206,6 +206,15 @@ def _labels(alert_payload: dict) -> dict:
     return labels
 
 
+def _is_recovery_alert(alert_payload: dict) -> bool:
+    status_value = str(alert_payload.get("status") or "").lower()
+    if status_value in {"resolved", "recovery", "ok", "up"}:
+        return True
+
+    first_status = str(_first_alert(alert_payload).get("status") or "").lower()
+    return first_status in {"resolved", "recovery", "ok", "up"}
+
+
 def _instance_host(instance: str) -> str:
     if instance.startswith("[") and "]" in instance:
         return instance[1:instance.index("]")]
@@ -320,12 +329,25 @@ def _triage_fields(plan, alert_payload: dict) -> list[dict]:
 
 async def investigate_alert(alert_payload: dict, model=None):
     title_source = alert_payload.get("groupLabels") or alert_payload.get("source") or alert_payload.get("host_name")
+    if _is_recovery_alert(alert_payload):
+        log.info(
+            "investigation_skipped",
+            reason="recovery",
+            alert_status=alert_payload.get("status"),
+            title_source=str(title_source),
+        )
+        return
+
     log.info(
         "investigation_started",
         alert_status=alert_payload.get("status"),
         title_source=str(title_source),
     )
-    await notify_start(f"NOC Triage: Alert from {title_source}", "Initializing investigation and collecting telemetry...")
+    await notify_start(
+        f"NOC Triage: Alert from {title_source}",
+        "Starting investigation and collecting telemetry.",
+        level=Verbosity.INFO,
+    )
 
     prompt = f"We received the following Prometheus AlertManager payload. Please investigate.\n\nPayload: {alert_payload}"
     run_started = start_run("triage")
@@ -363,17 +385,6 @@ async def investigate_alert(alert_payload: dict, model=None):
 
     color = _severity_color(plan.diagnosis.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
-    finish_description = f"Triggered by alert group: {title_source}"
-    if plan.requires_human:
-        finish_description += "\nStatus: escalated to human review"
-
-    await notify_finish(
-        f"NOC Triage: {plan.diagnosis.issue_summary}",
-        finish_description,
-        is_error=False
-    )
-
-    # We still want to send the detailed full embed:
     await send_discord_notification(
         title=f"Detailed Report: {plan.diagnosis.issue_summary}",
         description=_truncate_discord(
@@ -424,14 +435,20 @@ def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
 @app.post("/webhook/alertmanager")
 async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: BackgroundTasks):
     """Receives alerts from Prometheus Alertmanager and triggers the NOC agent."""
-    background_tasks.add_task(investigate_alert, payload.model_dump())
+    alert_payload = payload.model_dump()
+    if _is_recovery_alert(alert_payload):
+        return {"status": "ignored", "message": "Recovery notification ignored"}
+    background_tasks.add_task(investigate_alert, alert_payload)
     return {"status": "accepted", "message": "Alert received and agent triggered"}
 
 
 @app.post("/webhook/icinga")
 async def icinga_webhook(payload: IcingaNotification, background_tasks: BackgroundTasks):
     """Receives Icinga2 NotificationCommand POSTs and triggers the NOC agent."""
-    background_tasks.add_task(investigate_alert, _icinga_to_alert_payload(payload))
+    alert_payload = _icinga_to_alert_payload(payload)
+    if _is_recovery_alert(alert_payload):
+        return {"status": "ignored", "message": "Recovery notification ignored"}
+    background_tasks.add_task(investigate_alert, alert_payload)
     return {"status": "accepted", "message": "Icinga notification accepted"}
 
 

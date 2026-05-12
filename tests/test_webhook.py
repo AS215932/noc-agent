@@ -4,6 +4,7 @@ from pydantic import ValidationError
 
 from app.main import (
     AlertManagerPayload,
+    IcingaNotification,
     _release_mail_poller_lock,
     _try_acquire_mail_poller_lock,
     _triage_fields,
@@ -13,6 +14,7 @@ from app.main import (
     health_mail,
     health_mcp,
     poll_mailbox,
+    icinga_webhook,
 )
 from app.agent import ActionPlan
 from fastapi import Response, status
@@ -122,6 +124,38 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker):
     )
     assert response["status"] == "accepted"
 
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker):
+    background_tasks = mocker.Mock()
+    mock_alert_payload["status"] = "resolved"
+    mock_alert_payload["alerts"][0]["status"] = "resolved"
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(mock_alert_payload),
+        background_tasks,
+    )
+
+    assert response["status"] == "ignored"
+    background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_icinga_webhook_ignores_recovery(mocker):
+    background_tasks = mocker.Mock()
+    notification = IcingaNotification(
+        host_name="vault",
+        service_name="disk /",
+        check_command="disk",
+        state="OK",
+        state_type="RECOVERY",
+        output="disk recovered",
+    )
+
+    response = await icinga_webhook(notification, background_tasks)
+
+    assert response["status"] == "ignored"
+    background_tasks.add_task.assert_not_called()
+
 def test_alertmanager_webhook_invalid_payload():
     """
     Test that incomplete payloads are rejected with a 422 Unprocessable Entity.
@@ -161,7 +195,8 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     it should send a summary to a specified Discord Webhook URL.
     This test serves as a design driver for creating the `discord.py` integration.
     """
-    mock_discord = mocker.patch("app.main.send_discord_notification", return_value=None)
+    mock_start_discord = mocker.patch("app.discord.send_discord_notification", return_value=None)
+    mock_detail_discord = mocker.patch("app.main.send_discord_notification", return_value=None)
     
     # We call the investigation function directly to avoid asyncio background_tasks complications
     from app.main import investigate_alert
@@ -173,9 +208,13 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     # Run the test directly overriding the model logic for the scope of the method call
     await investigate_alert(mock_alert_payload, model=TestModel())
 
-    mock_discord.assert_called_once()
-    args, kwargs = mock_discord.call_args
-    assert "Detailed Report:" in kwargs["title"]
+    mock_detail_discord.assert_called_once()
+    start_titles = [call.kwargs["title"] for call in mock_start_discord.call_args_list]
+    detail_titles = [mock_detail_discord.call_args.kwargs["title"]]
+    assert any(title.startswith("⏳ Starting: NOC Triage:") for title in start_titles)
+    assert detail_titles[0].startswith("Detailed Report:")
+    titles = start_titles + detail_titles
+    assert not any("Finished" in title for title in titles)
 
 def test_triage_fields_turn_internal_schema_failure_into_operator_guidance(mock_alert_payload):
     plan = ActionPlan.model_validate({
