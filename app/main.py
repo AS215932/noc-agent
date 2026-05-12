@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
 
         xo_cmd = shlex.split(os.environ["XO_MCP_CMD"])
         xo_env = os.environ.copy()
-        xo_env.setdefault("XO_URL", "https://xoa.as215932.net")
+        xo_env.setdefault("XO_URL", "https://xo.servify.network")
         xo_env.setdefault("XO_MCP_ENABLE_ACTIONS", "0")
         xo_mcp_client = HyruleMCPClient(xo_cmd, env=xo_env)
         try:
