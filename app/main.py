@@ -2,7 +2,10 @@ import os
 import shlex
 import asyncio
 import fcntl
-from fastapi import FastAPI, BackgroundTasks, Response, status
+import hashlib
+import hmac
+import json
+from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field
 import uvicorn
 from contextlib import asynccontextmanager, suppress
@@ -10,6 +13,8 @@ from contextlib import asynccontextmanager, suppress
 from app import log
 from app.agent import noc_triage_agent, noc_mail_agent
 from app.discord import Verbosity, send_discord_notification, notify_start, notify_finish
+from app.discord import install_bot_notifier
+from app.discord_bot import build_bot
 from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
@@ -17,11 +22,15 @@ from app.model_metrics import metrics_response, record_failure, record_success, 
 from app.quota import check_gemini_quota
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.tools.mcp_client import HyruleMCPClient
+from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
+from app.noc_state import ApprovalDecision
 
 mcp_client = None
 xo_mcp_client = None
 mail_poller_task = None
 mail_poller_lock_fd = None
+discord_bot = None
+discord_bot_task = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 
 REQUIRED_CONFIG = [
@@ -74,11 +83,14 @@ async def lifespan(app: FastAPI):
     global xo_mcp_client
     global mail_poller_task
     global mail_poller_lock_fd
+    global discord_bot
+    global discord_bot_task
     log.info("startup_begin")
 
     if os.getenv("NOC_AGENT_DISABLE_MCP") != "1":
-        hyrule_cmd = shlex.split(os.environ["HYRULE_MCP_CMD"])
-        mcp_client = HyruleMCPClient(hyrule_cmd)
+        hyrule_url = os.getenv("HYRULE_MCP_URL", "").strip()
+        hyrule_cmd = shlex.split(os.environ["HYRULE_MCP_CMD"]) if not hyrule_url else None
+        mcp_client = HyruleMCPClient(hyrule_cmd, url=hyrule_url or None)
         try:
             await mcp_client.connect()
             tools = await mcp_client.get_tools()
@@ -113,7 +125,24 @@ async def lifespan(app: FastAPI):
     else:
         log.info("mail_polling_disabled", reason="MAIL_IMAP_PASSWORD-not-set")
 
+    try:
+        discord_bot = build_bot()
+        if discord_bot is not None:
+            install_bot_notifier(discord_bot.send_embed)
+            discord_bot_task = asyncio.create_task(discord_bot.start())
+            log.info("discord_bot_starting")
+    except Exception as e:
+        safe = classify_exception(e)
+        log_exception("discord_bot_start_failed", e, category=safe.category)
+
     yield
+
+    if discord_bot_task:
+        discord_bot_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await discord_bot_task
+        discord_bot_task = None
+    discord_bot = None
 
     if mail_poller_task:
         mail_poller_task.cancel()
@@ -349,12 +378,10 @@ async def investigate_alert(alert_payload: dict, model=None):
         level=Verbosity.INFO,
     )
 
-    prompt = f"We received the following Prometheus AlertManager payload. Please investigate.\n\nPayload: {alert_payload}"
     run_started = start_run("triage")
     try:
-        result = await noc_triage_agent.run(prompt, model=model)
-        plan = result.data if hasattr(result, 'data') else result.output
-        record_success("triage", run_started, result)
+        plan, graph_state = await run_investigation_graph(alert_payload, model=model)
+        record_success("triage", run_started, _SyntheticRunResult())
     except Exception as e:
         safe = classify_exception(e)
         record_failure("triage", run_started, safe)
@@ -381,6 +408,8 @@ async def investigate_alert(alert_payload: dict, model=None):
         requires_human=plan.requires_human,
         escalation_reason=plan.human_escalation_reason if plan.requires_human else None,
         proposed_actions=list(plan.automated_actions_proposed) if not plan.requires_human else [],
+        incident_id=graph_state.get("incident_id"),
+        active_specialist=graph_state.get("active_specialist"),
     )
 
     color = _severity_color(plan.diagnosis.severity, plan.requires_human)
@@ -462,6 +491,16 @@ async def poll_mailbox(background_tasks: BackgroundTasks):
 class TaskRequest(BaseModel):
     prompt: str
 
+
+class LocalDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected|acknowledged)$")
+    operator: str
+    comment: str = ""
+
+
+class SignedApprovalRequest(LocalDecisionRequest):
+    incident_id: str
+
 @app.post("/task", response_model=MailPollResponse)
 async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
     """Run an arbitrary task on the NOC Triage agent (e.g. 'Draft email to LocIX')."""
@@ -492,6 +531,50 @@ async def health_check():
     return {"status": "ok", "service": "AS215932 NOC Agent"}
 
 
+@app.get("/control/incidents/pending")
+async def pending_incidents(x_noc_control_token: str | None = Header(default=None)):
+    _require_control_token(x_noc_control_token)
+    return {"status": "ok", "incidents": pending_summaries()}
+
+
+@app.get("/control/incidents/{incident_id}")
+async def incident_status(incident_id: str, x_noc_control_token: str | None = Header(default=None)):
+    _require_control_token(x_noc_control_token)
+    summary = summary_for(incident_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return summary
+
+
+@app.post("/control/incidents/{incident_id}/decision")
+async def decide_incident(
+    incident_id: str,
+    request: LocalDecisionRequest,
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_token(x_noc_control_token)
+    decision = ApprovalDecision(incident_id=incident_id, **request.model_dump())
+    summary = record_operator_decision(incident_id, decision.model_dump())
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"status": "ok", "incident": summary}
+
+
+@app.post("/approval/resume")
+async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | None = Header(default=None)):
+    _require_signed_callback(request, x_noc_signature)
+    decision = ApprovalDecision(
+        incident_id=request.incident_id,
+        decision=request.decision,
+        operator=request.operator,
+        comment=request.comment,
+    )
+    summary = record_operator_decision(request.incident_id, decision.model_dump())
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"status": "ok", "incident": summary}
+
+
 @app.get("/health/mcp")
 async def health_mcp(response: Response):
     health = {
@@ -507,6 +590,8 @@ async def health_mcp(response: Response):
 @app.get("/health/config")
 async def health_config(response: Response):
     missing = [name for name in REQUIRED_CONFIG if not os.getenv(name)]
+    if os.getenv("HYRULE_MCP_URL"):
+        missing = [name for name in missing if name != "HYRULE_MCP_CMD"]
     disabled = []
     if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
         disabled.append("mcp")
@@ -559,6 +644,34 @@ async def health_mail(response: Response):
             "status": "degraded",
             "error": safe_health_error(e),
         }
+
+
+class _SyntheticRunResult:
+    def new_messages(self):
+        return []
+
+    def usage(self):
+        return None
+
+
+def _require_control_token(header_value: str | None) -> None:
+    expected = os.getenv("NOC_CONTROL_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Local control plane is not configured")
+    if not header_value or not hmac.compare_digest(header_value, expected):
+        raise HTTPException(status_code=401, detail="Invalid control token")
+
+
+def _require_signed_callback(request: SignedApprovalRequest, signature: str | None) -> None:
+    secret = os.getenv("NOC_APPROVAL_SIGNING_SECRET", "").encode()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Approval signing secret is not configured")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing callback signature")
+    body = json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+    expected = hmac.new(secret, body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid callback signature")
 
 
 def main():

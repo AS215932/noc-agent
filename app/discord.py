@@ -7,6 +7,7 @@ from app.model_metrics import record_sanitized_discord_failure
 from app.safe_errors import classify_exception, log_exception
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+BOT_NOTIFIER = None
 
 class Verbosity(enum.IntEnum):
     DEBUG = 10
@@ -23,6 +24,10 @@ async def send_discord_notification(title: str, description: str, color: int = 0
     Sends an embed message to a Discord webhook.
     """
     if level < get_verbosity():
+        return
+
+    if BOT_NOTIFIER is not None:
+        await BOT_NOTIFIER(title=title, description=description, color=color, fields=fields or [])
         return
 
     if not DISCORD_WEBHOOK_URL:
@@ -53,6 +58,11 @@ async def send_discord_notification(title: str, description: str, color: int = 0
         except httpx.HTTPError as e:
             safe = classify_exception(e)
             log_exception("discord_notification_failed", e, category=safe.category)
+
+
+def install_bot_notifier(notifier):
+    global BOT_NOTIFIER
+    BOT_NOTIFIER = notifier
 
 async def notify_start(task_name: str, description: str, level: Verbosity = Verbosity.DEBUG):
     await send_discord_notification(

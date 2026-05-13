@@ -1,0 +1,24 @@
+{
+  "asn": 215932,
+  "prefixes": ["2a0c:b641:b50::/44"],
+  "routers": {
+    "rtr": {"role": "ovh-edge", "os": "debian", "routing": ["frr", "ospf6", "ibgp"]},
+    "cr1_nl1": {"role": "core-transit-nl", "os": "freebsd", "routing": ["frr", "bgp", "wireguard"]},
+    "cr1_de1": {"role": "core-transit-de", "os": "freebsd", "routing": ["frr", "bgp", "wireguard"]}
+  },
+  "critical_services": [
+    "noc-agent",
+    "hyrule-mcp",
+    "prometheus",
+    "icinga2",
+    "vault-agent",
+    "knot",
+    "wireguard"
+  ],
+  "drift_invariants": {
+    "monitoring_requires_targets": ["node", "frr", "blackbox"],
+    "noc_requires_mcp": true,
+    "noc_requires_discord_control_plane": true,
+    "noc_requires_local_control_plane": true
+  }
+}

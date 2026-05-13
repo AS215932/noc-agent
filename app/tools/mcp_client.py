@@ -3,6 +3,7 @@ from typing import Any
 from contextlib import AsyncExitStack
 from mcp.client.stdio import stdio_client
 from mcp.client.stdio import StdioServerParameters
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.session import ClientSession
 from pydantic_ai.tools import Tool
 
@@ -29,22 +30,26 @@ def _normalize_input_schema(raw: Any) -> dict[str, Any]:
 
 
 class HyruleMCPClient:
-    def __init__(self, command: list[str], env: dict[str, str] | None = None):
-        self.command = command
+    def __init__(self, command: list[str] | None = None, env: dict[str, str] | None = None, url: str | None = None):
+        self.command = command or []
         self.env = env
+        self.url = url
         self.session: ClientSession | None = None
         self._exit_stack = AsyncExitStack()
 
     async def connect(self):
         """Starts the MCP server process and initializes the ClientSession."""
-        server_params = StdioServerParameters(
-            command=self.command[0],
-            args=self.command[1:],
-            env=self.env if self.env is not None else os.environ.copy(),
-        )
-
-        stdio_transport = await self._exit_stack.enter_async_context(stdio_client(server_params))
-        read, write = stdio_transport
+        if self.url:
+            http_transport = await self._exit_stack.enter_async_context(streamablehttp_client(self.url))
+            read, write = http_transport[0], http_transport[1]
+        else:
+            server_params = StdioServerParameters(
+                command=self.command[0],
+                args=self.command[1:],
+                env=self.env if self.env is not None else os.environ.copy(),
+            )
+            stdio_transport = await self._exit_stack.enter_async_context(stdio_client(server_params))
+            read, write = stdio_transport
 
         self.session = await self._exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
