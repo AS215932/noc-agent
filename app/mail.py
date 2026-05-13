@@ -23,6 +23,17 @@ ROLE_ADDRESSES = {
     "dh@as215932.net",
 }
 
+NO_RESPONSE_SYSTEM_SENDERS = {"root", "cron", "daemon", "operator"}
+NO_RESPONSE_SUBJECT_MARKERS = {
+    "cron ",
+    "cron:",
+    "daily output",
+    "daily security output",
+    "periodic output",
+    "logwatch",
+    "unattended-upgrades",
+}
+
 
 class InboundMail(BaseModel):
     uid: str
@@ -191,20 +202,26 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
     try:
         messages = fetch_unseen_messages(settings)
         drafts: list[StoredDraft] = []
+        no_response_messages: list[InboundMail] = []
         for message in messages:
+            if mail_needs_no_response(message):
+                no_response_messages.append(message)
+                continue
             draft = await draft_reply_for_message(message, model=model)
             store_draft(draft, settings)
             drafts.append(draft)
 
         if messages:
             msg_details = "\n\n".join(
-                f"**From:** {d.sender}\n"
-                f"**Subject:** {d.subject}\n"
-                f"**Message Summary:** {d.plan.summary}\n"
-                f"**Draft Summary:** {d.plan.reply_summary}"
-                for d in drafts
+                [_draft_notification_summary(d) for d in drafts]
+                + [_no_response_notification_summary(m) for m in no_response_messages]
             )
-            await notify_finish("Mailbox Poll", f"Processed {len(messages)} messages, created {len(drafts)} drafts.\n\n{msg_details}")
+            response_count = len(no_response_messages)
+            response_note = f", marked {response_count} no-response" if response_count else ""
+            await notify_finish(
+                "Mailbox Poll",
+                f"Processed {len(messages)} messages, created {len(drafts)} drafts{response_note}.\n\n{msg_details}",
+            )
         else:
             await notify_finish("Mailbox Poll", "No new messages.", level=Verbosity.DEBUG)
         return drafts
@@ -245,6 +262,42 @@ def check_mailbox_connection(settings: MailSettings | None = None) -> dict:
         "mailbox": settings.mailbox,
         "message_count": message_count,
     }
+
+
+def mail_needs_no_response(message: InboundMail) -> bool:
+    sender_local = message.from_address.split("@", 1)[0].lower()
+    subject = message.subject.lower()
+    if sender_local not in NO_RESPONSE_SYSTEM_SENDERS:
+        return False
+    return any(marker in subject for marker in NO_RESPONSE_SUBJECT_MARKERS)
+
+
+def _draft_notification_summary(draft: StoredDraft) -> str:
+    return (
+        f"**From:** {draft.sender}\n"
+        f"**Subject:** {draft.subject}\n"
+        f"**Message Summary:** {draft.plan.summary}\n"
+        f"**Draft Summary:** {draft.plan.reply_summary}"
+    )
+
+
+def _no_response_notification_summary(message: InboundMail) -> str:
+    return (
+        f"**From:** {message.from_address}\n"
+        f"**Subject:** {message.subject}\n"
+        f"**Message Summary:** {_summarize_mail_body(message)}\n"
+        "**Disposition:** no response needed"
+    )
+
+
+def _summarize_mail_body(message: InboundMail, limit: int = 220) -> str:
+    for line in message.text_body.splitlines():
+        clean = " ".join(line.split())
+        if clean:
+            if len(clean) <= limit:
+                return clean
+            return clean[: limit - 3].rstrip() + "..."
+    return "Automated system message."
 
 
 def _extract_text_body(message: Message) -> str:
