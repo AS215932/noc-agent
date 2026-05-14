@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent import ActionPlan
-from app.discord_bot import NOCDiscordBot, StatusOverview, parse_discord_operator_request
+from app.discord_bot import NOCDiscordBot, StatusOverview, parse_discord_operator_request, run_fast_status_check
 from app.mcp_runtime import MCPRuntime
 
 
@@ -65,6 +65,31 @@ class FakeThread:
         self.messages.append((content, kwargs))
 
 
+class FakeMCPSession:
+    def __init__(self):
+        self.calls = []
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        payload = '{"stdout":"Neighbor        AS MsgRcvd MsgSent State/PfxRcd\\n2a0c::1 215932 10 12 42","stderr":"","exit_code":0}'
+        return SimpleNamespace(content=[SimpleNamespace(text=payload)])
+
+
+class FakeRuntime:
+    def __init__(self):
+        self.session = FakeMCPSession()
+        self.clients = {"hyrule": SimpleNamespace(session=self.session)}
+
+    def health(self):
+        return {
+            "status": "ok",
+            "hyrule_tool_count": 27,
+            "xo_tool_count": 8,
+            "hyrule": True,
+            "xo": True,
+        }
+
+
 def _action_plan() -> ActionPlan:
     return ActionPlan(
         issue_summary="NOC health looks degraded",
@@ -83,6 +108,9 @@ def _action_plan() -> ActionPlan:
     ("text", "kind", "target", "incident_id", "decision"),
     [
         ("status noc", "status", "noc", "", ""),
+        ("status bgp cr1-nl1", "status", "cr1-nl1", "", ""),
+        ("status bgp peers cr1-de1", "status", "cr1-de1", "", ""),
+        ("status bgp cr1.de1?", "status", "cr1-de1", "", ""),
         ("what is the status of cr1.de1?", "status", "cr1-de1", "", ""),
         ("what's the status of cr1-nl1?", "status", "cr1-nl1", "", ""),
         ("how is noc doing?", "status", "noc", "", ""),
@@ -106,6 +134,14 @@ def test_parse_discord_operator_request(text, kind, target, incident_id, decisio
     assert intent.target == target
     assert intent.incident_id == incident_id
     assert intent.decision == decision
+
+
+def test_parse_bgp_status_adds_check_qualifier():
+    intent = parse_discord_operator_request("status bgp peers cr1-de1")
+
+    assert intent.type == "status"
+    assert intent.target == "cr1-de1"
+    assert intent.qualifiers == {"check": "bgp peers"}
 
 
 @pytest.mark.asyncio
@@ -235,6 +271,20 @@ async def test_status_mention_uses_fast_status_not_graph(monkeypatch):
     assert graph_called is False
     assert "Status for `noc`: `ok`" in message.messages[0][0]
     assert not message.threads
+
+
+@pytest.mark.asyncio
+async def test_bgp_status_uses_frr_summary_not_generic_host_lookup():
+    runtime = FakeRuntime()
+
+    overview = await run_fast_status_check("cr1-nl1", {"check": "bgp"}, runtime)
+
+    assert overview.status == "ok"
+    assert "BGP status" in overview.summary
+    assert "show bgp summary" in overview.checks[0]
+    assert runtime.session.calls == [
+        ("frr_vtysh_cmd", {"host": "cr1-nl1", "command": "show bgp summary"})
+    ]
 
 
 @pytest.mark.asyncio

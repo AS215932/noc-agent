@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -432,6 +433,9 @@ def parse_discord_operator_request(text: str) -> OperatorIntent:
         if rest.startswith("incident "):
             incident_id = _clean_target(rest.split(maxsplit=1)[1])
             return OperatorIntent(type="incident_status", raw_text=raw, incident_id=incident_id)
+        routed = _parse_structured_status(raw, rest)
+        if routed is not None:
+            return routed
         target = _clean_target(rest)
         if INCIDENT_ID_RE.match(target):
             return OperatorIntent(type="incident_status", raw_text=raw, incident_id=target)
@@ -485,6 +489,22 @@ async def run_fast_status_check(target: str, qualifiers: dict[str, str] | None, 
     if runtime_health["status"] != "ok":
         status = "degraded"
         checks.append(f"MCP health is {runtime_health['status']}; live host checks may be incomplete.")
+
+    if _is_bgp_check(qualifiers):
+        command = _bgp_status_command(qualifiers)
+        output = await _call_mcp_tool(runtime, "hyrule", "frr_vtysh_cmd", {"host": target, "command": command})
+        if output:
+            checks.append(f"FRR `{command}`: {_compact_tool_text(_command_output_summary(output), limit=900)}")
+        else:
+            status = "degraded"
+            checks.append(f"FRR `{command}` returned no data for `{target}`.")
+        return StatusOverview(
+            status=status,
+            target=target,
+            summary="Fast read-only BGP status check completed." if status == "ok" else "BGP status check needs operator review.",
+            checks=checks[:6],
+            suggested_next_action="" if status == "ok" else f'Reply with "investigate bgp {target}" to run the full investigation.',
+        )
 
     icinga = await _call_mcp_tool(runtime, "hyrule", "icinga_get_host_state", {"host": target})
     if icinga:
@@ -643,6 +663,18 @@ def _natural_status_target(text: str) -> str:
     return ""
 
 
+def _parse_structured_status(raw: str, rest: str) -> OperatorIntent | None:
+    tokens = rest.split()
+    if len(tokens) < 2:
+        return None
+    subject_tokens = tokens[:-1]
+    target = _clean_target(tokens[-1])
+    subject = " ".join(subject_tokens).strip().lower()
+    if subject in {"bgp", "bgp peer", "bgp peers", "bgp summary", "routing bgp"}:
+        return OperatorIntent(type="status", raw_text=raw, target=target, qualifiers={"check": subject})
+    return None
+
+
 def _clean_target(value: str) -> str:
     cleaned = str(value or "").strip().strip("`'\".,?!:;()[]{}")
     if re.match(r"^cr\d+\.(?:de\d+|nl\d+)$", cleaned, flags=re.IGNORECASE):
@@ -658,6 +690,35 @@ def _is_noc_target(target: str) -> bool:
 def _looks_like_virtualization_query(target: str, qualifiers: dict[str, str]) -> bool:
     blob = f"{target} {' '.join(qualifiers.values())}".lower()
     return any(token in blob for token in ("xo", "xoa", "vm", "vms", "pool", "xcp", "xen"))
+
+
+def _is_bgp_check(qualifiers: dict[str, str]) -> bool:
+    return "bgp" in str(qualifiers.get("check", "")).lower().split()
+
+
+def _bgp_status_command(qualifiers: dict[str, str]) -> str:
+    check = str(qualifiers.get("check", "")).lower()
+    if "summary" in check or "peer" in check or "bgp" in check:
+        return "show bgp summary"
+    return "show bgp summary"
+
+
+def _command_output_summary(text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return text
+    if not isinstance(payload, dict):
+        return text
+    stdout = str(payload.get("stdout") or "").strip()
+    stderr = str(payload.get("stderr") or "").strip()
+    exit_code = payload.get("exit_code")
+    if stdout:
+        prefix = f"exit={exit_code}; " if exit_code not in (None, 0) else ""
+        return prefix + stdout
+    if stderr:
+        return f"exit={exit_code}; {stderr}"
+    return f"exit={exit_code}; no output"
 
 
 def _missing_config() -> list[str]:
