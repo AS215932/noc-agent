@@ -5,6 +5,7 @@ from pydantic import ValidationError
 from app.main import (
     AlertManagerPayload,
     IcingaNotification,
+    _embedded_discord_bot_enabled,
     _release_mail_poller_lock,
     _try_acquire_mail_poller_lock,
     _triage_fields,
@@ -60,12 +61,43 @@ async def test_health_check():
 async def test_health_mcp_reports_degraded_when_tools_missing(mocker):
     mocker.patch("app.main.mcp_client", None)
     mocker.patch("app.main.xo_mcp_client", None)
+    mocker.patch("app.main.hyrule_mcp_tool_count", 0)
+    mocker.patch("app.main.xo_mcp_tool_count", 0)
     http_response = Response()
 
     response = await health_mcp(http_response)
 
     assert response["status"] == "degraded"
     assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_health_mcp_requires_registered_tools(mocker):
+    mocker.patch("app.main.mcp_client", type("Client", (), {"session": object()})())
+    mocker.patch("app.main.xo_mcp_client", type("Client", (), {"session": object()})())
+    mocker.patch("app.main.hyrule_mcp_tool_count", 0)
+    mocker.patch("app.main.xo_mcp_tool_count", 3)
+    http_response = Response()
+
+    response = await health_mcp(http_response)
+
+    assert response["status"] == "degraded"
+    assert response["hyrule"] is False
+    assert response["xo"] is True
+    assert response["hyrule_tool_count"] == 0
+    assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+def test_embedded_discord_bot_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_START_EMBEDDED_BOT", raising=False)
+
+    assert _embedded_discord_bot_enabled() is False
+
+
+def test_embedded_discord_bot_can_be_enabled(monkeypatch):
+    monkeypatch.setenv("NOC_AGENT_START_EMBEDDED_BOT", "1")
+
+    assert _embedded_discord_bot_enabled() is True
 
 @pytest.mark.asyncio
 async def test_health_config_reports_missing_mail_password(monkeypatch):

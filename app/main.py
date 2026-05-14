@@ -27,6 +27,8 @@ from app.noc_state import ApprovalDecision
 
 mcp_client = None
 xo_mcp_client = None
+hyrule_mcp_tool_count = 0
+xo_mcp_tool_count = 0
 mail_poller_task = None
 mail_poller_lock_fd = None
 discord_bot = None
@@ -81,6 +83,8 @@ async def _mail_poll_loop(lock_fd: int):
 async def lifespan(app: FastAPI):
     global mcp_client
     global xo_mcp_client
+    global hyrule_mcp_tool_count
+    global xo_mcp_tool_count
     global mail_poller_task
     global mail_poller_lock_fd
     global discord_bot
@@ -97,7 +101,10 @@ async def lifespan(app: FastAPI):
             for t in tools:
                 noc_triage_agent._function_toolset.add_tool(t)
                 log.info("mcp_tool_loaded", source="hyrule", name=t.name)
+            hyrule_mcp_tool_count = len(tools)
+            log.info("mcp_tools_loaded", source="hyrule", count=hyrule_mcp_tool_count)
         except Exception as e:
+            hyrule_mcp_tool_count = 0
             safe = classify_exception(e)
             log_exception("hyrule_mcp_connect_failed", e, category=safe.category)
 
@@ -112,7 +119,10 @@ async def lifespan(app: FastAPI):
             for t in xo_tools:
                 noc_triage_agent._function_toolset.add_tool(t)
                 log.info("mcp_tool_loaded", source="xo", name=t.name)
+            xo_mcp_tool_count = len(xo_tools)
+            log.info("mcp_tools_loaded", source="xo", count=xo_mcp_tool_count)
         except Exception as e:
+            xo_mcp_tool_count = 0
             safe = classify_exception(e)
             log_exception("xo_mcp_connect_failed", e, category=safe.category)
 
@@ -125,15 +135,17 @@ async def lifespan(app: FastAPI):
     else:
         log.info("mail_polling_disabled", reason="MAIL_IMAP_PASSWORD-not-set")
 
-    try:
-        discord_bot = build_bot()
-        if discord_bot is not None:
-            install_bot_notifier(discord_bot.send_embed)
-            discord_bot_task = asyncio.create_task(discord_bot.start())
-            log.info("discord_bot_starting")
-    except Exception as e:
-        safe = classify_exception(e)
-        log_exception("discord_bot_start_failed", e, category=safe.category)
+    if _embedded_discord_bot_enabled():
+        try:
+            discord_bot = build_bot()
+            if discord_bot is not None:
+                install_bot_notifier(discord_bot.send_embed)
+                discord_bot_task = asyncio.create_task(discord_bot.start())
+        except Exception as e:
+            safe = classify_exception(e)
+            log_exception("discord_bot_start_failed", e, category=safe.category)
+    else:
+        log.info("discord_bot_embedded_disabled")
 
     yield
 
@@ -154,12 +166,24 @@ async def lifespan(app: FastAPI):
     mail_poller_lock_fd = None
 
     if mcp_client:
-        await mcp_client.disconnect()
+        await _disconnect_mcp_client("hyrule", mcp_client)
 
     if xo_mcp_client:
-        await xo_mcp_client.disconnect()
+        await _disconnect_mcp_client("xo", xo_mcp_client)
 
     log.info("shutdown")
+
+
+def _embedded_discord_bot_enabled() -> bool:
+    return os.getenv("NOC_AGENT_START_EMBEDDED_BOT", "").strip() == "1"
+
+
+async def _disconnect_mcp_client(source: str, client: HyruleMCPClient) -> None:
+    try:
+        await client.disconnect()
+    except Exception as exc:
+        safe = classify_exception(exc)
+        log_exception("mcp_disconnect_failed", exc, category=safe.category, source=source)
 
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
@@ -577,11 +601,15 @@ async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | N
 
 @app.get("/health/mcp")
 async def health_mcp(response: Response):
+    hyrule_ready = mcp_client is not None and mcp_client.session is not None and hyrule_mcp_tool_count > 0
+    xo_ready = xo_mcp_client is not None and xo_mcp_client.session is not None and xo_mcp_tool_count > 0
     health = {
-        "hyrule": mcp_client is not None and mcp_client.session is not None,
-        "xo": xo_mcp_client is not None and xo_mcp_client.session is not None,
+        "hyrule": hyrule_ready,
+        "xo": xo_ready,
+        "hyrule_tool_count": hyrule_mcp_tool_count,
+        "xo_tool_count": xo_mcp_tool_count,
     }
-    health["status"] = "ok" if all(health.values()) else "degraded"
+    health["status"] = "ok" if hyrule_ready and xo_ready else "degraded"
     if health["status"] != "ok":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return health

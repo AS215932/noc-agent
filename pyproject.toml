@@ -33,6 +33,7 @@ dev = [
 
 [project.scripts]
 noc-agent = "app.main:main"
+noc-agent-bot = "app.discord_bot:main"
 nocctl = "app.nocctl:main"
 
 [build-system]
