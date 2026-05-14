@@ -71,7 +71,10 @@ class FakeMCPSession:
 
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
-        payload = '{"stdout":"Neighbor        AS MsgRcvd MsgSent State/PfxRcd\\n2a0c::1 215932 10 12 42","stderr":"","exit_code":0}'
+        if name == "icinga_list_problems":
+            payload = '{"object_type":"service","count":2,"returned":2,"problems":[{"name":"noc!disk","state":2,"output":"full"},{"name":"mail!smtp","state":1,"output":"slow"}]}'
+        else:
+            payload = '{"stdout":"Neighbor        AS MsgRcvd MsgSent State/PfxRcd\\n2a0c::1 215932 10 12 42","stderr":"","exit_code":0}'
         return SimpleNamespace(content=[SimpleNamespace(text=payload)])
 
 
@@ -111,6 +114,8 @@ def _action_plan() -> ActionPlan:
         ("status bgp cr1-nl1", "status", "cr1-nl1", "", ""),
         ("status bgp peers cr1-de1", "status", "cr1-de1", "", ""),
         ("status bgp cr1.de1?", "status", "cr1-de1", "", ""),
+        ("how many service problems in icinga?", "status", "icinga", "", ""),
+        ("service problems in icinga?", "status", "icinga", "", ""),
         ("what is the status of cr1.de1?", "status", "cr1-de1", "", ""),
         ("what's the status of cr1-nl1?", "status", "cr1-nl1", "", ""),
         ("how is noc doing?", "status", "noc", "", ""),
@@ -142,6 +147,14 @@ def test_parse_bgp_status_adds_check_qualifier():
     assert intent.type == "status"
     assert intent.target == "cr1-de1"
     assert intent.qualifiers == {"check": "bgp peers"}
+
+
+def test_parse_icinga_problem_question_adds_problem_qualifier():
+    intent = parse_discord_operator_request("how many service problems in icinga?")
+
+    assert intent.type == "status"
+    assert intent.target == "icinga"
+    assert intent.qualifiers == {"check": "icinga problems", "object_type": "service"}
 
 
 @pytest.mark.asyncio
@@ -282,8 +295,25 @@ async def test_bgp_status_uses_frr_summary_not_generic_host_lookup():
     assert overview.status == "ok"
     assert "BGP status" in overview.summary
     assert "show bgp summary" in overview.checks[0]
+    assert "```text" in overview.checks[0]
+    assert "\n2a0c::1 215932" in overview.checks[0]
     assert runtime.session.calls == [
         ("frr_vtysh_cmd", {"host": "cr1-nl1", "command": "show bgp summary"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_icinga_problem_question_uses_problem_tool_not_generic_host_lookup():
+    runtime = FakeRuntime()
+
+    overview = await run_fast_status_check("icinga", {"check": "icinga problems", "object_type": "service"}, runtime)
+
+    assert overview.status == "degraded"
+    assert "Icinga has active problems" in overview.summary
+    assert "Icinga service problems: `2`" in overview.checks[0]
+    assert "noc!disk state=2" in overview.checks[0]
+    assert runtime.session.calls == [
+        ("icinga_list_problems", {"object_type": "service", "limit": 20})
     ]
 
 

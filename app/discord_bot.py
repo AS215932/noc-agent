@@ -399,6 +399,10 @@ def parse_discord_operator_request(text: str) -> OperatorIntent:
     if natural_status:
         return OperatorIntent(type="status", raw_text=raw, target=natural_status)
 
+    icinga_problem_intent = _parse_icinga_problem_query(raw)
+    if icinga_problem_intent is not None:
+        return icinga_problem_intent
+
     words = raw.split()
     command = words[0].lower()
     rest = " ".join(words[1:]).strip()
@@ -490,11 +494,30 @@ async def run_fast_status_check(target: str, qualifiers: dict[str, str] | None, 
         status = "degraded"
         checks.append(f"MCP health is {runtime_health['status']}; live host checks may be incomplete.")
 
+    if _is_icinga_problem_check(target, qualifiers):
+        object_type = qualifiers.get("object_type", "service")
+        output = await _call_mcp_tool(runtime, "hyrule", "icinga_list_problems", {"object_type": object_type, "limit": 20})
+        if output:
+            overview = _icinga_problem_overview(output, object_type)
+            checks.append(overview)
+            if "`0`" not in overview:
+                status = "degraded"
+        else:
+            status = "degraded"
+            checks.append("Icinga problem query returned no data.")
+        return StatusOverview(
+            status=status,
+            target=target,
+            summary="Fast read-only Icinga problem check completed." if status == "ok" else "Icinga has active problems.",
+            checks=checks[:6],
+            suggested_next_action="" if status == "ok" else 'Reply with "investigate icinga service problems" to run the full investigation.',
+        )
+
     if _is_bgp_check(qualifiers):
         command = _bgp_status_command(qualifiers)
         output = await _call_mcp_tool(runtime, "hyrule", "frr_vtysh_cmd", {"host": target, "command": command})
         if output:
-            checks.append(f"FRR `{command}`: {_compact_tool_text(_command_output_summary(output), limit=900)}")
+            checks.append(f"FRR `{command}`:\n{_code_block(_command_output_summary(output, preserve_lines=True), limit=1200)}")
         else:
             status = "degraded"
             checks.append(f"FRR `{command}` returned no data for `{target}`.")
@@ -608,15 +631,32 @@ def _compact_tool_text(text: str, limit: int = 700) -> str:
     return value[: limit - 3].rstrip() + "..."
 
 
+def _compact_lines(text: str, limit: int = 1200) -> str:
+    lines = [line.rstrip() for line in str(text or "").splitlines() if line.strip()]
+    value = "\n".join(lines)
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
+
+
+def _code_block(text: str, *, limit: int = 1200) -> str:
+    value = _compact_lines(text, limit=limit).replace("```", "'''")
+    return f"```text\n{value or 'no output'}\n```"
+
+
 def _format_status_overview(overview: StatusOverview) -> str:
     lines = [
         f"Status for `{overview.target}`: `{overview.status}`",
         overview.summary,
     ]
-    lines.extend(f"- {check}" for check in overview.checks)
+    lines.extend(_format_check_line(check) for check in overview.checks)
     if overview.suggested_next_action:
         lines.append(overview.suggested_next_action)
     return "\n".join(line for line in lines if line)
+
+
+def _format_check_line(check: str) -> str:
+    return f"- {check}" if "\n" not in check else f"- {check}"
 
 
 def _format_pending() -> str:
@@ -675,6 +715,19 @@ def _parse_structured_status(raw: str, rest: str) -> OperatorIntent | None:
     return None
 
 
+def _parse_icinga_problem_query(raw: str) -> OperatorIntent | None:
+    query = str(raw or "").strip().strip("?.!").lower()
+    if "icinga" not in query or "problem" not in query:
+        return None
+    object_type = "host" if "host" in query and "service" not in query else "service"
+    return OperatorIntent(
+        type="status",
+        raw_text=raw,
+        target="icinga",
+        qualifiers={"check": "icinga problems", "object_type": object_type},
+    )
+
+
 def _clean_target(value: str) -> str:
     cleaned = str(value or "").strip().strip("`'\".,?!:;()[]{}")
     if re.match(r"^cr\d+\.(?:de\d+|nl\d+)$", cleaned, flags=re.IGNORECASE):
@@ -692,6 +745,11 @@ def _looks_like_virtualization_query(target: str, qualifiers: dict[str, str]) ->
     return any(token in blob for token in ("xo", "xoa", "vm", "vms", "pool", "xcp", "xen"))
 
 
+def _is_icinga_problem_check(target: str, qualifiers: dict[str, str]) -> bool:
+    blob = f"{target} {' '.join(qualifiers.values())}".lower()
+    return "icinga" in blob and "problem" in blob
+
+
 def _is_bgp_check(qualifiers: dict[str, str]) -> bool:
     return "bgp" in str(qualifiers.get("check", "")).lower().split()
 
@@ -703,13 +761,13 @@ def _bgp_status_command(qualifiers: dict[str, str]) -> str:
     return "show bgp summary"
 
 
-def _command_output_summary(text: str) -> str:
+def _command_output_summary(text: str, *, preserve_lines: bool = False) -> str:
     try:
         payload = json.loads(text)
     except Exception:
-        return text
+        return text if preserve_lines else _compact_tool_text(text)
     if not isinstance(payload, dict):
-        return text
+        return text if preserve_lines else _compact_tool_text(text)
     stdout = str(payload.get("stdout") or "").strip()
     stderr = str(payload.get("stderr") or "").strip()
     exit_code = payload.get("exit_code")
@@ -719,6 +777,31 @@ def _command_output_summary(text: str) -> str:
     if stderr:
         return f"exit={exit_code}; {stderr}"
     return f"exit={exit_code}; no output"
+
+
+def _icinga_problem_overview(text: str, object_type: str) -> str:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return f"Icinga {object_type} problems:\n{_code_block(text)}"
+    if not isinstance(payload, dict):
+        return f"Icinga {object_type} problems:\n{_code_block(text)}"
+    count = int(payload.get("count") or 0)
+    problems = payload.get("problems") or []
+    if count == 0:
+        return f"Icinga {object_type} problems: `0`"
+    lines = [f"Icinga {object_type} problems: `{count}`"]
+    for item in problems[:10]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("host") or "unknown"
+        state = item.get("state", "unknown")
+        output = str(item.get("output") or "").strip()
+        lines.append(f"{name} state={state}" + (f" - {output}" if output else ""))
+    returned = int(payload.get("returned") or len(problems))
+    if count > returned:
+        lines.append(f"... {count - returned} more not shown")
+    return "\n".join(lines)
 
 
 def _missing_config() -> list[str]:
