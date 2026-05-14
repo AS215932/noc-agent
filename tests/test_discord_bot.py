@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.agent import ActionPlan
-from app.discord_bot import NOCDiscordBot
+from app.discord_bot import NOCDiscordBot, StatusOverview, parse_discord_operator_request
 from app.mcp_runtime import MCPRuntime
 
 
@@ -45,8 +45,23 @@ class FakeMessage:
         self.guild = SimpleNamespace(id=1)
         self.channel = SimpleNamespace(id=2)
         self.messages = []
+        self.threads = []
 
     async def reply(self, content, **kwargs):
+        self.messages.append((content, kwargs))
+
+    async def create_thread(self, name):
+        thread = FakeThread(name)
+        self.threads.append(thread)
+        return thread
+
+
+class FakeThread:
+    def __init__(self, name):
+        self.name = name
+        self.messages = []
+
+    async def send(self, content, **kwargs):
         self.messages.append((content, kwargs))
 
 
@@ -62,6 +77,30 @@ def _action_plan() -> ActionPlan:
         tools_used=["health/mcp"],
         operator_next_steps=["Check MCP daemon logs."],
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "target", "incident_id", "decision"),
+    [
+        ("status noc", "status", "noc", "", ""),
+        ("check bgp on cr1-nl1", "status", "cr1-nl1", "", ""),
+        ("investigate packet loss to ns2", "investigate", "packet loss to ns2", "", ""),
+        ("pending", "pending", "", "", ""),
+        ("show pending", "pending", "", "", ""),
+        ("status inc-abc123", "incident_status", "", "inc-abc123", ""),
+        ("show incident incident-1", "incident_status", "", "incident-1", ""),
+        ("approve inc-abc looks good", "decision", "", "inc-abc", "approved"),
+        ("reject inc-abc hold", "decision", "", "inc-abc", "rejected"),
+        ("wat", "help", "", "", ""),
+    ],
+)
+def test_parse_discord_operator_request(text, kind, target, incident_id, decision):
+    intent = parse_discord_operator_request(text)
+
+    assert intent.type == kind
+    assert intent.target == target
+    assert intent.incident_id == incident_id
+    assert intent.decision == decision
 
 
 @pytest.mark.asyncio
@@ -148,7 +187,7 @@ async def test_noc_investigate_reports_timeout(monkeypatch):
 async def test_mention_investigation_uses_same_safe_runner(monkeypatch):
     async def fake_graph(payload):
         assert payload["source"] == "discord-mention"
-        assert payload["commonAnnotations"]["summary"] == "investigate noc health"
+        assert payload["commonAnnotations"]["summary"] == "noc health"
         return _action_plan(), {"incident_id": "inc-mention"}
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
@@ -159,7 +198,114 @@ async def test_mention_investigation_uses_same_safe_runner(monkeypatch):
 
     await bot.handle_investigation_message(message)
     assert "Investigation accepted" in message.messages[0][0]
+    assert message.threads
     task = next(iter(bot._tasks))
     await task
 
-    assert any("inc-mention" in content for content, _ in message.messages)
+    assert any("inc-mention" in content for content, _ in message.threads[0].messages)
+
+
+@pytest.mark.asyncio
+async def test_status_mention_uses_fast_status_not_graph(monkeypatch):
+    graph_called = False
+
+    async def fake_graph(payload):
+        nonlocal graph_called
+        graph_called = True
+        return _action_plan(), {"incident_id": "inc-unexpected"}
+
+    async def fake_status(target, qualifiers, runtime):
+        assert target == "noc"
+        return StatusOverview(status="ok", target=target, summary="NOC is healthy.", checks=["MCP health: ok"])
+
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
+    monkeypatch.setattr("app.discord_bot.run_investigation_graph", fake_graph)
+    monkeypatch.setattr("app.discord_bot.run_fast_status_check", fake_status)
+    bot = NOCDiscordBot()
+    bot.client._connection.user = SimpleNamespace(id=123)
+    message = FakeMessage("<@123> status noc")
+
+    await bot.handle_operator_message(message)
+
+    assert graph_called is False
+    assert "Status for `noc`: `ok`" in message.messages[0][0]
+    assert not message.threads
+
+
+@pytest.mark.asyncio
+async def test_degraded_status_mention_posts_thread(monkeypatch):
+    async def fake_status(target, qualifiers, runtime):
+        return StatusOverview(
+            status="degraded",
+            target=target,
+            summary="MCP is degraded.",
+            checks=["XO tools unavailable."],
+            suggested_next_action='Reply with "investigate noc" to run the full investigation.',
+        )
+
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
+    monkeypatch.setattr("app.discord_bot.run_fast_status_check", fake_status)
+    bot = NOCDiscordBot()
+    bot.client._connection.user = SimpleNamespace(id=123)
+    message = FakeMessage("<@123> status noc")
+
+    await bot.handle_operator_message(message)
+
+    assert "Details are in the thread" in message.messages[0][0]
+    assert message.threads
+    assert "Status for `noc`: `degraded`" in message.threads[0].messages[0][0]
+
+
+@pytest.mark.asyncio
+async def test_unknown_mention_returns_help_and_starts_no_work(monkeypatch):
+    async def fake_graph(payload):
+        raise AssertionError("graph should not run")
+
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
+    monkeypatch.setattr("app.discord_bot.run_investigation_graph", fake_graph)
+    bot = NOCDiscordBot()
+    bot.client._connection.user = SimpleNamespace(id=123)
+    message = FakeMessage("<@123> something strange")
+
+    await bot.handle_operator_message(message)
+
+    assert "status noc" in message.messages[0][0]
+    assert not bot._tasks
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_mention_rejects_before_work(monkeypatch):
+    async def fake_status(target, qualifiers, runtime):
+        raise AssertionError("status should not run")
+
+    monkeypatch.setenv("DISCORD_ALLOWED_ROLE_IDS", "99")
+    monkeypatch.setattr("app.discord_bot.run_fast_status_check", fake_status)
+    bot = NOCDiscordBot()
+    bot.client._connection.user = SimpleNamespace(id=123)
+    message = FakeMessage("<@123> status noc")
+
+    await bot.handle_operator_message(message)
+
+    assert message.messages == [("Not authorized.", {})]
+
+
+@pytest.mark.asyncio
+async def test_decision_mention_records_operator_decision(monkeypatch):
+    calls = []
+
+    def fake_decision(incident_id, decision):
+        calls.append((incident_id, decision))
+        return {"incident_id": incident_id, "status": "approved", "title": "Done"}
+
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
+    monkeypatch.setattr("app.discord_bot.record_operator_decision", fake_decision)
+    bot = NOCDiscordBot()
+    bot.client._connection.user = SimpleNamespace(id=123)
+    message = FakeMessage("<@123> approve inc-1 looks safe")
+
+    await bot.handle_operator_message(message)
+
+    assert calls[0][0] == "inc-1"
+    assert calls[0][1]["decision"] == "approved"
+    assert calls[0][1]["comment"] == "looks safe"
+    assert "Recorded `approved`" in message.messages[0][0]
