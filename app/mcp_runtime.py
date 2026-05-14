@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,7 @@ class MCPSourceState:
 class MCPRuntime:
     def __init__(self, *, owner: str):
         self.owner = owner
+        self.connect_timeout_s = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
         self.clients: dict[str, HyruleMCPClient] = {}
         self.states: dict[str, MCPSourceState] = {
             "hyrule": MCPSourceState(source="hyrule"),
@@ -68,16 +70,37 @@ class MCPRuntime:
         state = self.states[source]
         client = HyruleMCPClient(config.get("command"), env=config.get("env"), url=config.get("url"))
         try:
-            await client.connect()
-            tools = await client.get_tools()
-            for tool in tools:
-                agent._function_toolset.add_tool(tool)
-                log.info("mcp_tool_loaded", owner=self.owner, source=source, name=tool.name)
-            self.clients[source] = client
+            tool_count = await asyncio.wait_for(
+                self._connect_and_register(client, agent, source),
+                timeout=self.connect_timeout_s,
+            )
             state.ready = True
-            state.tool_count = len(tools)
+            state.tool_count = tool_count
             state.error = None
-            log.info("mcp_tools_loaded", owner=self.owner, source=source, count=len(tools))
+            log.info("mcp_tools_loaded", owner=self.owner, source=source, count=tool_count)
+        except TimeoutError as exc:
+            state.ready = False
+            state.tool_count = 0
+            state.error = "mcp_timeout"
+            log_exception(
+                "mcp_connect_timeout",
+                exc,
+                category="mcp_timeout",
+                owner=self.owner,
+                source=source,
+                timeout_seconds=self.connect_timeout_s,
+            )
+            try:
+                await client.disconnect()
+            except Exception as disconnect_exc:
+                disconnect_safe = classify_exception(disconnect_exc)
+                log_exception(
+                    "mcp_disconnect_failed",
+                    disconnect_exc,
+                    category=disconnect_safe.category,
+                    owner=self.owner,
+                    source=source,
+                )
         except Exception as exc:
             state.ready = False
             state.tool_count = 0
@@ -95,6 +118,15 @@ class MCPRuntime:
                     owner=self.owner,
                     source=source,
                 )
+
+    async def _connect_and_register(self, client: HyruleMCPClient, agent: Any, source: str) -> int:
+        await client.connect()
+        tools = await client.get_tools()
+        for tool in tools:
+            agent._function_toolset.add_tool(tool)
+            log.info("mcp_tool_loaded", owner=self.owner, source=source, name=tool.name)
+        self.clients[source] = client
+        return len(tools)
 
     @staticmethod
     def _source_health(state: MCPSourceState) -> dict[str, Any]:
