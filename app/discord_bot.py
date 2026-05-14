@@ -394,6 +394,10 @@ def parse_discord_operator_request(text: str) -> OperatorIntent:
     if not raw or lowered in {"help", "?", "commands"}:
         return OperatorIntent(type="help", raw_text=raw)
 
+    natural_status = _natural_status_target(raw)
+    if natural_status:
+        return OperatorIntent(type="status", raw_text=raw, target=natural_status)
+
     words = raw.split()
     command = words[0].lower()
     rest = " ".join(words[1:]).strip()
@@ -420,17 +424,18 @@ def parse_discord_operator_request(text: str) -> OperatorIntent:
         )
 
     if command in {"investigate", "investigation", "debug"}:
-        return OperatorIntent(type="investigate", raw_text=raw, target=rest or raw)
+        return OperatorIntent(type="investigate", raw_text=raw, target=_clean_target(rest or raw))
 
     if command in {"status", "show"}:
         if not rest:
             return OperatorIntent(type="help", raw_text=raw)
         if rest.startswith("incident "):
-            incident_id = rest.split(maxsplit=1)[1]
+            incident_id = _clean_target(rest.split(maxsplit=1)[1])
             return OperatorIntent(type="incident_status", raw_text=raw, incident_id=incident_id)
-        if INCIDENT_ID_RE.match(rest):
-            return OperatorIntent(type="incident_status", raw_text=raw, incident_id=rest)
-        return OperatorIntent(type="status", raw_text=raw, target=rest)
+        target = _clean_target(rest)
+        if INCIDENT_ID_RE.match(target):
+            return OperatorIntent(type="incident_status", raw_text=raw, incident_id=target)
+        return OperatorIntent(type="status", raw_text=raw, target=target)
 
     if command == "check":
         match = re.match(r"(?P<subject>.+?)\s+on\s+(?P<target>\S+)$", rest, flags=re.IGNORECASE)
@@ -438,10 +443,10 @@ def parse_discord_operator_request(text: str) -> OperatorIntent:
             return OperatorIntent(
                 type="status",
                 raw_text=raw,
-                target=match.group("target"),
+                target=_clean_target(match.group("target")),
                 qualifiers={"check": match.group("subject").strip()},
             )
-        return OperatorIntent(type="status", raw_text=raw, target=rest or raw)
+        return OperatorIntent(type="status", raw_text=raw, target=_clean_target(rest or raw))
 
     return OperatorIntent(type="help", raw_text=raw)
 
@@ -621,6 +626,28 @@ def _help_text() -> str:
 def _thread_name(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "investigation")).strip("-").lower()
     return f"noc-{cleaned or 'investigation'}"[:90]
+
+
+def _natural_status_target(text: str) -> str:
+    query = str(text or "").strip().strip("?.!")
+    patterns = (
+        r"^(?:what(?:'s| is)|show me|give me)\s+(?:the\s+)?status\s+(?:of|for)\s+(?P<target>.+)$",
+        r"^(?:what(?:'s| is)|show me|give me)\s+(?P<target>.+?)\s+status$",
+        r"^(?:how is|how's)\s+(?P<target>.+?)(?:\s+doing)?$",
+        r"^is\s+(?P<target>.+?)\s+(?:ok|okay|up|down|healthy|degraded)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, query, flags=re.IGNORECASE)
+        if match:
+            return _clean_target(match.group("target"))
+    return ""
+
+
+def _clean_target(value: str) -> str:
+    cleaned = str(value or "").strip().strip("`'\".,?!:;()[]{}")
+    if re.match(r"^cr\d+\.(?:de\d+|nl\d+)$", cleaned, flags=re.IGNORECASE):
+        cleaned = cleaned.replace(".", "-")
+    return cleaned
 
 
 def _is_noc_target(target: str) -> bool:
