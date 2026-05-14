@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shlex
 from typing import Any, Awaitable, Callable
 
 from app import log
 from app.agent import noc_triage_agent
 from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
+from app.mcp_runtime import MCPRuntime
 from app.safe_errors import classify_exception, log_exception
-from app.tools.mcp_client import HyruleMCPClient
 
 try:  # pragma: no cover - import availability depends on runtime extras
     import discord
@@ -38,7 +37,7 @@ class NOCDiscordBot:
         self.investigation_timeout_s = float(
             os.getenv("DISCORD_INVESTIGATION_TIMEOUT_SECONDS", str(DEFAULT_INVESTIGATION_TIMEOUT_SECONDS))
         )
-        self._mcp_clients: list[HyruleMCPClient] = []
+        self._mcp_runtime = MCPRuntime(owner="discord_bot")
         self._tasks: set[asyncio.Task] = set()
         self._register_handlers()
 
@@ -49,10 +48,10 @@ class NOCDiscordBot:
             return
         log.info("discord_bot_starting")
         try:
-            await self._connect_mcp_tools()
+            await self._mcp_runtime.connect_tools(noc_triage_agent)
             await self.client.start(token)
         finally:
-            await self._disconnect_mcp_tools()
+            await self._mcp_runtime.disconnect()
 
     async def send_embed(self, title: str, description: str, color: int, fields: list[dict[str, Any]] | None = None):
         if self.channel_id is None:
@@ -236,63 +235,6 @@ class NOCDiscordBot:
 
         task.add_done_callback(_done)
         return task
-
-    async def _connect_mcp_tools(self) -> None:
-        if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
-            log.info("discord_bot_mcp_disabled")
-            return
-        await self._connect_one_mcp(
-            source="hyrule",
-            command=shlex.split(os.environ["HYRULE_MCP_CMD"]) if not os.getenv("HYRULE_MCP_URL", "").strip() else None,
-            url=os.getenv("HYRULE_MCP_URL", "").strip() or None,
-        )
-        xo_env = os.environ.copy()
-        xo_env.setdefault("XO_URL", "https://xo.servify.network")
-        xo_env.setdefault("XO_MCP_ENABLE_ACTIONS", "0")
-        await self._connect_one_mcp(
-            source="xo",
-            command=shlex.split(os.environ["XO_MCP_CMD"]),
-            env=xo_env,
-        )
-
-    async def _connect_one_mcp(
-        self,
-        *,
-        source: str,
-        command: list[str] | None,
-        env: dict[str, str] | None = None,
-        url: str | None = None,
-    ) -> None:
-        client = HyruleMCPClient(command, env=env, url=url)
-        try:
-            await client.connect()
-            tools = await client.get_tools()
-            for tool in tools:
-                noc_triage_agent._function_toolset.add_tool(tool)
-            self._mcp_clients.append(client)
-            log.info("discord_bot_mcp_tools_loaded", source=source, count=len(tools))
-        except Exception as exc:
-            safe = classify_exception(exc)
-            log_exception("discord_bot_mcp_connect_failed", exc, category=safe.category, source=source)
-            try:
-                await client.disconnect()
-            except Exception as disconnect_exc:
-                disconnect_safe = classify_exception(disconnect_exc)
-                log_exception(
-                    "discord_bot_mcp_disconnect_failed",
-                    disconnect_exc,
-                    category=disconnect_safe.category,
-                    source=source,
-                )
-
-    async def _disconnect_mcp_tools(self) -> None:
-        while self._mcp_clients:
-            client = self._mcp_clients.pop()
-            try:
-                await client.disconnect()
-            except Exception as exc:
-                safe = classify_exception(exc)
-                log_exception("discord_bot_mcp_disconnect_failed", exc, category=safe.category)
 
     def _authorized(self, interaction) -> bool:
         if self.allowed_guilds and getattr(interaction.guild, "id", None) not in self.allowed_guilds:

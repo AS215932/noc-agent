@@ -1,5 +1,4 @@
 import os
-import shlex
 import asyncio
 import fcntl
 import hashlib
@@ -21,14 +20,11 @@ from app.model_metrics import STATE as MODEL_STATE
 from app.model_metrics import metrics_response, record_failure, record_success, start_run
 from app.quota import check_gemini_quota
 from app.safe_errors import classify_exception, log_exception, safe_health_error
-from app.tools.mcp_client import HyruleMCPClient
+from app.mcp_runtime import MCPRuntime
 from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
 from app.noc_state import ApprovalDecision
 
-mcp_client = None
-xo_mcp_client = None
-hyrule_mcp_tool_count = 0
-xo_mcp_tool_count = 0
+mcp_runtime = MCPRuntime(owner="api")
 mail_poller_task = None
 mail_poller_lock_fd = None
 discord_bot = None
@@ -39,7 +35,9 @@ REQUIRED_CONFIG = [
     "GEMINI_API_KEY",
     "DISCORD_WEBHOOK_URL",
     "HYRULE_MCP_CMD",
+    "HYRULE_MCP_URL",
     "XO_MCP_CMD",
+    "XO_MCP_URL",
     "XO_TOKEN",
     "ICINGA_API_USER",
     "ICINGA_API_PASSWORD",
@@ -81,50 +79,15 @@ async def _mail_poll_loop(lock_fd: int):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mcp_client
-    global xo_mcp_client
-    global hyrule_mcp_tool_count
-    global xo_mcp_tool_count
+    global mcp_runtime
     global mail_poller_task
     global mail_poller_lock_fd
     global discord_bot
     global discord_bot_task
     log.info("startup_begin")
 
-    if os.getenv("NOC_AGENT_DISABLE_MCP") != "1":
-        hyrule_url = os.getenv("HYRULE_MCP_URL", "").strip()
-        hyrule_cmd = shlex.split(os.environ["HYRULE_MCP_CMD"]) if not hyrule_url else None
-        mcp_client = HyruleMCPClient(hyrule_cmd, url=hyrule_url or None)
-        try:
-            await mcp_client.connect()
-            tools = await mcp_client.get_tools()
-            for t in tools:
-                noc_triage_agent._function_toolset.add_tool(t)
-                log.info("mcp_tool_loaded", source="hyrule", name=t.name)
-            hyrule_mcp_tool_count = len(tools)
-            log.info("mcp_tools_loaded", source="hyrule", count=hyrule_mcp_tool_count)
-        except Exception as e:
-            hyrule_mcp_tool_count = 0
-            safe = classify_exception(e)
-            log_exception("hyrule_mcp_connect_failed", e, category=safe.category)
-
-        xo_cmd = shlex.split(os.environ["XO_MCP_CMD"])
-        xo_env = os.environ.copy()
-        xo_env.setdefault("XO_URL", "https://xo.servify.network")
-        xo_env.setdefault("XO_MCP_ENABLE_ACTIONS", "0")
-        xo_mcp_client = HyruleMCPClient(xo_cmd, env=xo_env)
-        try:
-            await xo_mcp_client.connect()
-            xo_tools = await xo_mcp_client.get_tools()
-            for t in xo_tools:
-                noc_triage_agent._function_toolset.add_tool(t)
-                log.info("mcp_tool_loaded", source="xo", name=t.name)
-            xo_mcp_tool_count = len(xo_tools)
-            log.info("mcp_tools_loaded", source="xo", count=xo_mcp_tool_count)
-        except Exception as e:
-            xo_mcp_tool_count = 0
-            safe = classify_exception(e)
-            log_exception("xo_mcp_connect_failed", e, category=safe.category)
+    mcp_runtime = MCPRuntime(owner="api")
+    await mcp_runtime.connect_tools(noc_triage_agent)
 
     if os.getenv("MAIL_IMAP_PASSWORD"):
         mail_poller_lock_fd = _try_acquire_mail_poller_lock()
@@ -165,25 +128,13 @@ async def lifespan(app: FastAPI):
         _release_mail_poller_lock(mail_poller_lock_fd)
     mail_poller_lock_fd = None
 
-    if mcp_client:
-        await _disconnect_mcp_client("hyrule", mcp_client)
-
-    if xo_mcp_client:
-        await _disconnect_mcp_client("xo", xo_mcp_client)
+    await mcp_runtime.disconnect()
 
     log.info("shutdown")
 
 
 def _embedded_discord_bot_enabled() -> bool:
     return os.getenv("NOC_AGENT_START_EMBEDDED_BOT", "").strip() == "1"
-
-
-async def _disconnect_mcp_client(source: str, client: HyruleMCPClient) -> None:
-    try:
-        await client.disconnect()
-    except Exception as exc:
-        safe = classify_exception(exc)
-        log_exception("mcp_disconnect_failed", exc, category=safe.category, source=source)
 
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
@@ -601,15 +552,7 @@ async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | N
 
 @app.get("/health/mcp")
 async def health_mcp(response: Response):
-    hyrule_ready = mcp_client is not None and mcp_client.session is not None and hyrule_mcp_tool_count > 0
-    xo_ready = xo_mcp_client is not None and xo_mcp_client.session is not None and xo_mcp_tool_count > 0
-    health = {
-        "hyrule": hyrule_ready,
-        "xo": xo_ready,
-        "hyrule_tool_count": hyrule_mcp_tool_count,
-        "xo_tool_count": xo_mcp_tool_count,
-    }
-    health["status"] = "ok" if hyrule_ready and xo_ready else "degraded"
+    health = mcp_runtime.health()
     if health["status"] != "ok":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return health
@@ -620,6 +563,12 @@ async def health_config(response: Response):
     missing = [name for name in REQUIRED_CONFIG if not os.getenv(name)]
     if os.getenv("HYRULE_MCP_URL"):
         missing = [name for name in missing if name != "HYRULE_MCP_CMD"]
+    if os.getenv("HYRULE_MCP_CMD"):
+        missing = [name for name in missing if name != "HYRULE_MCP_URL"]
+    if os.getenv("XO_MCP_URL"):
+        missing = [name for name in missing if name != "XO_MCP_CMD"]
+    if os.getenv("XO_MCP_CMD"):
+        missing = [name for name in missing if name != "XO_MCP_URL"]
     disabled = []
     if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
         disabled.append("mcp")

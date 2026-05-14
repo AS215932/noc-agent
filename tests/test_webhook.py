@@ -18,6 +18,7 @@ from app.main import (
     icinga_webhook,
 )
 from app.agent import ActionPlan
+from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
 
 @pytest.fixture
@@ -59,10 +60,7 @@ async def test_health_check():
 
 @pytest.mark.asyncio
 async def test_health_mcp_reports_degraded_when_tools_missing(mocker):
-    mocker.patch("app.main.mcp_client", None)
-    mocker.patch("app.main.xo_mcp_client", None)
-    mocker.patch("app.main.hyrule_mcp_tool_count", 0)
-    mocker.patch("app.main.xo_mcp_tool_count", 0)
+    mocker.patch("app.main.mcp_runtime", MCPRuntime(owner="test"))
     http_response = Response()
 
     response = await health_mcp(http_response)
@@ -73,10 +71,12 @@ async def test_health_mcp_reports_degraded_when_tools_missing(mocker):
 
 @pytest.mark.asyncio
 async def test_health_mcp_requires_registered_tools(mocker):
-    mocker.patch("app.main.mcp_client", type("Client", (), {"session": object()})())
-    mocker.patch("app.main.xo_mcp_client", type("Client", (), {"session": object()})())
-    mocker.patch("app.main.hyrule_mcp_tool_count", 0)
-    mocker.patch("app.main.xo_mcp_tool_count", 3)
+    runtime = MCPRuntime(owner="test")
+    runtime.states["hyrule"].ready = True
+    runtime.states["hyrule"].tool_count = 0
+    runtime.states["xo"].ready = True
+    runtime.states["xo"].tool_count = 3
+    mocker.patch("app.main.mcp_runtime", runtime)
     http_response = Response()
 
     response = await health_mcp(http_response)

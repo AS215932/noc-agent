@@ -5,6 +5,7 @@ import pytest
 
 from app.agent import ActionPlan
 from app.discord_bot import NOCDiscordBot
+from app.mcp_runtime import MCPRuntime
 
 
 class FakeResponse:
@@ -61,6 +62,31 @@ def _action_plan() -> ActionPlan:
         tools_used=["health/mcp"],
         operator_next_steps=["Check MCP daemon logs."],
     )
+
+
+@pytest.mark.asyncio
+async def test_bot_start_uses_shared_mcp_runtime(monkeypatch):
+    calls = []
+
+    class FakeRuntime:
+        async def connect_tools(self, agent):
+            calls.append("connect")
+
+        async def disconnect(self):
+            calls.append("disconnect")
+
+    async def fake_start(token):
+        calls.append(("start", token))
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "token")
+    bot = NOCDiscordBot()
+    assert isinstance(bot._mcp_runtime, MCPRuntime)
+    bot._mcp_runtime = FakeRuntime()
+    monkeypatch.setattr(bot.client, "start", fake_start)
+
+    await bot.start()
+
+    assert calls == ["connect", ("start", "token"), "disconnect"]
 
 
 @pytest.mark.asyncio
