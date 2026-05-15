@@ -162,7 +162,7 @@ async def test_bot_start_uses_shared_mcp_runtime(monkeypatch):
     calls = []
 
     class FakeRuntime:
-        async def connect_tools(self, agent):
+        async def connect_tools(self):
             calls.append("connect")
 
         async def disconnect(self):

@@ -6,6 +6,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic_ai.toolsets import FunctionToolset
+
 from app import log
 from app.safe_errors import classify_exception, log_exception
 from app.tools.mcp_client import HyruleMCPClient
@@ -24,17 +26,18 @@ class MCPRuntime:
         self.owner = owner
         self.connect_timeout_s = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
         self.clients: dict[str, HyruleMCPClient] = {}
+        self.tools_by_source: dict[str, list[Any]] = {"hyrule": [], "xo": []}
         self.states: dict[str, MCPSourceState] = {
             "hyrule": MCPSourceState(source="hyrule"),
             "xo": MCPSourceState(source="xo"),
         }
 
-    async def connect_tools(self, agent: Any) -> None:
+    async def connect_tools(self, agent: Any | None = None) -> None:
         if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
             log.info("mcp_runtime_disabled", owner=self.owner)
             return
-        await self._connect_source(agent, self._hyrule_config())
-        await self._connect_source(agent, self._xo_config())
+        await self._connect_source(self._hyrule_config())
+        await self._connect_source(self._xo_config())
 
     async def disconnect(self) -> None:
         while self.clients:
@@ -47,6 +50,7 @@ class MCPRuntime:
             finally:
                 self.states[source].ready = False
                 self.states[source].tool_count = 0
+                self.tools_by_source[source] = []
 
     def health(self) -> dict[str, Any]:
         hyrule = self.states["hyrule"]
@@ -65,13 +69,13 @@ class MCPRuntime:
             "status": "ok" if hyrule_ready and xo_ready else "degraded",
         }
 
-    async def _connect_source(self, agent: Any, config: dict[str, Any]) -> None:
+    async def _connect_source(self, config: dict[str, Any]) -> None:
         source = config["source"]
         state = self.states[source]
         client = HyruleMCPClient(config.get("command"), env=config.get("env"), url=config.get("url"))
         try:
             tool_count = await asyncio.wait_for(
-                self._connect_and_register(client, agent, source),
+                self._connect_and_register(client, source),
                 timeout=self.connect_timeout_s,
             )
             state.ready = True
@@ -119,14 +123,26 @@ class MCPRuntime:
                     source=source,
                 )
 
-    async def _connect_and_register(self, client: HyruleMCPClient, agent: Any, source: str) -> int:
+    async def _connect_and_register(self, client: HyruleMCPClient, source: str) -> int:
         await client.connect()
         tools = await client.get_tools()
+        self.tools_by_source[source] = tools
         for tool in tools:
-            agent._function_toolset.add_tool(tool)
             log.info("mcp_tool_loaded", owner=self.owner, source=source, name=tool.name)
         self.clients[source] = client
         return len(tools)
+
+    def tools_for(self, specialist: str | None = None) -> list[Any]:
+        hyrule = list(self.tools_by_source.get("hyrule", []))
+        xo = list(self.tools_by_source.get("xo", []))
+        names = _allowed_tool_names(specialist)
+        return [tool for tool in [*hyrule, *xo] if getattr(tool, "name", "") in names]
+
+    def toolsets_for(self, specialist: str | None = None) -> list[FunctionToolset]:
+        tools = self.tools_for(specialist)
+        if not tools:
+            return []
+        return [FunctionToolset(tools)]
 
     @staticmethod
     def _source_health(state: MCPSourceState) -> dict[str, Any]:
@@ -150,3 +166,56 @@ class MCPRuntime:
         env.setdefault("XO_URL", "https://xo.servify.network")
         env.setdefault("XO_MCP_ENABLE_ACTIONS", "0")
         return {"source": "xo", "command": command, "url": url or None, "env": env}
+
+
+TRIAGE_TOOLS = {
+    "prometheus_list_targets",
+    "icinga_get_host_state",
+    "icinga_list_problems",
+}
+BGP_TOOLS = {
+    "frr_vtysh_cmd",
+    "path_explain",
+    "ecmp_path_select",
+    "multi_source_probe",
+    "prometheus_query",
+    "prometheus_list_targets",
+    "os_systemd_status",
+    "os_rcctl_check",
+}
+FIREWALL_TOOLS = {
+    "firewall_state",
+    "pf_log_tail",
+    "nft_log_tail",
+    "tcpdump_capture",
+    "ndp_state",
+    "arp_state",
+    "path_explain",
+    "prometheus_query",
+}
+INFRASTRUCTURE_TOOLS = {
+    "icinga_get_host_state",
+    "icinga_list_problems",
+    "prometheus_query",
+    "prometheus_list_targets",
+    "os_systemd_status",
+    "os_rcctl_check",
+    "os_journalctl",
+    "dmesg_tail",
+    "service_restart_history",
+    "vault_agent_status",
+    "dns_dig",
+    "dns_probe_burst",
+    "knot_zone_status",
+    "wg_show",
+}
+
+
+def _allowed_tool_names(specialist: str | None) -> set[str]:
+    if specialist == "bgp":
+        return BGP_TOOLS
+    if specialist == "security_firewall":
+        return FIREWALL_TOOLS
+    if specialist == "infrastructure":
+        return INFRASTRUCTURE_TOOLS
+    return TRIAGE_TOOLS

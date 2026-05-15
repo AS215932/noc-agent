@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
     log.info("startup_begin")
 
     mcp_runtime = MCPRuntime(owner="api")
-    await mcp_runtime.connect_tools(noc_triage_agent)
+    await mcp_runtime.connect_tools()
 
     if os.getenv("MAIL_IMAP_PASSWORD"):
         mail_poller_lock_fd = _try_acquire_mail_poller_lock()
@@ -355,7 +355,7 @@ async def investigate_alert(alert_payload: dict, model=None):
 
     run_started = start_run("triage")
     try:
-        plan, graph_state = await run_investigation_graph(alert_payload, model=model)
+        plan, graph_state = await run_investigation_graph(alert_payload, model=model, mcp_runtime=mcp_runtime)
         record_success("triage", run_started, _SyntheticRunResult())
     except Exception as e:
         safe = classify_exception(e)
@@ -509,13 +509,13 @@ async def health_check():
 @app.get("/control/incidents/pending")
 async def pending_incidents(x_noc_control_token: str | None = Header(default=None)):
     _require_control_token(x_noc_control_token)
-    return {"status": "ok", "incidents": pending_summaries()}
+    return {"status": "ok", "incidents": await pending_summaries()}
 
 
 @app.get("/control/incidents/{incident_id}")
 async def incident_status(incident_id: str, x_noc_control_token: str | None = Header(default=None)):
     _require_control_token(x_noc_control_token)
-    summary = summary_for(incident_id)
+    summary = await summary_for(incident_id)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return summary
@@ -529,7 +529,7 @@ async def decide_incident(
 ):
     _require_control_token(x_noc_control_token)
     decision = ApprovalDecision(incident_id=incident_id, **request.model_dump())
-    summary = record_operator_decision(incident_id, decision.model_dump())
+    summary = await record_operator_decision(incident_id, decision.model_dump())
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return {"status": "ok", "incident": summary}
@@ -544,7 +544,7 @@ async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | N
         operator=request.operator,
         comment=request.comment,
     )
-    summary = record_operator_decision(request.incident_id, decision.model_dump())
+    summary = await record_operator_decision(request.incident_id, decision.model_dump())
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return {"status": "ok", "incident": summary}

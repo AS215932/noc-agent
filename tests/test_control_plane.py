@@ -21,7 +21,7 @@ async def test_local_control_plane_lists_and_decides(monkeypatch):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     memory = IncidentMemory(redis_url="")
     monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
-    memory.put_summary("incident-1", {"incident_id": "incident-1", "status": "waiting_approval", "title": "packet loss"})
+    await memory.put_summary("incident-1", {"incident_id": "incident-1", "status": "waiting_approval", "title": "packet loss"})
 
     pending = await pending_incidents("secret")
     shown = await incident_status("incident-1", "secret")
@@ -41,7 +41,7 @@ async def test_signed_resume_uses_hmac(monkeypatch):
     monkeypatch.setenv("NOC_APPROVAL_SIGNING_SECRET", "sign-me")
     memory = IncidentMemory(redis_url="")
     monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
-    memory.put_summary("incident-2", {"incident_id": "incident-2", "status": "waiting_approval", "title": "bgp"})
+    await memory.put_summary("incident-2", {"incident_id": "incident-2", "status": "waiting_approval", "title": "bgp"})
     request = SignedApprovalRequest(
         incident_id="incident-2",
         decision="rejected",

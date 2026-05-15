@@ -81,7 +81,7 @@ class NOCDiscordBot:
             return
         log.info("discord_bot_starting")
         try:
-            await self._mcp_runtime.connect_tools(noc_triage_agent)
+            await self._mcp_runtime.connect_tools()
             await self.client.start(token)
         finally:
             await self._mcp_runtime.disconnect()
@@ -116,7 +116,7 @@ class NOCDiscordBot:
             if not self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
-            incidents = pending_summaries()
+            incidents = await pending_summaries()
             if not incidents:
                 await interaction.response.send_message("No pending NOC proposals.", ephemeral=True)
                 return
@@ -132,7 +132,7 @@ class NOCDiscordBot:
             if not self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
-            summary = summary_for(incident_id)
+            summary = await summary_for(incident_id)
             await interaction.response.send_message(
                 "Incident not found." if summary is None else f"`{incident_id}` {summary['status']}: {summary['title']}",
                 ephemeral=True,
@@ -144,7 +144,7 @@ class NOCDiscordBot:
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
             operator = str(getattr(interaction.user, "id", "discord"))
-            summary = record_operator_decision(
+            summary = await _maybe_await(record_operator_decision(
                 incident_id,
                 {
                     "incident_id": incident_id,
@@ -152,7 +152,7 @@ class NOCDiscordBot:
                     "operator": operator,
                     "comment": comment,
                 },
-            )
+            ))
             await interaction.response.send_message(
                 "Incident not found." if summary is None else f"Recorded `{decision}` for `{incident_id}`.",
                 ephemeral=True,
@@ -226,15 +226,15 @@ class NOCDiscordBot:
             return
 
         if intent.type == "pending":
-            await _safe_send(message.reply, _format_pending())
+            await _safe_send(message.reply, await _format_pending())
             return
 
         if intent.type == "incident_status":
-            await _safe_send(message.reply, _format_incident_status(intent.incident_id))
+            await _safe_send(message.reply, await _format_incident_status(intent.incident_id))
             return
 
         if intent.type == "decision":
-            summary = record_operator_decision(
+            summary = await _maybe_await(record_operator_decision(
                 intent.incident_id,
                 {
                     "incident_id": intent.incident_id,
@@ -242,7 +242,7 @@ class NOCDiscordBot:
                     "operator": operator,
                     "comment": intent.comment,
                 },
-            )
+            ))
             await _safe_send(
                 message.reply,
                 "Incident not found." if summary is None else f"Recorded `{intent.decision}` for `{intent.incident_id}`.",
@@ -465,7 +465,7 @@ async def run_fast_status_check(target: str, qualifiers: dict[str, str] | None, 
     checks: list[str] = []
     status = "ok"
 
-    incident = summary_for(target)
+    incident = await summary_for(target)
     if incident is not None:
         checks.append(f"Incident `{target}` is `{incident.get('status', 'unknown')}`: {incident.get('title', 'No title')}")
         return StatusOverview(status="ok", target=target, summary="Incident summary found.", checks=checks)
@@ -573,6 +573,10 @@ async def _safe_send(send: Callable[..., Awaitable[Any]], content: str, **kwargs
         log_exception("discord_investigation_reply_failed", exc, category=safe.category)
 
 
+async def _maybe_await(value):
+    return await value if hasattr(value, "__await__") else value
+
+
 def _csv_ints(name: str) -> set[int]:
     values = os.getenv(name, "")
     result: set[int] = set()
@@ -659,8 +663,8 @@ def _format_check_line(check: str) -> str:
     return f"- {check}" if "\n" not in check else f"- {check}"
 
 
-def _format_pending() -> str:
-    incidents = pending_summaries()
+async def _format_pending() -> str:
+    incidents = await pending_summaries()
     if not incidents:
         return "No pending NOC proposals."
     lines = ["Pending NOC proposals:"]
@@ -668,8 +672,8 @@ def _format_pending() -> str:
     return "\n".join(lines)
 
 
-def _format_incident_status(incident_id: str) -> str:
-    summary = summary_for(incident_id)
+async def _format_incident_status(incident_id: str) -> str:
+    summary = await summary_for(incident_id)
     if summary is None:
         return "Incident not found."
     return f"`{incident_id}` {summary['status']}: {summary['title']}"

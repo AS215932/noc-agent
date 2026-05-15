@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any
 from contextlib import AsyncExitStack
 from mcp.client.stdio import stdio_client
@@ -73,8 +74,14 @@ class HyruleMCPClient:
         async def tool_runner(**kwargs: Any) -> Any:
             try:
                 result = await self.session.call_tool(mcp_tool.name, arguments=kwargs)
+                structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
+                if structured is not None:
+                    return _json_safe(structured)
                 out = ""
                 for block in result.content:
+                    block_structured = getattr(block, "structuredContent", None) or getattr(block, "structured_content", None)
+                    if block_structured is not None:
+                        return _json_safe(block_structured)
                     if hasattr(block, "text"):
                         out += block.text + "\n"
                 return out.strip() if out else "Executed successfully."
@@ -95,3 +102,11 @@ class HyruleMCPClient:
             json_schema=json_schema,
             takes_ctx=False,
         )
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return json.loads(json.dumps(value, default=str))

@@ -182,6 +182,32 @@ async def test_tool_runner_concatenates_all_text_blocks():
 
 
 @pytest.mark.asyncio
+async def test_tool_runner_prefers_structured_mcp_content():
+    client = HyruleMCPClient(["dummy"])
+
+    class StructuredSession(_FakeSession):
+        async def call_tool(self, name, arguments):
+            self.calls.append((name, arguments))
+            return SimpleNamespace(
+                structuredContent={
+                    "schema_version": "2026-05-15.v1",
+                    "ok": False,
+                    "tool": name,
+                    "error_type": "unsupported_os",
+                    "sanitized_error": "Use os_rcctl_check instead.",
+                },
+                content=[],
+            )
+
+    client.session = StructuredSession()
+    tool = client._create_pydantic_tool(_make_mcp_tool())
+    result = await tool.function(host="mail", command="systemctl status smtpd")
+
+    assert result["schema_version"] == "2026-05-15.v1"
+    assert result["error_type"] == "unsupported_os"
+
+
+@pytest.mark.asyncio
 async def test_tool_runner_returns_default_when_no_text_blocks():
     client = HyruleMCPClient(["dummy"])
 

@@ -70,7 +70,8 @@ async def test_runtime_loads_hyrule_and_xo_from_urls(monkeypatch):
         "http://127.0.0.1:8765/mcp",
         "http://127.0.0.1:8766/mcp",
     ]
-    assert [tool.name for tool in agent._function_toolset.tools] == ["hyrule_tool", "xo_tool"]
+    assert [tool.name for tool in runtime.tools_by_source["hyrule"]] == ["hyrule_tool"]
+    assert [tool.name for tool in runtime.tools_by_source["xo"]] == ["xo_tool"]
     assert runtime.health()["status"] == "ok"
 
 
