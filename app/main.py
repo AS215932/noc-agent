@@ -290,9 +290,25 @@ def _fallback_operator_next_steps(alert_payload: dict) -> list[str]:
     return steps
 
 
-def _action_plan_text(plan, alert_payload: dict) -> str:
+def _diagnostic_next_steps_text(plan, alert_payload: dict) -> str:
+    proposal = plan.remediation_proposal
+    if proposal is not None:
+        actions = proposal.proposed_actions or plan.recommended_next_checks or _fallback_operator_next_steps(alert_payload)
+        details = [
+            "**Remediation proposal requires human approval**",
+            f"Reason: {_operator_reason(plan)}",
+            "",
+            "Proposed actions:",
+            _format_list(actions, "No proposed actions were provided."),
+        ]
+        if proposal.risk:
+            details.extend(["", f"Risk: {proposal.risk}"])
+        if proposal.rollback:
+            details.extend(["", f"Rollback: {proposal.rollback}"])
+        return _truncate_discord("\n".join(details))
+
     if plan.requires_human:
-        steps = plan.operator_next_steps or _fallback_operator_next_steps(alert_payload)
+        steps = plan.recommended_next_checks or _fallback_operator_next_steps(alert_payload)
         return _truncate_discord(
             "**Human review required**\n"
             f"Reason: {_operator_reason(plan)}\n\n"
@@ -300,34 +316,77 @@ def _action_plan_text(plan, alert_payload: dict) -> str:
             f"{_format_list(steps, 'No operator steps were provided.')}"
         )
 
-    if plan.automated_actions_proposed:
-        return (
-            "**Autonomous actions proposed**\n"
-            f"{_format_list(plan.automated_actions_proposed, 'No automated actions were proposed.')}"
-        )
+    return _format_list(plan.recommended_next_checks, "No further diagnostic checks were recommended.")
 
-    return "No further action necessary."
+
+def _evidence_lines(plan) -> list[str]:
+    return [
+        " | ".join(
+            part
+            for part in [
+                item.evidence_id,
+                item.tool,
+                item.target,
+                item.interpretation or item.observed_value,
+            ]
+            if part
+        )
+        for item in plan.evidence_chain
+    ]
+
+
+def _delta_lines(plan) -> list[str]:
+    return [
+        f"{delta.subject} {delta.attribute}: expected `{delta.expected_value or 'unknown'}`, observed `{delta.observed_value or 'unknown'}`"
+        for delta in plan.deltas
+    ]
+
+
+def _contradiction_lines(plan) -> list[str]:
+    return [
+        f"{item.status}: {item.summary}" + (f" Next check: {item.next_check}" if item.next_check else "")
+        for item in plan.contradictions
+    ]
+
+
+def _assessment_text(plan) -> str:
+    facts = [fact.statement for fact in plan.confirmed_facts if fact.statement]
+    hypotheses = [hypothesis.statement for hypothesis in plan.hypotheses if hypothesis.statement]
+    parts = []
+    if facts:
+        parts.append("Facts: " + "; ".join(facts[:3]))
+    if hypotheses:
+        parts.append("Hypotheses: " + "; ".join(hypotheses[:3]))
+    if plan.confidence_basis:
+        parts.append("Confidence basis: " + plan.confidence_basis)
+    return _truncate_discord("\n".join(parts) or plan.incident_summary)
 
 
 def _triage_fields(plan, alert_payload: dict) -> list[dict]:
     return [
         {"name": "Alert", "value": _alert_overview(alert_payload)},
-        {"name": "Assessment", "value": _truncate_discord(plan.diagnosis.root_cause_analysis)},
+        {"name": "Assessment", "value": _assessment_text(plan)},
         {
-            "name": "Evidence",
+            "name": "Evidence Chain",
             "value": _format_list(
-                plan.diagnostic_evidence,
-                "No live diagnostic evidence was recorded. Review the action plan before making changes.",
+                _evidence_lines(plan),
+                "No live diagnostic evidence was recorded. Review the synthesis before making changes.",
             ),
         },
         {
-            "name": "Tools",
-            "value": _format_list(plan.tools_used, "No MCP diagnostics were recorded for this run."),
-            "inline": True,
+            "name": "Deltas",
+            "value": _format_list(_delta_lines(plan), "No manifest-vs-telemetry deltas were confirmed."),
         },
-        {"name": "Confidence", "value": f"{plan.diagnosis.confidence_score * 100:.1f}%", "inline": True},
-        {"name": "Severity", "value": plan.diagnosis.severity, "inline": True},
-        {"name": "Action Plan", "value": _action_plan_text(plan, alert_payload)},
+        {
+            "name": "Contradictions / Missing Evidence",
+            "value": _format_list(
+                _contradiction_lines(plan),
+                "No telemetry contradictions were reported.",
+            ),
+        },
+        {"name": "Confidence", "value": f"{plan.confidence_score * 100:.1f}%", "inline": True},
+        {"name": "Severity", "value": plan.severity, "inline": True},
+        {"name": "Next Checks / Proposal", "value": _diagnostic_next_steps_text(plan, alert_payload)},
     ]
 
 
@@ -377,23 +436,23 @@ async def investigate_alert(alert_payload: dict, model=None):
 
     log.info(
         "investigation_complete",
-        summary=plan.diagnosis.issue_summary,
-        confidence=plan.diagnosis.confidence_score,
-        severity=plan.diagnosis.severity,
+        summary=plan.incident_summary,
+        confidence=plan.confidence_score,
+        severity=plan.severity,
         requires_human=plan.requires_human,
         escalation_reason=plan.human_escalation_reason if plan.requires_human else None,
-        proposed_actions=list(plan.automated_actions_proposed) if not plan.requires_human else [],
+        proposed_actions=list(plan.remediation_proposal.proposed_actions) if plan.remediation_proposal else [],
         incident_id=graph_state.get("incident_id"),
         active_specialist=graph_state.get("active_specialist"),
     )
 
-    color = _severity_color(plan.diagnosis.severity, plan.requires_human)
+    color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
     await send_discord_notification(
-        title=f"Detailed Report: {plan.diagnosis.issue_summary}",
+        title=f"Detailed Report: {plan.incident_summary}",
         description=_truncate_discord(
             f"{'Escalated to human review' if plan.requires_human else 'Triage completed'} "
-            f"with {plan.diagnosis.confidence_score * 100:.1f}% confidence.",
+            f"with {plan.confidence_score * 100:.1f}% confidence.",
             DISCORD_DESCRIPTION_LIMIT,
         ),
         color=color,
@@ -486,7 +545,7 @@ async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
             result = await noc_triage_agent.run(request.prompt)
             plan = result.data if hasattr(result, 'data') else result.output
             record_success("manual_task", run_started, result)
-            await notify_finish("Manual Task", f"Task completed: {plan.diagnosis.issue_summary}")
+            await notify_finish("Manual Task", f"Task completed: {plan.incident_summary}")
         except Exception as e:
             safe = classify_exception(e)
             record_failure("manual_task", run_started, safe)

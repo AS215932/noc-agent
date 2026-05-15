@@ -293,7 +293,7 @@ class NOCDiscordBot:
                 severity=plan.severity,
             )
             await send(
-                f"Investigation `{incident_id}` is waiting for review: {plan.issue_summary}\n"
+                f"Investigation `{incident_id}` is waiting for review: {plan.incident_summary}\n"
                 f"Confidence: {plan.confidence_score * 100:.1f}% | Severity: {plan.severity}"
             )
         except TimeoutError:

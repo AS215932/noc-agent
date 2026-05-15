@@ -6,7 +6,7 @@ from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from app.agent import ActionPlan
+from app.agent import DiagnosticSynthesis
 from app.main import health_model, investigate_alert, metrics
 from app.model_config import load_model_config
 from app.safe_errors import classify_exception
@@ -41,13 +41,15 @@ def mock_alert_payload():
 
 def _plan_args() -> dict:
     return {
-        "issue_summary": "Fallback model completed triage",
-        "root_cause_analysis": "The fallback model produced a safe diagnosis.",
+        "read_only": True,
+        "incident_summary": "Fallback model completed triage",
         "confidence_score": 0.8,
+        "confidence_basis": "The fallback model produced a safe diagnosis.",
         "severity": "MEDIUM",
         "requires_human": True,
         "human_escalation_reason": "Fallback triage should be reviewed by an operator.",
-        "operator_next_steps": ["Review the alert in Prometheus."],
+        "recommended_next_checks": ["Review the alert in Prometheus."],
+        "executed_actions": [],
     }
 
 
@@ -97,12 +99,12 @@ async def test_fallback_model_recovers_from_model_http_429():
         FunctionModel(fail_with_quota, model_name="gemini-3.1-pro-preview"),
         TestModel(custom_output_args=_plan_args(), model_name="fallback-test"),
     )
-    agent = Agent(fallback_model, output_type=ActionPlan)
+    agent = Agent(fallback_model, output_type=DiagnosticSynthesis)
 
     result = await agent.run("Investigate alert")
     plan = result.data if hasattr(result, "data") else result.output
 
-    assert plan.issue_summary == "Fallback model completed triage"
+    assert plan.incident_summary == "Fallback model completed triage"
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ from typing import Any
 
 from langgraph.types import interrupt
 
-from app.agents.triage import ActionPlan, TriageAgentDeps, build_triage_agent
+from app.agents.triage import DiagnosticEvidence, DiagnosticSynthesis, TriageAgentDeps, build_triage_agent
 from app.deps.runtime import RuntimeDeps
 from app.golden_state import drift_findings_for, load_supervisor_context
 from app.graph.routing import is_direct_measurement, supervisor_route
@@ -72,7 +72,7 @@ class NodeRunner:
             f"Active specialist: {specialist}\n"
             f"Resource: {state['resource_id']}\n"
             f"Chronic instability: {state.get('chronic_instability', False)}\n"
-            f"Investigate this normalized alert payload and return the structured action plan:\n"
+            f"Investigate this normalized alert payload and return DiagnosticSynthesis:\n"
             f"{state['normalized_alert']}"
         )
         agent = build_triage_agent()
@@ -83,20 +83,13 @@ class NodeRunner:
             deps=TriageAgentDeps(perimeter_context=perimeter),
             toolsets=toolsets,
         )
-        plan = result.data if hasattr(result, "data") else result.output
-        evidence = [
-            EvidenceItem(
-                tool=item if item else "agent_observation",
-                summary=item if item else "Agent reported diagnostic evidence.",
-                direct_measurement=is_direct_measurement(item),
-            )
-            for item in plan.tools_used or plan.diagnostic_evidence
-        ]
+        synthesis = result.data if hasattr(result, "data") else result.output
+        evidence = [_evidence_item(item) for item in synthesis.evidence_chain]
         finding = SpecialistFinding(
             specialist=specialist,
-            summary=plan.issue_summary,
-            assessment=plan.root_cause_analysis,
-            confidence=plan.confidence_score,
+            summary=synthesis.incident_summary,
+            assessment=_synthesis_assessment(synthesis),
+            confidence=synthesis.confidence_score,
             evidence=evidence,
         )
         update = {
@@ -104,8 +97,7 @@ class NodeRunner:
             "updated_at": utc_now(),
             "active_specialist": specialist,
             "specialist_type": specialist,
-            "action_plan": plan.model_dump(mode="json"),
-            "legacy_action_plan": plan.model_dump(mode="json"),
+            "diagnostic_synthesis": synthesis.model_dump(mode="json"),
             "specialist_finding": json_safe_model_dump(finding),
             "evidence_log": [json_safe_model_dump(item) for item in evidence],
             "perimeter_context_version": self.runtime.perimeter_context.schema_version if self.runtime.perimeter_context else "",
@@ -123,14 +115,13 @@ class NodeRunner:
         if not direct and confidence > 0.5:
             confidence = 0.5
         finding.confidence = confidence
-        legacy = ActionPlan.model_validate(state["action_plan"])
-        legacy.confidence_score = confidence
+        synthesis = DiagnosticSynthesis.model_validate(state["diagnostic_synthesis"])
+        synthesis.confidence_score = confidence
         update = {
             "current_step": "evidence_validation",
             "updated_at": utc_now(),
             "specialist_finding": json_safe_model_dump(finding),
-            "action_plan": legacy.model_dump(mode="json"),
-            "legacy_action_plan": legacy.model_dump(mode="json"),
+            "diagnostic_synthesis": synthesis.model_dump(mode="json"),
         }
         assert_json_serializable_state(update)
         return update
@@ -144,18 +135,21 @@ class NodeRunner:
 
     async def proposal_build(self, state: WorkflowState) -> dict[str, Any]:
         finding = SpecialistFinding.model_validate(state["specialist_finding"])
-        legacy = ActionPlan.model_validate(state["action_plan"])
+        synthesis = DiagnosticSynthesis.model_validate(state["diagnostic_synthesis"])
+        remediation = synthesis.remediation_proposal
+        proposed = remediation.proposed_actions if remediation is not None else synthesis.recommended_next_checks
+        evidence_refs = remediation.evidence_refs if remediation is not None else [item.tool for item in finding.evidence]
         proposal = ChangeProposal(
             incident_id=state["incident_id"],
             resource_id=state["resource_id"],
             assessment=finding.summary,
             root_cause_hypothesis=finding.assessment,
             confidence=finding.confidence,
-            evidence_refs=[item.tool for item in finding.evidence],
+            evidence_refs=evidence_refs,
             drift_findings=list(state.get("drift_findings", [])),
-            proposed_remediation=list(legacy.automated_actions_proposed or legacy.operator_next_steps),
+            proposed_remediation=list(proposed),
             validation_status="needs_more_evidence" if finding.confidence < 0.8 else "validated",
-            human_review_rationale=legacy.human_escalation_reason or "Diagnostic tranche requires human review before any execution.",
+            human_review_rationale=synthesis.human_escalation_reason or "Diagnostic tranche requires human review before any execution.",
         )
         update = {
             "current_step": "proposal_build",
@@ -170,7 +164,7 @@ class NodeRunner:
         summary = IncidentSummary(
             incident_id=state["incident_id"],
             resource_id=state["resource_id"],
-            title=ActionPlan.model_validate(state["action_plan"]).issue_summary,
+            title=DiagnosticSynthesis.model_validate(state["diagnostic_synthesis"]).incident_summary,
             status="waiting_approval",
             chronic_instability=bool(state.get("chronic_instability", False)),
             active_specialist=state.get("active_specialist"),
@@ -198,3 +192,39 @@ class NodeRunner:
         }
         assert_json_serializable_state(update)
         return update
+
+
+def _evidence_item(item: DiagnosticEvidence) -> EvidenceItem:
+    evidence_id = item.evidence_id or item.tool or "agent_observation"
+    summary_parts = [
+        f"{item.tool}({item.target})" if item.tool or item.target else evidence_id,
+        item.interpretation or item.observed_value or "Agent reported diagnostic evidence.",
+    ]
+    return EvidenceItem(
+        tool=evidence_id,
+        summary=": ".join(part for part in summary_parts if part),
+        direct_measurement=item.direct_measurement or is_direct_measurement(item.tool),
+        payload=item.model_dump(mode="json"),
+    )
+
+
+def _synthesis_assessment(synthesis: DiagnosticSynthesis) -> str:
+    sections: list[str] = []
+    if synthesis.confirmed_facts:
+        sections.append("Facts: " + "; ".join(fact.statement for fact in synthesis.confirmed_facts if fact.statement))
+    if synthesis.deltas:
+        sections.append(
+            "Deltas: "
+            + "; ".join(
+                f"{delta.subject} {delta.attribute}: expected {delta.expected_value}, observed {delta.observed_value}"
+                for delta in synthesis.deltas
+                if delta.subject or delta.attribute or delta.expected_value or delta.observed_value
+            )
+        )
+    if synthesis.hypotheses:
+        sections.append("Hypotheses: " + "; ".join(h.statement for h in synthesis.hypotheses if h.statement))
+    if synthesis.contradictions:
+        sections.append("Contradictions: " + "; ".join(c.summary for c in synthesis.contradictions if c.summary))
+    if synthesis.confidence_basis:
+        sections.append("Confidence basis: " + synthesis.confidence_basis)
+    return "\n".join(section for section in sections if section).strip() or synthesis.incident_summary

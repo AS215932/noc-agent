@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent import ActionPlan
+from app.agent import DiagnosticSynthesis
 from app.discord_bot import NOCDiscordBot, StatusOverview, parse_discord_operator_request, run_fast_status_check
 from app.mcp_runtime import MCPRuntime
 
@@ -93,17 +93,34 @@ class FakeRuntime:
         }
 
 
-def _action_plan() -> ActionPlan:
-    return ActionPlan(
-        issue_summary="NOC health looks degraded",
-        root_cause_analysis="The agent found a degraded check.",
+def _diagnostic_synthesis() -> DiagnosticSynthesis:
+    return DiagnosticSynthesis(
+        read_only=True,
+        incident_summary="NOC health looks degraded",
+        confidence_basis="The agent found a degraded check.",
         confidence_score=0.7,
         severity="MEDIUM",
         requires_human=True,
         human_escalation_reason="Review diagnostics before remediation.",
-        diagnostic_evidence=["health/mcp degraded"],
-        tools_used=["health/mcp"],
-        operator_next_steps=["Check MCP daemon logs."],
+        evidence_chain=[
+            {
+                "evidence_id": "ev1",
+                "tool": "health/mcp",
+                "target": "noc",
+                "observed_value": "degraded",
+                "expected_value": "ok",
+                "interpretation": "MCP health is degraded.",
+                "direct_measurement": True,
+            }
+        ],
+        confirmed_facts=[
+            {
+                "fact_id": "fact1",
+                "statement": "MCP health is degraded.",
+                "evidence_refs": ["ev1"],
+            }
+        ],
+        recommended_next_checks=["Check MCP daemon logs."],
     )
 
 
@@ -185,7 +202,7 @@ async def test_bot_start_uses_shared_mcp_runtime(monkeypatch):
 @pytest.mark.asyncio
 async def test_noc_investigate_sends_acceptance_and_final_followup(monkeypatch):
     async def fake_graph(payload):
-        return _action_plan(), {"incident_id": "inc-1"}
+        return _diagnostic_synthesis(), {"incident_id": "inc-1"}
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
     monkeypatch.setattr("app.discord_bot.run_investigation_graph", fake_graph)
@@ -242,7 +259,7 @@ async def test_mention_investigation_uses_same_safe_runner(monkeypatch):
     async def fake_graph(payload):
         assert payload["source"] == "discord-mention"
         assert payload["commonAnnotations"]["summary"] == "noc health"
-        return _action_plan(), {"incident_id": "inc-mention"}
+        return _diagnostic_synthesis(), {"incident_id": "inc-mention"}
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
     monkeypatch.setattr("app.discord_bot.run_investigation_graph", fake_graph)
@@ -266,7 +283,7 @@ async def test_status_mention_uses_fast_status_not_graph(monkeypatch):
     async def fake_graph(payload):
         nonlocal graph_called
         graph_called = True
-        return _action_plan(), {"incident_id": "inc-unexpected"}
+        return _diagnostic_synthesis(), {"incident_id": "inc-unexpected"}
 
     async def fake_status(target, qualifiers, runtime):
         assert target == "noc"

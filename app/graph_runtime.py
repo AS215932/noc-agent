@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from langgraph.types import Command
 
-from app.agents.triage import ActionPlan
+from app.agents.triage import DiagnosticSynthesis
 from app.deps.runtime import RuntimeDeps
 from app.graph.graph import build_graph
 from app.graph.routing import resource_id_from_alert
@@ -19,7 +19,7 @@ _GRAPH = None
 _THREAD_GRAPHS: dict[str, Any] = {}
 
 
-async def run_investigation_graph(alert_payload: dict[str, Any], model=None, mcp_runtime=None) -> tuple[ActionPlan, WorkflowState]:
+async def run_investigation_graph(alert_payload: dict[str, Any], model=None, mcp_runtime=None) -> tuple[DiagnosticSynthesis, WorkflowState]:
     incident_id = str(uuid4())
     thread_id = str(uuid4())
     state: WorkflowState = {
@@ -56,8 +56,8 @@ async def run_investigation_graph(alert_payload: dict[str, Any], model=None, mcp
         {"configurable": {"thread_id": thread_id}},
     )
     result_state = {key: value for key, value in result_state.items() if key != "__interrupt__"}
-    plan = ActionPlan.model_validate(result_state["action_plan"])
-    return plan, result_state
+    synthesis = DiagnosticSynthesis.model_validate(result_state["diagnostic_synthesis"])
+    return synthesis, result_state
 
 
 async def pending_summaries() -> list[dict[str, Any]]:

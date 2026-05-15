@@ -97,10 +97,7 @@ class WorkflowState(TypedDict, total=False):
     routing_reason: str
     evidence_log: list[JsonDict]
     specialist_finding: JsonDict
-    action_plan: JsonDict
-    # Backward-compatible mirror for existing presentation code. New graph code
-    # writes action_plan first and only mirrors this while callers migrate.
-    legacy_action_plan: JsonDict
+    diagnostic_synthesis: JsonDict
     proposals: list[JsonDict]
     approval_state: str
     operator_decision: JsonDict | None

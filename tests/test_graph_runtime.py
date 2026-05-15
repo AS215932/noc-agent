@@ -18,7 +18,9 @@ async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
 
     plan, state = await graph_runtime.run_investigation_graph(alert, model=TestModel())
 
-    assert plan.issue_summary
+    assert plan.incident_summary is not None
+    assert "diagnostic_synthesis" in state
+    assert "action_plan" not in state
     assert state["active_specialist"] == "bgp"
     assert state["approval_state"] == "waiting_approval"
     assert "model_override" not in state

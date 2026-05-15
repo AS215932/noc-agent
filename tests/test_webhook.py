@@ -17,7 +17,7 @@ from app.main import (
     poll_mailbox,
     icinga_webhook,
 )
-from app.agent import ActionPlan
+from app.agent import DiagnosticSynthesis
 from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
 
@@ -249,17 +249,19 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     assert not any("Finished" in title for title in titles)
 
 def test_triage_fields_turn_internal_schema_failure_into_operator_guidance(mock_alert_payload):
-    plan = ActionPlan.model_validate({
-        "issue_summary": "node_exporter unreachable on rtr1",
-        "root_cause_analysis": "Prometheus has stopped scraping node_exporter.",
+    plan = DiagnosticSynthesis.model_validate({
+        "read_only": True,
+        "incident_summary": "node_exporter unreachable on rtr1",
+        "confidence_basis": "Prometheus has stopped scraping node_exporter.",
         "confidence_score": 0.6,
         "severity": "HIGH",
         "requires_human": True,
         "human_escalation_reason": "Unable to execute diagnostic SSH commands or Prometheus queries due to an internal system schema limitation.",
+        "executed_actions": [],
     })
 
     fields = _triage_fields(plan, mock_alert_payload)
-    action_plan = next(field["value"] for field in fields if field["name"] == "Action Plan")
+    action_plan = next(field["value"] for field in fields if field["name"] == "Next Checks / Proposal")
 
     assert "internal system schema limitation" not in action_plan
     assert "Live diagnostics were not completed" in action_plan
