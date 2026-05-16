@@ -9,6 +9,7 @@ from pydantic_ai.models.test import TestModel
 from app.agent import DiagnosticSynthesis
 from app.main import health_model, investigate_alert, metrics
 from app.model_config import load_model_config
+from app.model_metrics import STATE
 from app.safe_errors import classify_exception
 
 
@@ -163,6 +164,42 @@ async def test_health_model_is_degraded_for_missing_model_credentials(monkeypatc
     assert health["status"] == "degraded"
     assert health["quota_monitoring"] == "not_configured"
     assert "test-google-key" not in str(health)
+
+
+@pytest.mark.asyncio
+async def test_health_model_ignores_stale_runtime_failure_when_config_is_healthy(monkeypatch):
+    monkeypatch.setenv("AGENT_MODEL", "google-gla:gemini-3.1-pro-preview")
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_QUOTA_PROJECT_ID", raising=False)
+
+    old_failure_at = STATE.last_failure_at
+    old_failure_category = STATE.last_failure_category
+    old_failure_model = STATE.last_failure_model
+    old_success_at = STATE.last_success_at
+    old_success_model = STATE.last_success_model
+
+    STATE.last_failure_at = 123.0
+    STATE.last_failure_category = "unknown_infrastructure"
+    STATE.last_failure_model = "unknown"
+    STATE.last_success_at = None
+    STATE.last_success_model = None
+
+    try:
+        response = Response()
+        health = await health_model(response)
+    finally:
+        STATE.last_failure_at = old_failure_at
+        STATE.last_failure_category = old_failure_category
+        STATE.last_failure_model = old_failure_model
+        STATE.last_success_at = old_success_at
+        STATE.last_success_model = old_success_model
+
+    assert response.status_code == status.HTTP_200_OK
+    assert health["status"] == "ok"
+    assert health["quota_monitoring"] == "not_configured"
+    assert health["last_failure_category"] == "unknown_infrastructure"
 
 
 @pytest.mark.asyncio

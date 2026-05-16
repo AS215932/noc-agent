@@ -84,11 +84,7 @@ class ModelRuntimeState:
     last_failure_model: str | None = None
 
     def health(self) -> dict[str, Any]:
-        status = "ok"
-        if self.missing_credentials or self.unsupported_models or self.last_failure_category:
-            status = "degraded"
-        if self.last_success_at and self.last_failure_at and self.last_success_at > self.last_failure_at:
-            status = "ok" if not (self.missing_credentials or self.unsupported_models) else "degraded"
+        status = "degraded" if (self.missing_credentials or self.unsupported_models) else "ok"
         return {"status": status, **asdict(self)}
 
 
