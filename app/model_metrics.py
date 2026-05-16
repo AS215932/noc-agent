@@ -69,6 +69,7 @@ MODEL_USAGE = Counter(
 )
 
 _fallback_failures: ContextVar[list[str]] = ContextVar("fallback_failures", default=[])
+RECENT_RUNTIME_FAILURE_WINDOW_SECONDS = 600.0
 
 
 @dataclass
@@ -85,7 +86,16 @@ class ModelRuntimeState:
 
     def health(self) -> dict[str, Any]:
         status = "degraded" if (self.missing_credentials or self.unsupported_models) else "ok"
+        if self._has_recent_runtime_failure():
+            status = "degraded"
         return {"status": status, **asdict(self)}
+
+    def _has_recent_runtime_failure(self) -> bool:
+        if not self.last_failure_category or self.last_failure_at is None:
+            return False
+        if self.last_success_at is not None and self.last_success_at > self.last_failure_at:
+            return False
+        return (time.time() - self.last_failure_at) <= RECENT_RUNTIME_FAILURE_WINDOW_SECONDS
 
 
 STATE = ModelRuntimeState()
