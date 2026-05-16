@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 from fastapi import Response, status
 from pydantic_ai import Agent
@@ -9,6 +11,7 @@ from pydantic_ai.models.test import TestModel
 from app.agent import DiagnosticSynthesis
 from app.main import health_model, investigate_alert, metrics
 from app.model_config import load_model_config
+from app.model_metrics import STATE
 from app.safe_errors import classify_exception
 
 
@@ -37,6 +40,19 @@ def mock_alert_payload():
         "groupKey": "{}:{alertname=\"InstanceDown\"}",
         "truncatedAlerts": 0,
     }
+
+
+@pytest.fixture
+def model_runtime_state_guard():
+    original_state = copy.deepcopy(STATE)
+    try:
+        yield
+    finally:
+        for attr, value in vars(original_state).items():
+            setattr(STATE, attr, value)
+        for attr in list(vars(STATE).keys()):
+            if attr not in vars(original_state):
+                delattr(STATE, attr)
 
 
 def _plan_args() -> dict:
@@ -163,6 +179,58 @@ async def test_health_model_is_degraded_for_missing_model_credentials(monkeypatc
     assert health["status"] == "degraded"
     assert health["quota_monitoring"] == "not_configured"
     assert "test-google-key" not in str(health)
+
+
+@pytest.mark.asyncio
+async def test_health_model_is_degraded_for_recent_runtime_failure_when_config_is_healthy(monkeypatch, model_runtime_state_guard):
+    monkeypatch.setenv("AGENT_MODEL", "google-gla:gemini-3.1-pro-preview")
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_QUOTA_PROJECT_ID", raising=False)
+    monkeypatch.setattr("app.model_metrics.time.time", lambda: 180.0)
+
+    STATE.last_failure_at = 123.0
+    STATE.last_failure_category = "unknown_infrastructure"
+    STATE.last_failure_model = "unknown"
+    STATE.last_success_at = None
+    STATE.last_success_model = None
+
+    response = Response()
+    health = await health_model(response)
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert health["status"] == "degraded"
+    assert health["quota_monitoring"] == "not_configured"
+    assert health["last_failure_category"] == "unknown_infrastructure"
+    assert health["last_failure_at"] == 123.0
+    assert health["last_failure_model"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_health_model_ignores_stale_runtime_failure_when_config_is_healthy(monkeypatch, model_runtime_state_guard):
+    monkeypatch.setenv("AGENT_MODEL", "google-gla:gemini-3.1-pro-preview")
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_QUOTA_PROJECT_ID", raising=False)
+    monkeypatch.setattr("app.model_metrics.time.time", lambda: 1000.0)
+
+    STATE.last_failure_at = 123.0
+    STATE.last_failure_category = "unknown_infrastructure"
+    STATE.last_failure_model = "unknown"
+    STATE.last_success_at = None
+    STATE.last_success_model = None
+
+    response = Response()
+    health = await health_model(response)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert health["status"] == "ok"
+    assert health["quota_monitoring"] == "not_configured"
+    assert health["last_failure_category"] == "unknown_infrastructure"
+    assert health["last_failure_at"] == 123.0
+    assert health["last_failure_model"] == "unknown"
 
 
 @pytest.mark.asyncio
