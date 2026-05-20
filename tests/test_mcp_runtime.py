@@ -185,21 +185,42 @@ async def test_runtime_live_health_reconnects_missing_source(monkeypatch):
     xo_url = "http://127.0.0.1:8766/mcp"
     monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
     monkeypatch.setenv("XO_MCP_URL", xo_url)
-    FakeMCPClient.fail_url = xo_url
+    previous_fail_url = FakeMCPClient.fail_url
     runtime = MCPRuntime(owner="test")
+    try:
+        FakeMCPClient.fail_url = xo_url
 
-    await runtime.connect_tools(FakeAgent())
+        await runtime.connect_tools(FakeAgent())
+        health = runtime.health()
+        assert health["xo"] is False
+        assert "xo" not in runtime.clients
+
+        FakeMCPClient.fail_url = None
+        health = await runtime.live_health()
+
+        assert health["xo"] is True
+        assert health["sources"]["xo"]["ready"] is True
+        assert health["sources"]["xo"]["tool_count"] == 1
+        assert "xo" in runtime.clients
+    finally:
+        FakeMCPClient.fail_url = previous_fail_url
+
+
+@pytest.mark.asyncio
+async def test_runtime_health_preserves_ready_state_without_client():
+    runtime = MCPRuntime(owner="test")
+    runtime.states["hyrule"].ready = True
+    runtime.states["hyrule"].tool_count = 2
+    runtime.states["xo"].ready = True
+    runtime.states["xo"].tool_count = 3
+
     health = runtime.health()
-    assert health["xo"] is False
-    assert "xo" not in runtime.clients
 
-    FakeMCPClient.fail_url = None
-    health = await runtime.live_health()
-
+    assert health["hyrule"] is True
     assert health["xo"] is True
-    assert health["sources"]["xo"]["ready"] is True
-    assert health["sources"]["xo"]["tool_count"] == 1
-    assert "xo" in runtime.clients
+    assert health["sources"]["hyrule"]["tool_count"] == 2
+    assert health["sources"]["xo"]["tool_count"] == 3
+    assert runtime.clients == {}
 
 
 @pytest.mark.asyncio
