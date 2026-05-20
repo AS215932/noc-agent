@@ -21,7 +21,7 @@ The key invariants we lock down:
 
 from types import SimpleNamespace
 
-from anyio import ClosedResourceError
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 import pytest
 
 from app.tools.mcp_client import (
@@ -272,10 +272,11 @@ async def test_tool_runner_reconnects_once_for_stale_session():
     assert result == "recovered"
 
 
+@pytest.mark.parametrize("stale_exc_type", [BrokenResourceError, ClosedResourceError, EndOfStream])
 @pytest.mark.asyncio
-async def test_tool_runner_reconnects_once_for_closed_resource():
+async def test_tool_runner_reconnects_once_for_stale_session_errors(stale_exc_type):
     client = HyruleMCPClient(["dummy"])
-    stale = _FakeSession(raise_exc=ClosedResourceError())
+    stale = _FakeSession(raise_exc=stale_exc_type())
     fresh = _FakeSession(response_text="recovered")
     client.session = stale
     reconnects = 0
@@ -325,10 +326,11 @@ async def test_check_health_uses_live_list_tools():
     assert await client.check_health() == 1
 
 
+@pytest.mark.parametrize("stale_exc_type", [BrokenResourceError, ClosedResourceError, EndOfStream])
 @pytest.mark.asyncio
-async def test_check_health_reconnects_once_for_stale_session():
+async def test_check_health_reconnects_once_for_stale_session(stale_exc_type):
     client = HyruleMCPClient(["dummy"])
-    stale = _FakeSession(raise_list_exc=ClosedResourceError())
+    stale = _FakeSession(raise_list_exc=stale_exc_type())
     fresh = _FakeSession()
     client.session = stale
     reconnects = 0

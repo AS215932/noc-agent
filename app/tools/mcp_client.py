@@ -1,8 +1,9 @@
 import os
 import json
 import asyncio
-from typing import Any
+from typing import Any, Awaitable, Callable
 from contextlib import AsyncExitStack
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from mcp.client.stdio import stdio_client
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamablehttp_client
@@ -70,19 +71,13 @@ class HyruleMCPClient:
 
     async def check_health(self) -> int:
         """Verify the current session can make a live MCP request."""
-        if not self.session:
-            raise RuntimeError("Not connected to MCP server")
-        try:
-            response = await self.session.list_tools()
-        except Exception as exc:
-            if not _looks_like_stale_session(exc):
-                raise
-            log_exception("mcp_health_session_stale", exc, category="mcp_session_stale")
-            await self.reconnect()
+        async def list_tool_count() -> int:
             if not self.session:
                 raise RuntimeError("Not connected to MCP server")
             response = await self.session.list_tools()
-        return len(response.tools)
+            return len(response.tools)
+
+        return await self._run_with_reconnect_once(list_tool_count, stale_event="mcp_health_session_stale")
 
     async def get_tools(self) -> list[Tool]:
         """
@@ -117,14 +112,27 @@ class HyruleMCPClient:
         )
 
     async def _call_tool_with_reconnect(self, name: str, arguments: dict[str, Any]) -> Any:
+        return await self._run_with_reconnect_once(
+            lambda: self._call_tool_once(name, arguments),
+            stale_event="mcp_tool_session_stale",
+            tool=name,
+        )
+
+    async def _run_with_reconnect_once(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        stale_event: str,
+        **log_context: Any,
+    ) -> Any:
         try:
-            return await self._call_tool_once(name, arguments)
+            return await operation()
         except Exception as exc:
             if not _looks_like_stale_session(exc):
                 raise
-            log_exception("mcp_tool_session_stale", exc, category="mcp_session_stale", tool=name)
+            log_exception(stale_event, exc, category="mcp_session_stale", **log_context)
             await self.reconnect()
-            return await self._call_tool_once(name, arguments)
+            return await operation()
 
     async def _call_tool_once(self, name: str, arguments: dict[str, Any]) -> Any:
         if not self.session:
@@ -144,7 +152,7 @@ class HyruleMCPClient:
 
 
 def _looks_like_stale_session(exc: BaseException) -> bool:
-    if type(exc).__name__ in {"BrokenResourceError", "ClosedResourceError", "EndOfStream"}:
+    if isinstance(exc, (BrokenResourceError, ClosedResourceError, EndOfStream)):
         return True
     message = str(exc).lower()
     return any(
