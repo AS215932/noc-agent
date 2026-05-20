@@ -180,6 +180,29 @@ async def test_runtime_live_health_updates_source_state_across_calls(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_runtime_live_health_reconnects_missing_source(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    xo_url = "http://127.0.0.1:8766/mcp"
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", xo_url)
+    FakeMCPClient.fail_url = xo_url
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    health = runtime.health()
+    assert health["xo"] is False
+    assert "xo" not in runtime.clients
+
+    FakeMCPClient.fail_url = None
+    health = await runtime.live_health()
+
+    assert health["xo"] is True
+    assert health["sources"]["xo"]["ready"] is True
+    assert health["sources"]["xo"]["tool_count"] == 1
+    assert "xo" in runtime.clients
+
+
+@pytest.mark.asyncio
 async def test_runtime_times_out_stalled_source(monkeypatch):
     monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
     monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")

@@ -70,8 +70,27 @@ class MCPRuntime:
         }
 
     async def live_health(self) -> dict[str, Any]:
-        for source, client in list(self.clients.items()):
+        configs = {
+            "hyrule": self._hyrule_config,
+            "xo": self._xo_config,
+        }
+        for source, config_factory in configs.items():
             state = self.states[source]
+            client = self.clients.get(source)
+            if not state.ready:
+                try:
+                    config = config_factory()
+                except Exception as exc:
+                    safe = classify_exception(exc)
+                    state.ready = False
+                    state.tool_count = 0
+                    state.error = safe.category
+                    log_exception("mcp_health_config_failed", exc, category=safe.category, owner=self.owner, source=source)
+                    continue
+                await self._connect_source(config)
+                continue
+            if client is None:
+                continue
             try:
                 state.tool_count = await client.check_health()
                 state.ready = state.tool_count > 0
