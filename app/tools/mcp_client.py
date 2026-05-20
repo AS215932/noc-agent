@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from typing import Any
 from contextlib import AsyncExitStack
 from mcp.client.stdio import stdio_client
@@ -37,6 +38,7 @@ class HyruleMCPClient:
         self.url = url
         self.session: ClientSession | None = None
         self._exit_stack = AsyncExitStack()
+        self._reconnect_lock = asyncio.Lock()
 
     async def connect(self):
         """Starts the MCP server process and initializes the ClientSession."""
@@ -59,6 +61,19 @@ class HyruleMCPClient:
         """Closes the MCP server connection."""
         await self._exit_stack.aclose()
         self.session = None
+        self._exit_stack = AsyncExitStack()
+
+    async def reconnect(self) -> None:
+        async with self._reconnect_lock:
+            await self.disconnect()
+            await self.connect()
+
+    async def check_health(self) -> int:
+        """Verify the current session can make a live MCP request."""
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+        response = await self.session.list_tools()
+        return len(response.tools)
 
     async def get_tools(self) -> list[Tool]:
         """
@@ -73,18 +88,7 @@ class HyruleMCPClient:
     def _create_pydantic_tool(self, mcp_tool: Any) -> Tool:
         async def tool_runner(**kwargs: Any) -> Any:
             try:
-                result = await self.session.call_tool(mcp_tool.name, arguments=kwargs)
-                structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
-                if structured is not None:
-                    return _json_safe(structured)
-                out = ""
-                for block in result.content:
-                    block_structured = getattr(block, "structuredContent", None) or getattr(block, "structured_content", None)
-                    if block_structured is not None:
-                        return _json_safe(block_structured)
-                    if hasattr(block, "text"):
-                        out += block.text + "\n"
-                return out.strip() if out else "Executed successfully."
+                return await self._call_tool_with_reconnect(mcp_tool.name, kwargs)
             except Exception as e:
                 safe = classify_exception(e)
                 log_exception("mcp_tool_execution_failed", e, category=safe.category, tool=mcp_tool.name)
@@ -102,6 +106,47 @@ class HyruleMCPClient:
             json_schema=json_schema,
             takes_ctx=False,
         )
+
+    async def _call_tool_with_reconnect(self, name: str, arguments: dict[str, Any]) -> Any:
+        try:
+            return await self._call_tool_once(name, arguments)
+        except Exception as exc:
+            if not _looks_like_stale_session(exc):
+                raise
+            log_exception("mcp_tool_session_stale", exc, category="mcp_session_stale", tool=name)
+            await self.reconnect()
+            return await self._call_tool_once(name, arguments)
+
+    async def _call_tool_once(self, name: str, arguments: dict[str, Any]) -> Any:
+        if not self.session:
+            raise RuntimeError("Not connected to MCP server")
+        result = await self.session.call_tool(name, arguments=arguments)
+        structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
+        if structured is not None:
+            return _json_safe(structured)
+        out = ""
+        for block in result.content:
+            block_structured = getattr(block, "structuredContent", None) or getattr(block, "structured_content", None)
+            if block_structured is not None:
+                return _json_safe(block_structured)
+            if hasattr(block, "text"):
+                out += block.text + "\n"
+        return out.strip() if out else "Executed successfully."
+
+
+def _looks_like_stale_session(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "session terminated",
+            "client session",
+            "connection reset",
+            "connection closed",
+            "closed resource",
+            "not connected",
+        )
+    )
 
 
 def _json_safe(value: Any) -> Any:

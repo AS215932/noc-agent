@@ -43,6 +43,12 @@ class FakeMCPClient:
         prefix = "xo" if self.url and "8766" in self.url else "hyrule"
         return [SimpleNamespace(name=f"{prefix}_tool", description="tool")]
 
+    async def check_health(self):
+        if self.url == FakeMCPClient.fail_url:
+            raise RuntimeError("health failed")
+        prefix = "xo" if self.url and "8766" in self.url else "hyrule"
+        return len([SimpleNamespace(name=f"{prefix}_tool", description="tool")])
+
     async def disconnect(self):
         self.disconnected = True
         self.session = None
@@ -106,6 +112,22 @@ async def test_runtime_marks_failed_source_degraded(monkeypatch):
     assert health["hyrule"] is True
     assert health["xo"] is False
     assert health["xo_tool_count"] == 0
+    assert health["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_runtime_live_health_marks_stale_source_degraded(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", "http://127.0.0.1:8766/mcp")
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    FakeMCPClient.fail_url = "http://127.0.0.1:8765/mcp"
+    health = await runtime.live_health()
+
+    assert health["hyrule"] is False
+    assert health["sources"]["hyrule"]["error"] == "unknown_infrastructure"
     assert health["status"] == "degraded"
 
 

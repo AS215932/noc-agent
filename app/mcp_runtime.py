@@ -69,6 +69,20 @@ class MCPRuntime:
             "status": "ok" if hyrule_ready and xo_ready else "degraded",
         }
 
+    async def live_health(self) -> dict[str, Any]:
+        for source, client in list(self.clients.items()):
+            state = self.states[source]
+            try:
+                state.tool_count = await client.check_health()
+                state.ready = state.tool_count > 0
+                state.error = None
+            except Exception as exc:
+                safe = classify_exception(exc)
+                state.ready = False
+                state.error = safe.category
+                log_exception("mcp_health_probe_failed", exc, category=safe.category, owner=self.owner, source=source)
+        return self.health()
+
     async def _connect_source(self, config: dict[str, Any]) -> None:
         source = config["source"]
         state = self.states[source]
