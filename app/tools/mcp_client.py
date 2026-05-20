@@ -72,7 +72,16 @@ class HyruleMCPClient:
         """Verify the current session can make a live MCP request."""
         if not self.session:
             raise RuntimeError("Not connected to MCP server")
-        response = await self.session.list_tools()
+        try:
+            response = await self.session.list_tools()
+        except Exception as exc:
+            if not _looks_like_stale_session(exc):
+                raise
+            log_exception("mcp_health_session_stale", exc, category="mcp_session_stale")
+            await self.reconnect()
+            if not self.session:
+                raise RuntimeError("Not connected to MCP server")
+            response = await self.session.list_tools()
         return len(response.tools)
 
     async def get_tools(self) -> list[Tool]:
@@ -135,6 +144,8 @@ class HyruleMCPClient:
 
 
 def _looks_like_stale_session(exc: BaseException) -> bool:
+    if type(exc).__name__ in {"BrokenResourceError", "ClosedResourceError", "EndOfStream"}:
+        return True
     message = str(exc).lower()
     return any(
         marker in message
