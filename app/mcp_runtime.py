@@ -31,6 +31,10 @@ class MCPRuntime:
             "hyrule": MCPSourceState(source="hyrule"),
             "xo": MCPSourceState(source="xo"),
         }
+        self.source_configs = {
+            "hyrule": self._hyrule_config,
+            "xo": self._xo_config,
+        }
 
     async def connect_tools(self, agent: Any | None = None) -> None:
         if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
@@ -70,8 +74,30 @@ class MCPRuntime:
         }
 
     async def live_health(self) -> dict[str, Any]:
-        for source, client in list(self.clients.items()):
+        for source, config_factory in self.source_configs.items():
             state = self.states[source]
+            client = self.clients.get(source)
+            if not state.ready:
+                try:
+                    config = config_factory()
+                except Exception as exc:
+                    safe = classify_exception(exc)
+                    state.ready = False
+                    state.tool_count = 0
+                    state.error = safe.category
+                    log_exception("mcp_health_config_failed", exc, category=safe.category, owner=self.owner, source=source)
+                    continue
+                try:
+                    await self._connect_source(config)
+                except Exception as exc:
+                    safe = classify_exception(exc)
+                    state.ready = False
+                    state.tool_count = 0
+                    state.error = safe.category
+                    log_exception("mcp_health_reconnect_failed", exc, category=safe.category, owner=self.owner, source=source)
+                continue
+            if client is None:
+                continue
             try:
                 state.tool_count = await client.check_health()
                 state.ready = state.tool_count > 0
