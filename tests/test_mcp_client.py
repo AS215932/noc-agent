@@ -264,6 +264,27 @@ async def test_tool_runner_reconnects_once_for_stale_session():
 
 
 @pytest.mark.asyncio
+async def test_tool_runner_does_not_reconnect_for_non_stale_error():
+    client = HyruleMCPClient(["dummy"])
+    failing = _FakeSession(raise_exc=RuntimeError("some other error"))
+    client.session = failing
+    reconnects = 0
+
+    async def reconnect():
+        nonlocal reconnects
+        reconnects += 1
+
+    client.reconnect = reconnect
+
+    tool = client._create_pydantic_tool(_make_mcp_tool())
+    result = await tool.function(host="h", command="c")
+
+    assert reconnects == 0
+    assert failing.calls == [("ssh_run_command", {"host": "h", "command": "c"})]
+    assert "MCP tool execution failed" in result
+
+
+@pytest.mark.asyncio
 async def test_check_health_uses_live_list_tools():
     client = HyruleMCPClient(["dummy"])
     client.session = _FakeSession()

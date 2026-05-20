@@ -79,6 +79,7 @@ class MCPRuntime:
             except Exception as exc:
                 safe = classify_exception(exc)
                 state.ready = False
+                state.tool_count = 0
                 state.error = safe.category
                 log_exception("mcp_health_probe_failed", exc, category=safe.category, owner=self.owner, source=source)
         return self.health()

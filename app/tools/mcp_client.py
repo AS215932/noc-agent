@@ -140,11 +140,7 @@ def _looks_like_stale_session(exc: BaseException) -> bool:
         marker in message
         for marker in (
             "session terminated",
-            "client session",
-            "connection reset",
-            "connection closed",
-            "closed resource",
-            "not connected",
+            "not connected to mcp server",
         )
     )
 
