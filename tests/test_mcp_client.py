@@ -21,6 +21,7 @@ The key invariants we lock down:
 
 from types import SimpleNamespace
 
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 import pytest
 
 from app.tools.mcp_client import (
@@ -62,10 +63,16 @@ class _FakeSession:
     Records call_tool invocations and returns whatever was queued.
     """
 
-    def __init__(self, response_text: str = "ok", raise_exc: Exception | None = None):
+    def __init__(
+        self,
+        response_text: str = "ok",
+        raise_exc: Exception | None = None,
+        raise_list_exc: Exception | None = None,
+    ):
         self.calls: list[tuple[str, dict]] = []
         self._response_text = response_text
         self._raise_exc = raise_exc
+        self._raise_list_exc = raise_list_exc
 
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
@@ -74,6 +81,8 @@ class _FakeSession:
         return SimpleNamespace(content=[_make_text_block(self._response_text)])
 
     async def list_tools(self):
+        if self._raise_list_exc is not None:
+            raise self._raise_list_exc
         return SimpleNamespace(tools=[_make_mcp_tool()])
 
 
@@ -263,6 +272,31 @@ async def test_tool_runner_reconnects_once_for_stale_session():
     assert result == "recovered"
 
 
+@pytest.mark.parametrize("stale_exc_type", [BrokenResourceError, ClosedResourceError, EndOfStream])
+@pytest.mark.asyncio
+async def test_tool_runner_reconnects_once_for_stale_session_errors(stale_exc_type):
+    client = HyruleMCPClient(["dummy"])
+    stale = _FakeSession(raise_exc=stale_exc_type())
+    fresh = _FakeSession(response_text="recovered")
+    client.session = stale
+    reconnects = 0
+
+    async def reconnect():
+        nonlocal reconnects
+        reconnects += 1
+        client.session = fresh
+
+    client.reconnect = reconnect
+
+    tool = client._create_pydantic_tool(_make_mcp_tool())
+    result = await tool.function(host="h", command="c")
+
+    assert reconnects == 1
+    assert stale.calls == [("ssh_run_command", {"host": "h", "command": "c"})]
+    assert fresh.calls == [("ssh_run_command", {"host": "h", "command": "c"})]
+    assert result == "recovered"
+
+
 @pytest.mark.asyncio
 async def test_tool_runner_does_not_reconnect_for_non_stale_error():
     client = HyruleMCPClient(["dummy"])
@@ -290,6 +324,26 @@ async def test_check_health_uses_live_list_tools():
     client.session = _FakeSession()
 
     assert await client.check_health() == 1
+
+
+@pytest.mark.parametrize("stale_exc_type", [BrokenResourceError, ClosedResourceError, EndOfStream])
+@pytest.mark.asyncio
+async def test_check_health_reconnects_once_for_stale_session(stale_exc_type):
+    client = HyruleMCPClient(["dummy"])
+    stale = _FakeSession(raise_list_exc=stale_exc_type())
+    fresh = _FakeSession()
+    client.session = stale
+    reconnects = 0
+
+    async def reconnect():
+        nonlocal reconnects
+        reconnects += 1
+        client.session = fresh
+
+    client.reconnect = reconnect
+
+    assert await client.check_health() == 1
+    assert reconnects == 1
 
 
 # --- get_tools wiring ---------------------------------------------------------
