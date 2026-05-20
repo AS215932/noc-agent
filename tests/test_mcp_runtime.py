@@ -43,6 +43,12 @@ class FakeMCPClient:
         prefix = "xo" if self.url and "8766" in self.url else "hyrule"
         return [SimpleNamespace(name=f"{prefix}_tool", description="tool")]
 
+    async def check_health(self):
+        if self.url == FakeMCPClient.fail_url:
+            raise RuntimeError("health failed")
+        prefix = "xo" if self.url and "8766" in self.url else "hyrule"
+        return len([SimpleNamespace(name=f"{prefix}_tool", description="tool")])
+
     async def disconnect(self):
         self.disconnected = True
         self.session = None
@@ -107,6 +113,70 @@ async def test_runtime_marks_failed_source_degraded(monkeypatch):
     assert health["xo"] is False
     assert health["xo_tool_count"] == 0
     assert health["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_runtime_live_health_marks_all_sources_ok(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", "http://127.0.0.1:8766/mcp")
+    FakeMCPClient.fail_url = None
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    health = await runtime.live_health()
+
+    assert health["hyrule"] is True
+    assert health["xo"] is True
+    assert health["sources"]["hyrule"]["ready"] is True
+    assert health["sources"]["xo"]["ready"] is True
+    assert health["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_runtime_live_health_marks_stale_source_degraded(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", "http://127.0.0.1:8766/mcp")
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    FakeMCPClient.fail_url = "http://127.0.0.1:8765/mcp"
+    health = await runtime.live_health()
+
+    assert health["hyrule"] is False
+    assert health["sources"]["hyrule"]["error"] == "unknown_infrastructure"
+    assert health["sources"]["hyrule"]["tool_count"] == 0
+    assert health["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_runtime_live_health_updates_source_state_across_calls(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    hyrule_url = "http://127.0.0.1:8765/mcp"
+    xo_url = "http://127.0.0.1:8766/mcp"
+    monkeypatch.setenv("HYRULE_MCP_URL", hyrule_url)
+    monkeypatch.setenv("XO_MCP_URL", xo_url)
+    FakeMCPClient.fail_url = None
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    health = await runtime.live_health()
+
+    assert health["status"] == "ok"
+    assert health["sources"]["hyrule"]["ready"] is True
+    assert health["sources"]["hyrule"]["tool_count"] == 1
+    assert health["sources"]["xo"]["ready"] is True
+    assert health["sources"]["xo"]["tool_count"] == 1
+
+    FakeMCPClient.fail_url = xo_url
+    health = await runtime.live_health()
+
+    assert health["status"] == "degraded"
+    assert health["sources"]["hyrule"]["ready"] is True
+    assert health["sources"]["hyrule"]["tool_count"] == 1
+    assert health["sources"]["xo"]["ready"] is False
+    assert health["sources"]["xo"]["tool_count"] == 0
 
 
 @pytest.mark.asyncio

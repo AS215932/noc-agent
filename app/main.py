@@ -611,7 +611,7 @@ async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | N
 
 @app.get("/health/mcp")
 async def health_mcp(response: Response):
-    health = mcp_runtime.health()
+    health = await mcp_runtime.live_health()
     if health["status"] != "ok":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return health
