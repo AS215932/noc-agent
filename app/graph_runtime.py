@@ -11,7 +11,7 @@ from app.deps.runtime import RuntimeDeps
 from app.graph.graph import build_graph
 from app.graph.routing import resource_id_from_alert
 from app.graph.state import WorkflowState, assert_json_serializable_state, utc_now
-from app.incident_memory import IncidentMemory
+from app.incident_memory import CaseIntakeResult, IncidentMemory, case_event_from_alert
 
 
 INCIDENT_MEMORY = IncidentMemory()
@@ -19,11 +19,89 @@ _GRAPH = None
 _THREAD_GRAPHS: dict[str, Any] = {}
 
 
-async def run_investigation_graph(alert_payload: dict[str, Any], model=None, mcp_runtime=None) -> tuple[DiagnosticSynthesis, WorkflowState]:
-    incident_id = str(uuid4())
-    thread_id = str(uuid4())
+async def intake_alert(alert_payload: dict[str, Any]) -> CaseIntakeResult:
+    return await INCIDENT_MEMORY.intake_alert(alert_payload)
+
+
+async def inject_case_event(case: dict[str, Any], event: dict[str, Any]) -> bool:
+    thread_id = case.get("thread_id")
+    if not thread_id:
+        return False
+    graph = _THREAD_GRAPHS.get(thread_id) or await _graph(
+        RuntimeDeps.build(incident_memory=INCIDENT_MEMORY),
+        cache=True,
+    )
+    context = await INCIDENT_MEMORY.case_context(case["incident_id"])
+    config = {"configurable": {"thread_id": thread_id}}
+    existing_values: dict[str, Any] = {}
+    if hasattr(graph, "aget_state"):
+        snapshot = await graph.aget_state(config)
+        existing_values = dict(getattr(snapshot, "values", {}) or {})
+    related_alerts = list(existing_values.get("related_alerts") or [])
+    related_alerts.append(event)
+    update = {
+        "updated_at": utc_now(),
+        "related_alerts": related_alerts,
+        "case_event_count": case.get("event_count", 0),
+        "latest_event": event,
+        "latest_transition": case.get("latest_transition"),
+        "downstream_victims": list(case.get("downstream_victims", [])),
+        "case_status": case.get("status", ""),
+        "case_context": context,
+        "needs_reassessment": bool(case.get("needs_reassessment", False)),
+    }
+    try:
+        await graph.aupdate_state(
+            config,
+            update,
+            as_node="intake_event_injection",
+        )
+        return True
+    except Exception:
+        # Some LangGraph versions require as_node to be a compiled node. Retry
+        # without as_node so production keeps preserving case context.
+        await graph.aupdate_state(config, update)
+        return True
+
+
+async def link_to_parent_case(
+    child_case_id: str,
+    parent_case_id: str,
+    reason: str,
+    evidence_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    result = await INCIDENT_MEMORY.link_to_parent_case(child_case_id, parent_case_id, reason, evidence_refs or [])
+    parent = result.get("parent_case") if isinstance(result, dict) else None
+    if parent:
+        await inject_case_event(
+            parent,
+            {
+                "received_at": utc_now(),
+                "event_type": "linked_child_case",
+                "child_case_id": child_case_id,
+                "summary": reason,
+                "evidence_refs": list(evidence_refs or []),
+            },
+        )
+    return result
+
+
+async def run_investigation_graph(
+    alert_payload: dict[str, Any],
+    model=None,
+    mcp_runtime=None,
+    case: dict[str, Any] | None = None,
+) -> tuple[DiagnosticSynthesis, WorkflowState]:
+    incident_id = case["incident_id"] if case else str(uuid4())
+    thread_id = case.get("thread_id") if case and case.get("thread_id") else str(uuid4())
+    case_context = await INCIDENT_MEMORY.case_context(incident_id) if case else {}
+    latest_event = case_context.get("event_timeline", [{}])[-1] if case_context.get("event_timeline") else case_event_from_alert(alert_payload)
     state: WorkflowState = {
         "incident_id": incident_id,
+        "case_number": case.get("case_number", "") if case else "",
+        "case_status": case.get("status", "") if case else "",
+        "case_event_count": int(case.get("event_count", 0)) if case else 1,
+        "fingerprint": case.get("fingerprint", "") if case else "",
         "thread_id": thread_id,
         "current_step": "start",
         "created_at": utc_now(),
@@ -31,6 +109,11 @@ async def run_investigation_graph(alert_payload: dict[str, Any], model=None, mcp
         "normalized_alert": _jsonish_dict(alert_payload),
         "resource_id": resource_id_from_alert(alert_payload),
         "related_alerts": [_jsonish_dict(alert_payload)],
+        "latest_event": _jsonish_dict(latest_event),
+        "latest_transition": case.get("latest_transition") if case else None,
+        "case_context": _jsonish_dict(case_context),
+        "downstream_victims": list(case.get("downstream_victims", [])) if case else [],
+        "needs_reassessment": bool(case.get("needs_reassessment", False)) if case else False,
         "incident_history": [],
         "history_summary": {},
         "telemetry_cache": {},
@@ -51,12 +134,24 @@ async def run_investigation_graph(alert_payload: dict[str, Any], model=None, mcp
     )
     graph = await _graph(runtime, cache=model is None and mcp_runtime is None)
     _THREAD_GRAPHS[thread_id] = graph
+    if case:
+        await INCIDENT_MEMORY.set_case_thread(incident_id, thread_id)
     result_state = await graph.ainvoke(
         state,
         {"configurable": {"thread_id": thread_id}},
     )
     result_state = {key: value for key, value in result_state.items() if key != "__interrupt__"}
     synthesis = DiagnosticSynthesis.model_validate(result_state["diagnostic_synthesis"])
+    if case:
+        await INCIDENT_MEMORY.update_case(
+            incident_id,
+            {
+                "status": "waiting_approval",
+                "thread_id": thread_id,
+                "diagnostic_summary": synthesis.incident_summary,
+                "case_context": await INCIDENT_MEMORY.case_context(incident_id),
+            },
+        )
     return synthesis, result_state
 
 
@@ -81,6 +176,14 @@ async def record_operator_decision(incident_id: str, decision: dict[str, Any]) -
         }
     )
     await INCIDENT_MEMORY.put_summary(incident_id, summary)
+    await INCIDENT_MEMORY.update_case(
+        incident_id,
+        {
+            "status": "resolved",
+            "decision_status": summary["status"],
+            "operator_decision": decision,
+        },
+    )
     return summary
 
 

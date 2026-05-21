@@ -76,12 +76,64 @@ async def test_incident_memory_marks_chronic_after_four_distinct_events(monkeypa
 async def test_record_operator_decision_updates_summary(monkeypatch):
     memory = IncidentMemory(redis_url="")
     monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
-    await memory.put_summary("incident-1", {"incident_id": "incident-1", "status": "waiting_approval", "title": "test"})
+    case_result = await memory.intake_alert(
+        {
+            "source": "icinga2",
+            "status": "firing",
+            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
+            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
+        }
+    )
+    incident_id = case_result.case["incident_id"]
+    await memory.put_summary(incident_id, {"incident_id": incident_id, "status": "waiting_approval", "title": "test"})
 
     updated = await graph_runtime.record_operator_decision(
-        "incident-1",
-        {"incident_id": "incident-1", "decision": "approved", "operator": "svag", "comment": "ok"},
+        incident_id,
+        {"incident_id": incident_id, "decision": "approved", "operator": "svag", "comment": "ok"},
     )
+    case = await memory.get_case(incident_id)
 
     assert updated["status"] == "approved"
     assert updated["operator_decision"]["operator"] == "svag"
+    assert case["status"] == "resolved"
+    assert case["decision_status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_inject_case_event_updates_existing_graph_state(monkeypatch):
+    memory = IncidentMemory(redis_url="")
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    result = await memory.intake_alert(
+        {
+            "source": "icinga2",
+            "status": "firing",
+            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
+            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
+        }
+    )
+    case = await memory.set_case_thread(result.case["incident_id"], "thread-1")
+
+    class FakeSnapshot:
+        values = {
+            "related_alerts": [{"status": "firing"}],
+            "diagnostic_synthesis": {"incident_summary": "keep me"},
+        }
+
+    class FakeGraph:
+        def __init__(self):
+            self.update = None
+
+        async def aget_state(self, config):
+            return FakeSnapshot()
+
+        async def aupdate_state(self, config, values, as_node=None):
+            self.update = values
+
+    graph = FakeGraph()
+    monkeypatch.setitem(graph_runtime._THREAD_GRAPHS, "thread-1", graph)
+    event = {"received_at": "2026-05-20T19:40:00Z", "state": "CRITICAL", "summary": "worse"}
+
+    assert await graph_runtime.inject_case_event(case, event) is True
+    assert graph.update["related_alerts"] == [{"status": "firing"}, event]
+    assert "diagnostic_synthesis" not in graph.update
+    assert graph.update["latest_event"] == event

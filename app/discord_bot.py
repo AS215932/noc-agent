@@ -72,6 +72,7 @@ class NOCDiscordBot:
         )
         self._mcp_runtime = MCPRuntime(owner="discord_bot")
         self._tasks: set[asyncio.Task] = set()
+        self._case_messages = {}
         self._register_handlers()
 
     async def start(self):
@@ -100,6 +101,37 @@ class NOCDiscordBot:
                 inline=bool(field.get("inline", False)),
             )
         await channel.send(embed=embed)
+
+    async def send_case_embed(
+        self,
+        case_id: str,
+        title: str,
+        description: str,
+        color: int,
+        fields: list[dict[str, Any]] | None = None,
+    ):
+        if self.channel_id is None:
+            return
+        channel = self.client.get_channel(self.channel_id)
+        if channel is None:
+            return
+        embed = discord.Embed(title=title, description=description, color=color)
+        for field in fields or []:
+            embed.add_field(
+                name=str(field.get("name", "Field")),
+                value=str(field.get("value", "")),
+                inline=bool(field.get("inline", False)),
+            )
+        message = self._case_messages.get(case_id)
+        if message is not None and callable(getattr(message, "edit", None)):
+            try:
+                await message.edit(embed=embed)
+                return
+            except Exception as exc:
+                safe = classify_exception(exc)
+                log_exception("discord_case_embed_edit_failed", exc, category=safe.category, case_id=case_id)
+        sent = await channel.send(embed=embed)
+        self._case_messages[case_id] = sent
 
     def _register_handlers(self) -> None:
         @self.client.event

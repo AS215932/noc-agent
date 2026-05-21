@@ -62,9 +62,21 @@ class IncidentSummary(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     incident_id: str
+    case_number: str = ""
     resource_id: str = ""
     title: str
-    status: Literal["running", "waiting_approval", "approved", "rejected", "finalized"]
+    status: Literal[
+        "running",
+        "investigating",
+        "waiting_approval",
+        "recovered_pending",
+        "resolved",
+        "expired",
+        "linked",
+        "approved",
+        "rejected",
+        "finalized",
+    ]
     chronic_instability: bool = False
     active_specialist: str | None = None
     proposal_count: int = 0
@@ -81,6 +93,10 @@ class WorkflowState(TypedDict, total=False):
     # Durable, JSON-safe workflow state only. Runtime dependencies, clients,
     # agents, toolsets, model objects, and file handles must never be added.
     incident_id: str
+    case_number: str
+    case_status: str
+    case_event_count: int
+    fingerprint: str
     thread_id: str
     current_step: str
     created_at: str
@@ -89,6 +105,11 @@ class WorkflowState(TypedDict, total=False):
     resource_id: str
     correlation_key: str
     related_alerts: list[JsonDict]
+    latest_event: JsonDict
+    latest_transition: JsonDict | None
+    case_context: JsonDict
+    downstream_victims: list[str]
+    needs_reassessment: bool
     incident_history: list[JsonDict]
     history_summary: JsonDict
     telemetry_cache: JsonDict

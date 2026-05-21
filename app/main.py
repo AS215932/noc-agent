@@ -11,8 +11,8 @@ from contextlib import asynccontextmanager, suppress
 
 from app import log
 from app.agent import noc_triage_agent, noc_mail_agent
-from app.discord import Verbosity, send_discord_notification, notify_start, notify_finish
-from app.discord import install_bot_notifier
+from app.discord import Verbosity, send_discord_notification, send_case_notification, notify_start, notify_finish
+from app.discord import install_bot_notifier, install_case_notifier
 from app.discord_bot import build_bot
 from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
 from app.model_config import load_model_config
@@ -21,7 +21,8 @@ from app.model_metrics import metrics_response, record_failure, record_success, 
 from app.quota import check_gemini_quota
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
-from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
+from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
+from app.incident_memory import CaseIntakeResult, case_display_title, case_event_from_alert
 from app.noc_state import ApprovalDecision
 
 mcp_runtime = MCPRuntime(owner="api")
@@ -103,6 +104,7 @@ async def lifespan(app: FastAPI):
             discord_bot = build_bot()
             if discord_bot is not None:
                 install_bot_notifier(discord_bot.send_embed)
+                install_case_notifier(discord_bot.send_case_embed)
                 discord_bot_task = asyncio.create_task(discord_bot.start())
         except Exception as e:
             safe = classify_exception(e)
@@ -390,31 +392,122 @@ def _triage_fields(plan, alert_payload: dict) -> list[dict]:
     ]
 
 
-async def investigate_alert(alert_payload: dict, model=None):
-    title_source = alert_payload.get("groupLabels") or alert_payload.get("source") or alert_payload.get("host_name")
+def _case_update_fields(case: dict, event: dict) -> list[dict]:
+    timeline = []
+    latest = case.get("latest_event") or event
+    if latest:
+        timeline.append(
+            " | ".join(
+                part
+                for part in [
+                    latest.get("received_at", ""),
+                    latest.get("state", ""),
+                    latest.get("summary", ""),
+                ]
+                if part
+            )
+        )
+    victims = list(case.get("downstream_victims", []))
+    victim_lines = [f"- {victim}" for victim in victims[:10]]
+    if len(victims) > 10:
+        victim_lines.append(f"- Plus {len(victims) - 10} more")
+    return [
+        {"name": "Case", "value": f"{case.get('case_number', 'NOC')} · {case.get('status', 'unknown')}"},
+        {"name": "Events", "value": str(case.get("event_count", 0)), "inline": True},
+        {"name": "Latest Event", "value": _truncate_discord("\n".join(timeline) or "No event details.")},
+        {"name": "Downstream Victims", "value": _truncate_discord("\n".join(victim_lines) or "None")},
+    ]
+
+
+def _case_update_title(action: str, case: dict, event: dict) -> str:
+    display = case_display_title(case, event)
+    if action == "recovered":
+        return f"✅ {case.get('case_number', 'NOC')}: recovered, cooling down"
+    if action == "reopened":
+        return f"⚠️ {case.get('case_number', 'NOC')}: reopened during cooldown"
+    if action == "escalated":
+        return f"⚠️ {case.get('case_number', 'NOC')}: escalated to {event.get('state', 'UNKNOWN')}"
+    if action == "linked_parent":
+        return f"🔁 {case.get('case_number', 'NOC')}: downstream event linked"
+    return f"🔁 {case.get('case_number', 'NOC')}: duplicate event attached"
+
+
+def _case_update_description(action: str, case: dict, event: dict) -> str:
+    if action == "recovered":
+        return "Recovery event attached. The case is in recovered_pending cooldown for 10 minutes."
+    if action == "reopened":
+        return "A firing event arrived during recovered_pending cooldown, so the existing case was reopened."
+    if action == "linked_parent":
+        parent = case.get("linked_parent_case") or "parent case"
+        return f"Downstream event attached to `{parent}` instead of starting a separate investigation."
+    summary = event.get("summary") or "No output summary was provided."
+    return _truncate_discord(f"Event attached to the existing case. Latest state: `{event.get('state', 'UNKNOWN')}`.\n{summary}", DISCORD_DESCRIPTION_LIMIT)
+
+
+def _case_color(action: str, event: dict) -> int:
+    if action == "recovered":
+        return 0x2ecc71
+    if action in {"escalated", "reopened"} or str(event.get("state", "")).upper() == "CRITICAL":
+        return 0xe74c3c
+    return 0xf39c12
+
+
+async def _handle_case_update(result: CaseIntakeResult) -> None:
+    target_case = result.parent_case if result.parent_case is not None else result.case
+    if target_case is None:
+        return
+    if result.should_inject:
+        try:
+            await inject_case_event(target_case, result.event)
+        except Exception as e:
+            safe = classify_exception(e)
+            log_exception(
+                "case_event_injection_failed",
+                e,
+                category=safe.category,
+                case_number=target_case.get("case_number"),
+                action=result.action,
+            )
+    await send_case_notification(
+        case_id=target_case["incident_id"],
+        title=_case_update_title(result.action, target_case, result.event),
+        description=_case_update_description(result.action, result.case or target_case, result.event),
+        color=_case_color(result.action, result.event),
+        fields=_case_update_fields(target_case, result.event),
+        level=Verbosity.INFO,
+    )
+
+
+async def investigate_alert(alert_payload: dict, model=None, case: dict | None = None):
+    event = (case or {}).get("latest_event") or case_event_from_alert(alert_payload)
+    display_title = case_display_title(case, event)
     if _is_recovery_alert(alert_payload):
         log.info(
             "investigation_skipped",
             reason="recovery",
             alert_status=alert_payload.get("status"),
-            title_source=str(title_source),
+            title_source=display_title,
         )
         return
 
     log.info(
         "investigation_started",
         alert_status=alert_payload.get("status"),
-        title_source=str(title_source),
+        title_source=display_title,
+        incident_id=(case or {}).get("incident_id"),
+        case_number=(case or {}).get("case_number"),
     )
-    await notify_start(
-        f"NOC Triage: Alert from {title_source}",
-        "Starting investigation and collecting telemetry.",
+    await send_case_notification(
+        case_id=(case or {}).get("incident_id", display_title),
+        title=f"⏳ {display_title}",
+        description="Starting investigation and collecting telemetry.",
+        color=0xf39c12,
         level=Verbosity.INFO,
     )
 
     run_started = start_run("triage")
     try:
-        plan, graph_state = await run_investigation_graph(alert_payload, model=model, mcp_runtime=mcp_runtime)
+        plan, graph_state = await run_investigation_graph(alert_payload, model=model, mcp_runtime=mcp_runtime, case=case)
         record_success("triage", run_started, _SyntheticRunResult())
     except Exception as e:
         safe = classify_exception(e)
@@ -427,7 +520,7 @@ async def investigate_alert(alert_payload: dict, model=None):
             model=safe.model_name,
         )
         await notify_finish(
-            f"NOC Triage: Alert from {title_source}",
+            f"NOC Triage: {display_title}",
             safe.discord_description("NOC triage"),
             is_error=True,
             safe_category=safe.category,
@@ -448,15 +541,16 @@ async def investigate_alert(alert_payload: dict, model=None):
 
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
-    await send_discord_notification(
-        title=f"Detailed Report: {plan.incident_summary}",
+    await send_case_notification(
+        case_id=(case or {}).get("incident_id", display_title),
+        title=f"Detailed Report: {display_title}",
         description=_truncate_discord(
             f"{'Escalated to human review' if plan.requires_human else 'Triage completed'} "
             f"with {plan.confidence_score * 100:.1f}% confidence.",
             DISCORD_DESCRIPTION_LIMIT,
         ),
         color=color,
-        fields=fields
+        fields=fields,
     )
 
 
@@ -499,20 +593,37 @@ def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
 async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: BackgroundTasks):
     """Receives alerts from Prometheus Alertmanager and triggers the NOC agent."""
     alert_payload = payload.model_dump()
-    if _is_recovery_alert(alert_payload):
-        return {"status": "ignored", "message": "Recovery notification ignored"}
-    background_tasks.add_task(investigate_alert, alert_payload)
-    return {"status": "accepted", "message": "Alert received and agent triggered"}
+    alert_payload["source"] = "alertmanager"
+    result = await intake_alert(alert_payload)
+    if result.should_investigate and result.case is not None:
+        background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
+    elif result.case is not None or result.parent_case is not None:
+        background_tasks.add_task(_handle_case_update, result)
+    return {
+        "status": "accepted" if result.case or result.parent_case else "ignored",
+        "message": f"Alert {result.action}",
+        "action": result.action,
+        "case_number": (result.case or result.parent_case or {}).get("case_number"),
+        "incident_id": (result.case or result.parent_case or {}).get("incident_id"),
+    }
 
 
 @app.post("/webhook/icinga")
 async def icinga_webhook(payload: IcingaNotification, background_tasks: BackgroundTasks):
     """Receives Icinga2 NotificationCommand POSTs and triggers the NOC agent."""
     alert_payload = _icinga_to_alert_payload(payload)
-    if _is_recovery_alert(alert_payload):
-        return {"status": "ignored", "message": "Recovery notification ignored"}
-    background_tasks.add_task(investigate_alert, alert_payload)
-    return {"status": "accepted", "message": "Icinga notification accepted"}
+    result = await intake_alert(alert_payload)
+    if result.should_investigate and result.case is not None:
+        background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
+    elif result.case is not None or result.parent_case is not None:
+        background_tasks.add_task(_handle_case_update, result)
+    return {
+        "status": "accepted" if result.case or result.parent_case else "ignored",
+        "message": f"Icinga notification {result.action}",
+        "action": result.action,
+        "case_number": (result.case or result.parent_case or {}).get("case_number"),
+        "incident_id": (result.case or result.parent_case or {}).get("incident_id"),
+    }
 
 
 @app.post("/mail/poll", response_model=MailPollResponse)
