@@ -26,6 +26,7 @@ INTAKE_LOCK_TTL_MS = int(os.getenv("NOC_INTAKE_LOCK_TTL_MS", "10000"))
 MAX_CASE_EVENTS = int(os.getenv("NOC_CASE_MAX_EVENTS", "100"))
 MAX_TOPOLOGY_DEPTH = int(os.getenv("NOC_TOPOLOGY_PARENT_MAX_DEPTH", "10"))
 OPEN_CASE_STATUSES = {"investigating", "waiting_approval", "recovered_pending"}
+CASE_EXPIRY_INDEX_KEY = "noc:case:expiry"
 
 
 @dataclass
@@ -124,6 +125,7 @@ class IncidentMemory:
 
     async def get_case(self, incident_id: str) -> dict[str, Any] | None:
         if self._redis is not None:
+            incident_id = _redis_text(incident_id)
             raw = await self._redis.get(f"noc:case:{incident_id}")
             return json.loads(raw) if raw else None
         async with self._local.lock:
@@ -132,6 +134,7 @@ class IncidentMemory:
 
     async def case_events(self, incident_id: str) -> list[dict[str, Any]]:
         if self._redis is not None:
+            incident_id = _redis_text(incident_id)
             raw = await self._redis.lrange(f"noc:case:events:{incident_id}", 0, -1)
             return [json.loads(item) for item in raw]
         async with self._local.lock:
@@ -141,6 +144,7 @@ class IncidentMemory:
         fields = _jsonish_dict(fields)
         fields["updated_at"] = utc_now()
         if self._redis is not None:
+            incident_id = _redis_text(incident_id)
             raw = await self._redis.get(f"noc:case:{incident_id}")
             if not raw:
                 return None
@@ -311,7 +315,7 @@ class IncidentMemory:
             return await self._intake_alert_redis_locked(event, alert_payload, time.time())
         finally:
             with contextlib.suppress(Exception):
-                if await self._redis.get(lock_key) == owner:
+                if _redis_text(await self._redis.get(lock_key)) == owner:
                     await self._redis.delete(lock_key)
 
     async def _intake_alert_redis_locked(
@@ -322,6 +326,7 @@ class IncidentMemory:
     ) -> CaseIntakeResult:
         await self._expire_redis_cases(now)
         existing_id = await self._redis.get(f"noc:case:fingerprint:{event['fingerprint']}")
+        existing_id = _redis_text(existing_id) if existing_id else None
         existing = await self.get_case(existing_id) if existing_id else None
         if existing and existing.get("status") in OPEN_CASE_STATUSES:
             case, action = await self._append_event_redis(existing, event, now)
@@ -584,7 +589,7 @@ class IncidentMemory:
     async def _newest_open_case_redis(self, resource_key: str, now: float) -> dict[str, Any] | None:
         candidates: list[dict[str, Any]] = []
         for case_id in await self._redis.smembers(f"noc:open:resource:{resource_key}"):
-            case = await self.get_case(case_id)
+            case = await self.get_case(_redis_text(case_id))
             if case and case.get("status") in OPEN_CASE_STATUSES and not _case_is_idle(case, now):
                 candidates.append(case)
         return max(candidates, key=lambda item: item.get("updated_at", "")) if candidates else None
@@ -596,17 +601,17 @@ class IncidentMemory:
         except Exception:
             raw = None
         if raw:
-            parsed = json.loads(raw)
+            parsed = json.loads(_redis_text(raw))
             if isinstance(parsed, list):
                 return [_norm_key(item) for item in parsed if _norm_key(item)]
         with contextlib.suppress(Exception):
             values = await self._redis.lrange(key, 0, -1)
             if values:
-                return [_norm_key(item) for item in values if _norm_key(item)]
+                return [_norm_key(_redis_text(item)) for item in values if _norm_key(_redis_text(item))]
         with contextlib.suppress(Exception):
             values = await self._redis.smembers(key)
             if values:
-                return [_norm_key(item) for item in values if _norm_key(item)]
+                return [_norm_key(_redis_text(item)) for item in values if _norm_key(_redis_text(item))]
         return []
 
     def _expire_local_cases_locked(self, now: float) -> None:
@@ -622,13 +627,20 @@ class IncidentMemory:
                 self._drop_open_indexes_local_locked(case)
 
     async def _expire_redis_cases(self, now: float) -> None:
-        async for key in self._redis.scan_iter("noc:case:*"):
-            if ":events:" in key or ":fingerprint:" in key or ":daily:" in key:
+        case_ids = await self._redis.zrangebyscore(CASE_EXPIRY_INDEX_KEY, "-inf", now)
+        for raw_case_id in case_ids:
+            case_id = _redis_text(raw_case_id)
+            case = await self.get_case(case_id)
+            if not case:
+                await self._redis.zrem(CASE_EXPIRY_INDEX_KEY, case_id)
                 continue
-            raw = await self._redis.get(key)
-            if not raw:
+            expiry_at = _case_expiry_ts(case)
+            if expiry_at is None:
+                await self._redis.zrem(CASE_EXPIRY_INDEX_KEY, case_id)
                 continue
-            case = json.loads(raw)
+            if expiry_at > now:
+                await self._redis.zadd(CASE_EXPIRY_INDEX_KEY, {case_id: expiry_at})
+                continue
             status = case.get("status")
             if status == "recovered_pending" and _seconds_since(case.get("recovered_at"), now) >= RECOVERY_COOLDOWN_SECONDS:
                 case["status"] = "resolved"
@@ -694,7 +706,14 @@ class IncidentMemory:
             await self._redis.expire(redis_key, CASE_HISTORY_SECONDS)
 
     async def _store_case_redis(self, case: dict[str, Any]) -> None:
-        await self._redis.set(f"noc:case:{case['incident_id']}", json.dumps(_jsonish_dict(case)), ex=CASE_HISTORY_SECONDS)
+        case = _jsonish_dict(case)
+        await self._redis.set(f"noc:case:{case['incident_id']}", json.dumps(case), ex=CASE_HISTORY_SECONDS)
+        expiry_at = _case_expiry_ts(case)
+        if expiry_at is None:
+            await self._redis.zrem(CASE_EXPIRY_INDEX_KEY, case["incident_id"])
+            return
+        await self._redis.zadd(CASE_EXPIRY_INDEX_KEY, {case["incident_id"]: expiry_at})
+        await self._redis.expire(CASE_EXPIRY_INDEX_KEY, CASE_HISTORY_SECONDS)
 
     def _link_cases_local_locked(
         self,
@@ -1001,6 +1020,12 @@ def _jsonish_dict(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
+def _redis_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
 def _json_excerpt(value: Any, limit: int = 3000) -> dict[str, Any] | str:
     safe = _jsonish_dict(value)
     text = json.dumps(safe, sort_keys=True, separators=(",", ":"))
@@ -1038,3 +1063,14 @@ def _seconds_since(value: Any, now: float) -> float:
 
 def _case_is_idle(case: dict[str, Any], now: float) -> bool:
     return _seconds_since(case.get("last_event_at") or case.get("updated_at"), now) >= CASE_IDLE_SECONDS
+
+
+def _case_expiry_ts(case: dict[str, Any]) -> float | None:
+    status = case.get("status")
+    if status == "recovered_pending":
+        recovered_at = _parse_ts(case.get("recovered_at"))
+        return (recovered_at or time.time()) + RECOVERY_COOLDOWN_SECONDS
+    if status in {"investigating", "waiting_approval"}:
+        last_event_at = _parse_ts(case.get("last_event_at") or case.get("updated_at"))
+        return (last_event_at or time.time()) + CASE_IDLE_SECONDS
+    return None

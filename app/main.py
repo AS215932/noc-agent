@@ -22,7 +22,7 @@ from app.quota import check_gemini_quota
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
 from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
-from app.incident_memory import CaseIntakeResult, case_display_title, case_event_from_alert
+from app.incident_memory import CaseIntakeResult, RECOVERY_COOLDOWN_SECONDS, case_display_title, case_event_from_alert
 from app.noc_state import ApprovalDecision
 
 mcp_runtime = MCPRuntime(owner="api")
@@ -434,7 +434,8 @@ def _case_update_title(action: str, case: dict, event: dict) -> str:
 
 def _case_update_description(action: str, case: dict, event: dict) -> str:
     if action == "recovered":
-        return "Recovery event attached. The case is in recovered_pending cooldown for 10 minutes."
+        cooldown = _format_duration(RECOVERY_COOLDOWN_SECONDS)
+        return f"Recovery event attached. The case is in recovered_pending cooldown for {cooldown}."
     if action == "reopened":
         return "A firing event arrived during recovered_pending cooldown, so the existing case was reopened."
     if action == "linked_parent":
@@ -442,6 +443,19 @@ def _case_update_description(action: str, case: dict, event: dict) -> str:
         return f"Downstream event attached to `{parent}` instead of starting a separate investigation."
     summary = event.get("summary") or "No output summary was provided."
     return _truncate_discord(f"Event attached to the existing case. Latest state: `{event.get('state', 'UNKNOWN')}`.\n{summary}", DISCORD_DESCRIPTION_LIMIT)
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        value = seconds // 3600
+        unit = "hour" if value == 1 else "hours"
+    elif seconds % 60 == 0:
+        value = seconds // 60
+        unit = "minute" if value == 1 else "minutes"
+    else:
+        value = seconds
+        unit = "second" if value == 1 else "seconds"
+    return f"{value} {unit}"
 
 
 def _case_color(action: str, event: dict) -> int:

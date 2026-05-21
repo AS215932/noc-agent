@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -72,7 +73,8 @@ class NOCDiscordBot:
         )
         self._mcp_runtime = MCPRuntime(owner="discord_bot")
         self._tasks: set[asyncio.Task] = set()
-        self._case_messages = {}
+        self._max_case_messages = int(os.getenv("DISCORD_CASE_MESSAGE_CACHE_MAX", "1000"))
+        self._case_messages = OrderedDict()
         self._register_handlers()
 
     async def start(self):
@@ -126,12 +128,21 @@ class NOCDiscordBot:
         if message is not None and callable(getattr(message, "edit", None)):
             try:
                 await message.edit(embed=embed)
+                self._remember_case_message(case_id, message)
                 return
             except Exception as exc:
                 safe = classify_exception(exc)
                 log_exception("discord_case_embed_edit_failed", exc, category=safe.category, case_id=case_id)
         sent = await channel.send(embed=embed)
-        self._case_messages[case_id] = sent
+        self._remember_case_message(case_id, sent)
+
+    def _remember_case_message(self, case_id: str, message) -> None:
+        if self._max_case_messages <= 0:
+            return
+        self._case_messages[case_id] = message
+        self._case_messages.move_to_end(case_id)
+        while len(self._case_messages) > self._max_case_messages:
+            self._case_messages.popitem(last=False)
 
     def _register_handlers(self) -> None:
         @self.client.event

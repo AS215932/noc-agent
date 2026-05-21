@@ -85,16 +85,28 @@ async def test_record_operator_decision_updates_summary(monkeypatch):
         }
     )
     incident_id = case_result.case["incident_id"]
-    await memory.put_summary(incident_id, {"incident_id": incident_id, "status": "waiting_approval", "title": "test"})
+    await memory.put_summary(
+        incident_id,
+        {
+            "incident_id": incident_id,
+            "case_number": case_result.case["case_number"],
+            "status": "waiting_approval",
+            "title": "test",
+        },
+    )
 
     updated = await graph_runtime.record_operator_decision(
         incident_id,
         {"incident_id": incident_id, "decision": "approved", "operator": "svag", "comment": "ok"},
     )
     case = await memory.get_case(incident_id)
+    stored_summary = await memory.get_summary(incident_id)
 
     assert updated["status"] == "approved"
     assert updated["operator_decision"]["operator"] == "svag"
+    assert stored_summary["status"] == "approved"
+    assert stored_summary["incident_id"] == incident_id
+    assert stored_summary["case_number"] == case_result.case["case_number"]
     assert case["status"] == "resolved"
     assert case["decision_status"] == "approved"
 
@@ -137,3 +149,60 @@ async def test_inject_case_event_updates_existing_graph_state(monkeypatch):
     assert graph.update["related_alerts"] == [{"status": "firing"}, event]
     assert "diagnostic_synthesis" not in graph.update
     assert graph.update["latest_event"] == event
+
+
+@pytest.mark.asyncio
+async def test_inject_case_event_without_thread_id_leaves_thread_graphs_unchanged(monkeypatch):
+    memory = IncidentMemory(redis_url="")
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    original_graphs = {"thread-existing": object()}
+    monkeypatch.setattr(graph_runtime, "_THREAD_GRAPHS", dict(original_graphs))
+
+    result = await memory.intake_alert(
+        {
+            "source": "icinga2",
+            "status": "firing",
+            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
+            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
+        }
+    )
+
+    assert await graph_runtime.inject_case_event(result.case, {"state": "CRITICAL"}) is False
+    assert graph_runtime._THREAD_GRAPHS == original_graphs
+
+
+@pytest.mark.asyncio
+async def test_inject_case_event_retries_without_as_node(monkeypatch):
+    memory = IncidentMemory(redis_url="")
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    result = await memory.intake_alert(
+        {
+            "source": "icinga2",
+            "status": "firing",
+            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
+            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
+        }
+    )
+    case = await memory.set_case_thread(result.case["incident_id"], "thread-fallback")
+
+    class EmptySnapshot:
+        values = {}
+
+    class FallbackGraph:
+        def __init__(self):
+            self.calls = []
+
+        async def aget_state(self, config):
+            return EmptySnapshot()
+
+        async def aupdate_state(self, config, values, **kwargs):
+            self.calls.append({"config": config, "values": values, "kwargs": kwargs})
+            if len(self.calls) == 1:
+                raise RuntimeError("as_node not supported")
+
+    graph = FallbackGraph()
+    monkeypatch.setattr(graph_runtime, "_THREAD_GRAPHS", {"thread-fallback": graph})
+
+    assert await graph_runtime.inject_case_event(case, {"state": "CRITICAL"}) is True
+    assert graph.calls[0]["kwargs"] == {"as_node": "intake_event_injection"}
+    assert graph.calls[1]["kwargs"] == {}
