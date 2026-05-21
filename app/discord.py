@@ -8,6 +8,7 @@ from app.safe_errors import classify_exception, log_exception
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 BOT_NOTIFIER = None
+CASE_BOT_NOTIFIER = None
 
 class Verbosity(enum.IntEnum):
     DEBUG = 10
@@ -60,9 +61,36 @@ async def send_discord_notification(title: str, description: str, color: int = 0
             log_exception("discord_notification_failed", e, category=safe.category)
 
 
+async def send_case_notification(
+    case_id: str,
+    title: str,
+    description: str,
+    color: int = 0x3498db,
+    fields: list[dict[str, Any]] | None = None,
+    level: Verbosity = Verbosity.INFO,
+):
+    if level < get_verbosity():
+        return
+    if CASE_BOT_NOTIFIER is not None:
+        await CASE_BOT_NOTIFIER(
+            case_id=case_id,
+            title=title,
+            description=description,
+            color=color,
+            fields=fields or [],
+        )
+        return
+    await send_discord_notification(title=title, description=description, color=color, fields=fields or [], level=level)
+
+
 def install_bot_notifier(notifier):
     global BOT_NOTIFIER
     BOT_NOTIFIER = notifier
+
+
+def install_case_notifier(notifier):
+    global CASE_BOT_NOTIFIER
+    CASE_BOT_NOTIFIER = notifier
 
 async def notify_start(task_name: str, description: str, level: Verbosity = Verbosity.DEBUG):
     await send_discord_notification(

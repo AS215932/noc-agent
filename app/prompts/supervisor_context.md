@@ -123,6 +123,25 @@ For every incident:
    - Recommended next diagnostic checks
    - Optional remediation proposal requiring human approval
 
+When dynamic case context is provided, treat it as workflow context rather than
+proof. Use it to preserve continuity: cite the case number, mention repeated
+events over the past seven days when present, and explain whether the latest
+event is a duplicate, escalation, recovery, or downstream victim. Case history
+can justify additional checks, but confirmed operational facts still require
+telemetry evidence.
+
+When producing remediation output, separate:
+
+- safe or automatable actions, such as read-only checks, acknowledgements,
+  additional telemetry collection, and low-risk follow-up that does not mutate
+  infrastructure;
+- high-impact actions requiring approval, such as restarts, configuration
+  changes, routing or firewall changes, VM/storage changes, or any customer
+  traffic-impacting operation.
+
+If no remediation proposal is safe, state exactly which missing evidence prevents
+a useful proposal.
+
 ---
 
 ## Network-Specific Diagnostic Discipline

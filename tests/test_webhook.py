@@ -18,6 +18,8 @@ from app.main import (
     icinga_webhook,
 )
 from app.agent import DiagnosticSynthesis
+from app.incident_memory import IncidentMemory
+import app.graph_runtime as graph_runtime
 from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
 
@@ -144,11 +146,12 @@ async def test_health_mail_reports_failures(mocker):
     assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker):
+async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, monkeypatch):
     """
     Test that the webhook successfully parses standard AlertManager payloads
     and offloads the processing to a background task.
     """
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     mocker.patch("app.main.investigate_alert") # Mock the background execution so we don't hit the real LLM API
     response = await alertmanager_webhook(
         AlertManagerPayload.model_validate(mock_alert_payload),
@@ -157,7 +160,8 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker):
     assert response["status"] == "accepted"
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker):
+async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, monkeypatch):
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     background_tasks = mocker.Mock()
     mock_alert_payload["status"] = "resolved"
     mock_alert_payload["alerts"][0]["status"] = "resolved"
@@ -172,7 +176,8 @@ async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker)
 
 
 @pytest.mark.asyncio
-async def test_icinga_webhook_ignores_recovery(mocker):
+async def test_icinga_webhook_ignores_recovery(mocker, monkeypatch):
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     background_tasks = mocker.Mock()
     notification = IcingaNotification(
         host_name="vault",
@@ -227,8 +232,7 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     it should send a summary to a specified Discord Webhook URL.
     This test serves as a design driver for creating the `discord.py` integration.
     """
-    mock_start_discord = mocker.patch("app.discord.send_discord_notification", return_value=None)
-    mock_detail_discord = mocker.patch("app.main.send_discord_notification", return_value=None)
+    mock_case_discord = mocker.patch("app.main.send_case_notification", return_value=None)
     
     # We call the investigation function directly to avoid asyncio background_tasks complications
     from app.main import investigate_alert
@@ -240,13 +244,36 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     # Run the test directly overriding the model logic for the scope of the method call
     await investigate_alert(mock_alert_payload, model=TestModel())
 
-    mock_detail_discord.assert_called_once()
-    start_titles = [call.kwargs["title"] for call in mock_start_discord.call_args_list]
-    detail_titles = [mock_detail_discord.call_args.kwargs["title"]]
-    assert any(title.startswith("⏳ Starting: NOC Triage:") for title in start_titles)
-    assert detail_titles[0].startswith("Detailed Report:")
-    titles = start_titles + detail_titles
+    assert mock_case_discord.call_count == 2
+    titles = [call.kwargs["title"] for call in mock_case_discord.call_args_list]
+    assert any(title.startswith("⏳ NOC:") for title in titles)
+    assert any(title.startswith("Detailed Report:") for title in titles)
     assert not any("Finished" in title for title in titles)
+
+
+@pytest.mark.asyncio
+async def test_icinga_duplicate_attaches_to_existing_case_without_second_investigation(mocker, monkeypatch):
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
+    background_tasks = mocker.Mock()
+    notification = IcingaNotification(
+        host_name="noc",
+        service_name="noc-agent-uptime",
+        check_command="noc-agent-uptime",
+        state="WARNING",
+        state_type="PROBLEM",
+        output="WARNING: uptime_seconds=556 (<1800)",
+    )
+    duplicate = notification.model_copy(update={"state": "CRITICAL", "output": "CRITICAL: uptime_seconds=258 (<300)"})
+
+    first = await icinga_webhook(notification, background_tasks)
+    second = await icinga_webhook(duplicate, background_tasks)
+
+    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
+    assert first["action"] == "created"
+    assert second["action"] == "escalated"
+    assert first["case_number"] == second["case_number"]
+    assert scheduled.count("investigate_alert") == 1
+    assert scheduled.count("_handle_case_update") == 1
 
 def test_triage_fields_turn_internal_schema_failure_into_operator_guidance(mock_alert_payload):
     plan = DiagnosticSynthesis.model_validate({

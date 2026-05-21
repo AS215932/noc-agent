@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from langgraph.types import interrupt
+from pydantic_ai.toolsets import FunctionToolset
 
 from app.agents.triage import DiagnosticEvidence, DiagnosticSynthesis, TriageAgentDeps, build_triage_agent
 from app.deps.runtime import RuntimeDeps
@@ -66,9 +67,14 @@ class NodeRunner:
 
     async def _run_specialist(self, state: WorkflowState, specialist: str) -> dict[str, Any]:
         perimeter = self.runtime.perimeter_context.prompt_block() if self.runtime.perimeter_context else ""
+        case_context = state.get("case_context") or {}
         prompt = (
             f"{load_supervisor_context()}\n\n"
             f"{perimeter}\n\n"
+            f"Case context (dynamic intake state, not standalone evidence):\n{case_context}\n\n"
+            "When proposing remediation, separate safe/automatable follow-up from high-impact actions that need approval. "
+            "Mention chronic 7-day behavior when it is present in case context. "
+            "If no remediation proposal is safe, explain exactly what evidence is missing.\n"
             f"Active specialist: {specialist}\n"
             f"Resource: {state['resource_id']}\n"
             f"Chronic instability: {state.get('chronic_instability', False)}\n"
@@ -77,6 +83,8 @@ class NodeRunner:
         )
         agent = build_triage_agent()
         toolsets = self.runtime.mcp_runtime.toolsets_for(specialist) if self.runtime.mcp_runtime is not None else []
+        toolsets = list(toolsets)
+        toolsets.append(self._case_link_toolset(state))
         result = await agent.run(
             prompt,
             model=self.runtime.model_override,
@@ -163,6 +171,7 @@ class NodeRunner:
         proposal_count = len(state.get("proposals", []))
         summary = IncidentSummary(
             incident_id=state["incident_id"],
+            case_number=state.get("case_number", ""),
             resource_id=state["resource_id"],
             title=DiagnosticSynthesis.model_validate(state["diagnostic_synthesis"]).incident_summary,
             status="waiting_approval",
@@ -172,7 +181,19 @@ class NodeRunner:
         ).model_dump(mode="json")
         summary["thread_id"] = state["thread_id"]
         summary["proposals"] = list(state.get("proposals", []))
+        summary["fingerprint"] = state.get("fingerprint", "")
+        summary["event_count"] = state.get("case_event_count", 0)
+        summary["case_context"] = state.get("case_context", {})
         await self.runtime.incident_memory.put_summary(state["incident_id"], summary)
+        await self.runtime.incident_memory.update_case(
+            state["incident_id"],
+            {
+                "status": "waiting_approval",
+                "summary": summary,
+                "thread_id": state["thread_id"],
+                "diagnostic_summary": summary["title"],
+            },
+        )
         update = {
             "current_step": "prepare_approval",
             "updated_at": utc_now(),
@@ -181,6 +202,20 @@ class NodeRunner:
         }
         assert_json_serializable_state(update)
         return update
+
+    def _case_link_toolset(self, state: WorkflowState) -> FunctionToolset:
+        async def link_to_parent_case(child_case_id: str, parent_case_id: str, reason: str, evidence_refs: list[str] | None = None) -> dict[str, Any]:
+            """Link a downstream victim case to an upstream parent NOC case."""
+            if child_case_id != state["incident_id"]:
+                return {"ok": False, "error": "child_case_id must match the active case"}
+            return await self.runtime.incident_memory.link_to_parent_case(
+                child_case_id,
+                parent_case_id,
+                reason,
+                evidence_refs or [],
+            )
+
+        return FunctionToolset([link_to_parent_case])
 
     async def approval_interrupt(self, state: WorkflowState) -> dict[str, Any]:
         decision = interrupt({"incident_id": state["incident_id"], "approval_state": "waiting_approval"})
