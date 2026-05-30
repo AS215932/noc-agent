@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from langgraph.types import interrupt
@@ -13,6 +14,7 @@ from app.graph.state import (
     ChangeProposal,
     EvidenceItem,
     IncidentSummary,
+    JsonValue,
     SpecialistFinding,
     WorkflowState,
     assert_json_serializable_state,
@@ -203,6 +205,82 @@ class NodeRunner:
         assert_json_serializable_state(update)
         return update
 
+    async def execute_approved_remediation(self, state: WorkflowState) -> dict[str, Any]:
+        decision = state.get("operator_decision") or {}
+        if decision.get("decision") != "approved":
+            update = {"current_step": "execute_approved_remediation", "updated_at": utc_now(), "approval_state": decision.get("decision", "acknowledged")}
+            assert_json_serializable_state(update)
+            return update
+
+        actions = _approved_restart_actions(state)
+        results = []
+        for action in actions:
+            try:
+                result = await self.runtime.mcp_runtime.call_tool(
+                    "hyrule",
+                    "os_service_restart",
+                    {"host": action["host"], "service": action["service"]},
+                )
+            except Exception as exc:
+                result = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
+            results.append({"action": action, "result": _jsonish(result), "ok": bool(isinstance(result, dict) and result.get("ok"))})
+
+        if not actions:
+            approval_state = "approved_no_executable_action"
+        elif all(item["ok"] for item in results):
+            approval_state = "executed"
+        else:
+            approval_state = "execution_failed"
+        update = {
+            "current_step": "execute_approved_remediation",
+            "updated_at": utc_now(),
+            "approval_state": approval_state,
+            "executed_actions": list(state.get("executed_actions", [])) + results,
+        }
+        assert_json_serializable_state(update)
+        return update
+
+    async def verify_remediation(self, state: WorkflowState) -> dict[str, Any]:
+        executed = [item for item in state.get("executed_actions", []) if item.get("ok")]
+        results = []
+        for item in executed:
+            action = item.get("action") or {}
+            host = str(action.get("host") or "")
+            instance = _prometheus_instance_for(host)
+            if not instance:
+                results.append({"host": host, "ok": False, "error": "No Prometheus instance mapping for host", "attempts": []})
+                continue
+            query = f'up{{instance="{instance}"}}'
+            attempts = []
+            verified = False
+            for attempt in range(1, 4):
+                await asyncio.sleep(15)
+                try:
+                    response = await self.runtime.mcp_runtime.call_tool("hyrule", "prometheus_query", {"query": query})
+                except Exception as exc:
+                    response = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
+                ok = _prometheus_up(response)
+                attempts.append({"attempt": attempt, "query": query, "ok": ok, "response": _jsonish(response)})
+                if ok:
+                    verified = True
+                    break
+            results.append({"host": host, "instance": instance, "ok": verified, "attempts": attempts})
+
+        if not executed:
+            approval_state = state.get("approval_state", "approved_no_executable_action")
+        elif all(item.get("ok") for item in results):
+            approval_state = "verified"
+        else:
+            approval_state = "verification_failed"
+        update = {
+            "current_step": "verify_remediation",
+            "updated_at": utc_now(),
+            "approval_state": approval_state,
+            "verification_results": list(state.get("verification_results", [])) + results,
+        }
+        assert_json_serializable_state(update)
+        return update
+
     def _case_link_toolset(self, state: WorkflowState) -> FunctionToolset:
         async def link_to_parent_case(child_case_id: str, parent_case_id: str, reason: str, evidence_refs: list[str] | None = None) -> dict[str, Any]:
             """Link a downstream victim case to an upstream parent NOC case."""
@@ -263,3 +341,66 @@ def _synthesis_assessment(synthesis: DiagnosticSynthesis) -> str:
     if synthesis.confidence_basis:
         sections.append("Confidence basis: " + synthesis.confidence_basis)
     return "\n".join(section for section in sections if section).strip() or synthesis.incident_summary
+
+
+_ROUTER_ALIASES = {
+    "cr1-nl1": "cr1-nl1",
+    "cr1.nl1": "cr1-nl1",
+    "cr1_nl1": "cr1-nl1",
+    "cr1-de1": "cr1-de1",
+    "cr1.de1": "cr1-de1",
+    "cr1_de1": "cr1-de1",
+}
+
+_PROMETHEUS_NODE_INSTANCES = {
+    "cr1-nl1": "[2a0c:b641:b50::a]:9100",
+    "cr1-de1": "[2a0c:b641:b50::b]:9100",
+}
+
+
+def _approved_restart_actions(state: WorkflowState) -> list[dict[str, str]]:
+    synthesis = DiagnosticSynthesis.model_validate(state["diagnostic_synthesis"])
+    text = " ".join(
+        [
+            synthesis.incident_summary,
+            " ".join(synthesis.affected_objects),
+            _flatten_text(state.get("proposals", [])),
+            _flatten_text(state.get("normalized_alert", {})),
+        ]
+    ).lower()
+    if "restart" not in text or "node_exporter" not in text:
+        return []
+    hosts = []
+    for alias, canonical in _ROUTER_ALIASES.items():
+        if alias in text and canonical not in hosts:
+            hosts.append(canonical)
+    return [{"type": "restart_service", "host": host, "service": "node_exporter"} for host in hosts]
+
+
+def _prometheus_instance_for(host: str) -> str | None:
+    return _PROMETHEUS_NODE_INSTANCES.get(_ROUTER_ALIASES.get(host, host))
+
+
+def _prometheus_up(response: Any) -> bool:
+    if not isinstance(response, dict) or not response.get("ok", False):
+        return False
+    rows = response.get("result") or (response.get("data") or {}).get("result") or []
+    for row in rows:
+        value = row.get("value") if isinstance(row, dict) else None
+        if str(value) == "1":
+            return True
+    return False
+
+
+def _flatten_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(_flatten_text(item) for item in value.values())
+    if isinstance(value, list):
+        return " ".join(_flatten_text(item) for item in value)
+    return str(value)
+
+
+def _jsonish(value: Any) -> JsonValue:
+    import json
+
+    return json.loads(json.dumps(value, default=str))

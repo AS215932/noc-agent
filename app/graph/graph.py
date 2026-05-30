@@ -23,6 +23,8 @@ async def build_graph(runtime: RuntimeDeps):
     workflow.add_node("proposal_build", nodes.proposal_build)
     workflow.add_node("prepare_approval", nodes.prepare_approval)
     workflow.add_node("approval_interrupt", nodes.approval_interrupt)
+    workflow.add_node("execute_approved_remediation", nodes.execute_approved_remediation)
+    workflow.add_node("verify_remediation", nodes.verify_remediation)
 
     workflow.add_edge(START, "correlate_and_dedupe")
     workflow.add_edge("correlate_and_dedupe", "recall_history")
@@ -42,8 +44,20 @@ async def build_graph(runtime: RuntimeDeps):
     workflow.add_edge("golden_state_drift_check", "proposal_build")
     workflow.add_edge("proposal_build", "prepare_approval")
     workflow.add_edge("prepare_approval", "approval_interrupt")
-    workflow.add_edge("approval_interrupt", END)
+    workflow.add_conditional_edges(
+        "approval_interrupt",
+        _route_after_approval,
+        {
+            "execute_approved_remediation": "execute_approved_remediation",
+            "end": END,
+        },
+    )
+    workflow.add_edge("execute_approved_remediation", "verify_remediation")
+    workflow.add_edge("verify_remediation", END)
 
     checkpointer = await build_checkpointer()
     return workflow.compile(checkpointer=checkpointer)
 
+
+def _route_after_approval(state: WorkflowState) -> str:
+    return "execute_approved_remediation" if state.get("approval_state") == "approved" else "end"

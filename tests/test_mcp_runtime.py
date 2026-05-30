@@ -223,6 +223,21 @@ async def test_runtime_health_preserves_ready_state_without_client():
     assert runtime.clients == {}
 
 
+def test_infrastructure_toolset_includes_read_only_freebsd_tools_but_not_restart():
+    runtime = MCPRuntime(owner="test")
+    runtime.tools_by_source["hyrule"] = [
+        SimpleNamespace(name="os_service_status"),
+        SimpleNamespace(name="os_service_logs"),
+        SimpleNamespace(name="socket_listeners"),
+        SimpleNamespace(name="os_service_restart"),
+    ]
+
+    names = {tool.name for tool in runtime.tools_for("infrastructure")}
+
+    assert {"os_service_status", "os_service_logs", "socket_listeners"} <= names
+    assert "os_service_restart" not in names
+
+
 @pytest.mark.asyncio
 async def test_runtime_times_out_stalled_source(monkeypatch):
     monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)

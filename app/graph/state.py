@@ -120,6 +120,8 @@ class WorkflowState(TypedDict, total=False):
     specialist_finding: JsonDict
     diagnostic_synthesis: JsonDict
     proposals: list[JsonDict]
+    executed_actions: list[JsonDict]
+    verification_results: list[JsonDict]
     approval_state: str
     operator_decision: JsonDict | None
     chronic_instability: bool
