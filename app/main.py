@@ -713,7 +713,7 @@ async def decide_incident(
 ):
     _require_control_token(x_noc_control_token)
     decision = ApprovalDecision(incident_id=incident_id, **request.model_dump())
-    summary = await record_operator_decision(incident_id, decision.model_dump())
+    summary = await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return {"status": "ok", "incident": summary}
@@ -728,7 +728,7 @@ async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | N
         operator=request.operator,
         comment=request.comment,
     )
-    summary = await record_operator_decision(request.incident_id, decision.model_dump())
+    summary = await record_operator_decision(request.incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return {"status": "ok", "incident": summary}

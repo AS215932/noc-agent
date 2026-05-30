@@ -185,6 +185,12 @@ class MCPRuntime:
             return []
         return [FunctionToolset(tools)]
 
+    async def call_tool(self, source: str, name: str, arguments: dict[str, Any]) -> Any:
+        client = self.clients.get(source)
+        if client is None:
+            raise RuntimeError(f"MCP source {source!r} is not connected")
+        return await client._call_tool_with_reconnect(name, arguments)
+
     @staticmethod
     def _source_health(state: MCPSourceState) -> dict[str, Any]:
         return {
@@ -221,8 +227,11 @@ BGP_TOOLS = {
     "multi_source_probe",
     "prometheus_query",
     "prometheus_list_targets",
+    "os_service_status",
+    "os_service_logs",
     "os_systemd_status",
     "os_rcctl_check",
+    "socket_listeners",
 }
 FIREWALL_TOOLS = {
     "firewall_state",
@@ -233,17 +242,21 @@ FIREWALL_TOOLS = {
     "arp_state",
     "path_explain",
     "prometheus_query",
+    "socket_listeners",
 }
 INFRASTRUCTURE_TOOLS = {
     "icinga_get_host_state",
     "icinga_list_problems",
     "prometheus_query",
     "prometheus_list_targets",
+    "os_service_status",
+    "os_service_logs",
     "os_systemd_status",
     "os_rcctl_check",
     "os_journalctl",
     "dmesg_tail",
     "service_restart_history",
+    "socket_listeners",
     "vault_agent_status",
     "dns_dig",
     "dns_probe_burst",

@@ -2,6 +2,8 @@ import pytest
 from pydantic_ai.models.test import TestModel
 
 import app.graph_runtime as graph_runtime
+from app.agents.triage import DiagnosticSynthesis
+from app.graph.nodes import NodeRunner
 from app.incident_memory import IncidentMemory
 
 
@@ -206,3 +208,97 @@ async def test_inject_case_event_retries_without_as_node(monkeypatch):
     assert await graph_runtime.inject_case_event(case, {"state": "CRITICAL"}) is True
     assert graph.calls[0]["kwargs"] == {"as_node": "intake_event_injection"}
     assert graph.calls[1]["kwargs"] == {}
+
+
+@pytest.mark.asyncio
+async def test_approved_restart_proposal_executes_node_exporter_restart():
+    class FakeMCPRuntime:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, source, name, arguments):
+            self.calls.append((source, name, arguments))
+            return {"ok": True, "tool": name}
+
+    runtime = type("Runtime", (), {"mcp_runtime": FakeMCPRuntime()})()
+    runner = NodeRunner(runtime)
+    synthesis = DiagnosticSynthesis(incident_summary="node_exporter down", affected_objects=["cr1.nl1"])
+    state = {
+        "operator_decision": {"decision": "approved", "operator": "pytest"},
+        "diagnostic_synthesis": synthesis.model_dump(mode="json"),
+        "normalized_alert": {},
+        "proposals": [{"proposed_remediation": ["Restart node_exporter on cr1.nl1"]}],
+        "executed_actions": [],
+    }
+
+    update = await runner.execute_approved_remediation(state)
+
+    assert runtime.mcp_runtime.calls == [
+        ("hyrule", "os_service_restart", {"host": "cr1-nl1", "service": "node_exporter"})
+    ]
+    assert update["approval_state"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_verification_retries_prometheus_before_escalating(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("app.graph.nodes.asyncio.sleep", fake_sleep)
+
+    class FakeMCPRuntime:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, source, name, arguments):
+            self.calls.append((source, name, arguments))
+            return {"ok": True, "result": [{"metric": {"instance": arguments["query"]}, "value": "0"}]}
+
+    runtime = type("Runtime", (), {"mcp_runtime": FakeMCPRuntime()})()
+    runner = NodeRunner(runtime)
+    state = {
+        "approval_state": "executed",
+        "executed_actions": [{"ok": True, "action": {"host": "cr1-nl1", "service": "node_exporter"}}],
+        "verification_results": [],
+    }
+
+    update = await runner.verify_remediation(state)
+
+    assert sleeps == [15, 15, 15]
+    assert len(runtime.mcp_runtime.calls) == 3
+    assert update["approval_state"] == "verification_failed"
+
+
+@pytest.mark.asyncio
+async def test_verification_stops_after_prometheus_recovery(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("app.graph.nodes.asyncio.sleep", fake_sleep)
+
+    class FakeMCPRuntime:
+        def __init__(self):
+            self.calls = 0
+
+        async def call_tool(self, source, name, arguments):
+            self.calls += 1
+            value = "1" if self.calls == 2 else "0"
+            return {"ok": True, "result": [{"value": value}]}
+
+    runtime = type("Runtime", (), {"mcp_runtime": FakeMCPRuntime()})()
+    runner = NodeRunner(runtime)
+    state = {
+        "approval_state": "executed",
+        "executed_actions": [{"ok": True, "action": {"host": "cr1-nl1", "service": "node_exporter"}}],
+        "verification_results": [],
+    }
+
+    update = await runner.verify_remediation(state)
+
+    assert sleeps == [15, 15]
+    assert runtime.mcp_runtime.calls == 2
+    assert update["approval_state"] == "verified"

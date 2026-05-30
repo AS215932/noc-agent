@@ -146,6 +146,17 @@ a useful proposal.
 
 ## Network-Specific Diagnostic Discipline
 
+### Service Diagnostics
+
+Prefer universal service tools over OS-specific tools. Use
+`os_service_status` and `os_service_logs` first, then fall back to
+`os_systemd_status`, `os_journalctl`, or `os_rcctl_check` only when the
+universal tool reports that it is unsupported for the target.
+
+For FreeBSD routers, expect rc services to use `service <name> onestatus` and
+logs to live either in a dedicated `/var/log/<service>.log` file or in
+`/var/log/messages`.
+
 ### Direct Measurement
 
 Direct measurement beats inference.

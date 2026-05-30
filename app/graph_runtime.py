@@ -119,6 +119,8 @@ async def run_investigation_graph(
         "telemetry_cache": {},
         "evidence_log": [],
         "proposals": [],
+        "executed_actions": [],
+        "verification_results": [],
         "approval_state": "pending",
         "operator_decision": None,
         "drift_findings": [],
@@ -163,11 +165,14 @@ async def summary_for(incident_id: str) -> dict[str, Any] | None:
     return await INCIDENT_MEMORY.get_summary(incident_id)
 
 
-async def record_operator_decision(incident_id: str, decision: dict[str, Any]) -> dict[str, Any] | None:
+async def record_operator_decision(incident_id: str, decision: dict[str, Any], mcp_runtime=None) -> dict[str, Any] | None:
     summary = await INCIDENT_MEMORY.get_summary(incident_id)
     if not summary:
         return None
     status = decision.get("decision", "acknowledged")
+    final_state = None
+    if status == "approved" and summary.get("thread_id"):
+        final_state = await resume_investigation(incident_id, decision, mcp_runtime=mcp_runtime)
     summary.update(
         {
             "status": "approved" if status == "approved" else "rejected" if status == "rejected" else "finalized",
@@ -175,13 +180,23 @@ async def record_operator_decision(incident_id: str, decision: dict[str, Any]) -
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+    if final_state is not None:
+        summary["approval_state"] = final_state.get("approval_state", summary["status"])
+        summary["executed_actions"] = list(final_state.get("executed_actions", []))
+        summary["verification_results"] = list(final_state.get("verification_results", []))
+        if final_state.get("approval_state") == "verified":
+            summary["status"] = "resolved"
+        elif final_state.get("approval_state") in {"verification_failed", "execution_failed", "approved_no_executable_action"}:
+            summary["status"] = "waiting_approval"
     await INCIDENT_MEMORY.put_summary(incident_id, summary)
     await INCIDENT_MEMORY.update_case(
         incident_id,
         {
-            "status": "resolved",
+            "status": "waiting_approval" if summary["status"] == "waiting_approval" else "resolved",
             "decision_status": summary["status"],
             "operator_decision": decision,
+            "executed_actions": summary.get("executed_actions", []),
+            "verification_results": summary.get("verification_results", []),
         },
     )
     return summary
