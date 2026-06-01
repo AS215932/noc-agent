@@ -20,6 +20,7 @@ The key invariants we lock down:
 """
 
 from types import SimpleNamespace
+import asyncio
 
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 import pytest
@@ -84,6 +85,84 @@ class _FakeSession:
         if self._raise_list_exc is not None:
             raise self._raise_list_exc
         return SimpleNamespace(tools=[_make_mcp_tool()])
+
+
+class _TaskOwnedTransport:
+    instances = []
+
+    def __init__(self):
+        self.enter_task = None
+        self.exit_task = None
+        _TaskOwnedTransport.instances.append(self)
+
+    async def __aenter__(self):
+        self.enter_task = asyncio.current_task()
+        return (object(), object())
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exit_task = asyncio.current_task()
+        if self.exit_task is not self.enter_task:
+            raise RuntimeError("Attempted to exit cancel scope in a different task")
+
+
+class _OwnerFakeSession:
+    instances = []
+    initialize_failures: list[BaseException] = []
+    list_failures: list[BaseException] = []
+    call_failures: list[BaseException] = []
+    list_delay_s = 0.0
+    call_delay_s = 0.0
+
+    def __init__(self, read, write):
+        self.read = read
+        self.write = write
+        self.calls: list[tuple[str, dict]] = []
+        self.enter_task = None
+        self.exit_task = None
+        _OwnerFakeSession.instances.append(self)
+
+    async def __aenter__(self):
+        self.enter_task = asyncio.current_task()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exit_task = asyncio.current_task()
+        if self.exit_task is not self.enter_task:
+            raise RuntimeError("Attempted to exit cancel scope in a different task")
+
+    async def initialize(self):
+        if len(_OwnerFakeSession.instances) > 1 and _OwnerFakeSession.initialize_failures:
+            raise _OwnerFakeSession.initialize_failures.pop(0)
+        return None
+
+    async def list_tools(self):
+        if self.list_delay_s:
+            await asyncio.sleep(self.list_delay_s)
+        if _OwnerFakeSession.list_failures:
+            raise _OwnerFakeSession.list_failures.pop(0)
+        return SimpleNamespace(tools=[_make_mcp_tool()])
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        if self.call_delay_s:
+            await asyncio.sleep(self.call_delay_s)
+        if _OwnerFakeSession.call_failures:
+            raise _OwnerFakeSession.call_failures.pop(0)
+        return SimpleNamespace(content=[_make_text_block(f"ok:{name}")])
+
+
+@pytest.fixture
+def owner_client_fakes(monkeypatch):
+    _TaskOwnedTransport.instances = []
+    _OwnerFakeSession.instances = []
+    _OwnerFakeSession.initialize_failures = []
+    _OwnerFakeSession.list_failures = []
+    _OwnerFakeSession.call_failures = []
+    _OwnerFakeSession.list_delay_s = 0.0
+    _OwnerFakeSession.call_delay_s = 0.0
+    monkeypatch.setattr("app.tools.mcp_client.streamablehttp_client", lambda url: _TaskOwnedTransport())
+    monkeypatch.setattr("app.tools.mcp_client.ClientSession", _OwnerFakeSession)
+    return _OwnerFakeSession
 
 
 # --- _normalize_input_schema ---------------------------------------------------
@@ -344,6 +423,113 @@ async def test_check_health_reconnects_once_for_stale_session(stale_exc_type):
 
     assert await client.check_health() == 1
     assert reconnects == 1
+
+
+# --- owner-task MCP session lifecycle -----------------------------------------
+
+async def _in_new_task(awaitable_factory):
+    task = asyncio.create_task(awaitable_factory())
+    return await task
+
+
+@pytest.mark.asyncio
+async def test_owner_task_owns_connect_health_and_disconnect(owner_client_fakes):
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+
+    await _in_new_task(client.connect)
+    assert await _in_new_task(client.check_health) == 1
+    await _in_new_task(client.disconnect)
+
+    assert _TaskOwnedTransport.instances
+    assert all(transport.exit_task is transport.enter_task for transport in _TaskOwnedTransport.instances)
+    assert all(session.exit_task is session.enter_task for session in owner_client_fakes.instances)
+
+
+@pytest.mark.parametrize("stale_exc_type", [BrokenResourceError, ClosedResourceError, EndOfStream])
+@pytest.mark.asyncio
+async def test_owner_reconnects_and_retries_stale_tool_call(owner_client_fakes, stale_exc_type):
+    owner_client_fakes.call_failures = [stale_exc_type()]
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+
+    await client.connect()
+    result = await client._call_tool_with_reconnect("ssh_run_command", {"host": "h"})
+    await client.disconnect()
+
+    assert result == "ok:ssh_run_command"
+    assert len(owner_client_fakes.instances) == 2
+    assert owner_client_fakes.instances[0].calls == [("ssh_run_command", {"host": "h"})]
+    assert owner_client_fakes.instances[1].calls == [("ssh_run_command", {"host": "h"})]
+
+
+@pytest.mark.asyncio
+async def test_owner_backoff_throttles_repeated_health_checks(monkeypatch, owner_client_fakes):
+    owner_client_fakes.list_failures = [ClosedResourceError()]
+    owner_client_fakes.initialize_failures = [RuntimeError("still down")]
+    monkeypatch.setattr("app.tools.mcp_client.random.uniform", lambda low, high: 0)
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+
+    await client.connect()
+    with pytest.raises(RuntimeError, match="still down"):
+        await client.check_health()
+
+    before = len(owner_client_fakes.instances)
+    with pytest.raises(RuntimeError, match="reconnect backoff active"):
+        await client.check_health()
+    await client.disconnect()
+
+    assert len(owner_client_fakes.instances) == before
+
+
+@pytest.mark.asyncio
+async def test_caller_timeout_abandons_hung_owner_operation(monkeypatch, owner_client_fakes):
+    owner_client_fakes.list_delay_s = 0.05
+    monkeypatch.setenv("MCP_HEALTH_TIMEOUT_SECONDS", "0.01")
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+
+    await client.connect()
+    try:
+        with pytest.raises(TimeoutError):
+            await client.check_health()
+        client.health_timeout_s = 1
+        owner_client_fakes.list_delay_s = 0.0
+        assert await client.check_health() == 1
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_owner_operations_receive_own_results(owner_client_fakes):
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+
+    await client.connect()
+    results = await asyncio.gather(
+        client._call_tool_with_reconnect("first", {"n": 1}),
+        client._call_tool_with_reconnect("second", {"n": 2}),
+        client.check_health(),
+    )
+    await client.disconnect()
+
+    assert results == ["ok:first", "ok:second", 1]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fails_pending_owner_operations(monkeypatch, owner_client_fakes):
+    owner_client_fakes.call_delay_s = 0.05
+    monkeypatch.setenv("MCP_OPERATION_TIMEOUT_SECONDS", "1")
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+
+    await client.connect()
+    first = asyncio.create_task(client._call_tool_with_reconnect("slow", {}))
+    await asyncio.sleep(0)
+    shutdown = asyncio.create_task(client.disconnect())
+    await asyncio.sleep(0)
+    pending = [asyncio.create_task(client.check_health()) for _ in range(3)]
+    await shutdown
+
+    assert await first == "ok:slow"
+    for task in pending:
+        with pytest.raises(ClosedResourceError):
+            await task
 
 
 # --- get_tools wiring ---------------------------------------------------------
