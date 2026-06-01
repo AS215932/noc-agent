@@ -23,6 +23,9 @@ class FakeMCPClient:
     instances = []
     fail_url = None
     hang_url = None
+    health_delay_s = 0.0
+    active_health_by_url = {}
+    max_active_health_by_url = {}
 
     def __init__(self, command=None, env=None, url=None):
         self.command = command or []
@@ -46,6 +49,17 @@ class FakeMCPClient:
     async def check_health(self):
         if self.url == FakeMCPClient.fail_url:
             raise RuntimeError("health failed")
+        if FakeMCPClient.health_delay_s:
+            key = self.url or "stdio"
+            FakeMCPClient.active_health_by_url[key] = FakeMCPClient.active_health_by_url.get(key, 0) + 1
+            FakeMCPClient.max_active_health_by_url[key] = max(
+                FakeMCPClient.max_active_health_by_url.get(key, 0),
+                FakeMCPClient.active_health_by_url[key],
+            )
+            try:
+                await asyncio.sleep(FakeMCPClient.health_delay_s)
+            finally:
+                FakeMCPClient.active_health_by_url[key] -= 1
         prefix = "xo" if self.url and "8766" in self.url else "hyrule"
         return len([SimpleNamespace(name=f"{prefix}_tool", description="tool")])
 
@@ -59,6 +73,9 @@ def fake_client(monkeypatch):
     FakeMCPClient.instances = []
     FakeMCPClient.fail_url = None
     FakeMCPClient.hang_url = None
+    FakeMCPClient.health_delay_s = 0.0
+    FakeMCPClient.active_health_by_url = {}
+    FakeMCPClient.max_active_health_by_url = {}
     monkeypatch.setattr("app.mcp_runtime.HyruleMCPClient", FakeMCPClient)
 
 
@@ -204,6 +221,39 @@ async def test_runtime_live_health_reconnects_missing_source(monkeypatch):
         assert "xo" in runtime.clients
     finally:
         FakeMCPClient.fail_url = previous_fail_url
+
+
+@pytest.mark.asyncio
+async def test_runtime_concurrent_live_health_serializes_each_source(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", "http://127.0.0.1:8766/mcp")
+    FakeMCPClient.health_delay_s = 0.02
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    results = await asyncio.gather(runtime.live_health(), runtime.live_health(), runtime.live_health())
+
+    assert all(result["status"] == "ok" for result in results)
+    assert FakeMCPClient.max_active_health_by_url["http://127.0.0.1:8765/mcp"] == 1
+    assert FakeMCPClient.max_active_health_by_url["http://127.0.0.1:8766/mcp"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_live_health_times_out_stale_probe(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", "http://127.0.0.1:8766/mcp")
+    monkeypatch.setenv("MCP_HEALTH_TIMEOUT_SECONDS", "0.01")
+    FakeMCPClient.health_delay_s = 1
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    health = await runtime.live_health()
+
+    assert health["status"] == "degraded"
+    assert health["sources"]["hyrule"]["error"] == "mcp_timeout"
+    assert health["sources"]["xo"]["error"] == "mcp_timeout"
 
 
 @pytest.mark.asyncio

@@ -25,11 +25,16 @@ class MCPRuntime:
     def __init__(self, *, owner: str):
         self.owner = owner
         self.connect_timeout_s = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
+        self.health_timeout_s = float(os.getenv("MCP_HEALTH_TIMEOUT_SECONDS", "5"))
         self.clients: dict[str, HyruleMCPClient] = {}
         self.tools_by_source: dict[str, list[Any]] = {"hyrule": [], "xo": []}
         self.states: dict[str, MCPSourceState] = {
             "hyrule": MCPSourceState(source="hyrule"),
             "xo": MCPSourceState(source="xo"),
+        }
+        self._source_locks: dict[str, asyncio.Lock] = {
+            "hyrule": asyncio.Lock(),
+            "xo": asyncio.Lock(),
         }
         self.source_configs = {
             "hyrule": self._hyrule_config,
@@ -44,16 +49,18 @@ class MCPRuntime:
         await self._connect_source(self._xo_config())
 
     async def disconnect(self) -> None:
-        while self.clients:
-            source, client = self.clients.popitem()
-            try:
-                await client.disconnect()
-            except Exception as exc:
-                safe = classify_exception(exc)
-                log_exception("mcp_disconnect_failed", exc, category=safe.category, owner=self.owner, source=source)
-            finally:
+        for source in list(self.states):
+            async with self._source_locks[source]:
+                client = self.clients.pop(source, None)
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception as exc:
+                        safe = classify_exception(exc)
+                        log_exception("mcp_disconnect_failed", exc, category=safe.category, owner=self.owner, source=source)
                 self.states[source].ready = False
                 self.states[source].tool_count = 0
+                self.states[source].error = None
                 self.tools_by_source[source] = []
 
     def health(self) -> dict[str, Any]:
@@ -75,42 +82,41 @@ class MCPRuntime:
 
     async def live_health(self) -> dict[str, Any]:
         for source, config_factory in self.source_configs.items():
-            state = self.states[source]
-            client = self.clients.get(source)
-            if not state.ready:
-                try:
-                    config = config_factory()
-                except Exception as exc:
-                    safe = classify_exception(exc)
-                    state.ready = False
-                    state.tool_count = 0
-                    state.error = safe.category
-                    log_exception("mcp_health_config_failed", exc, category=safe.category, owner=self.owner, source=source)
-                    continue
-                try:
-                    await self._connect_source(config)
-                except Exception as exc:
-                    safe = classify_exception(exc)
-                    state.ready = False
-                    state.tool_count = 0
-                    state.error = safe.category
-                    log_exception("mcp_health_reconnect_failed", exc, category=safe.category, owner=self.owner, source=source)
-                continue
-            if client is None:
-                continue
             try:
-                state.tool_count = await client.check_health()
-                state.ready = state.tool_count > 0
-                state.error = None
+                await asyncio.wait_for(
+                    self._refresh_source_health(source, config_factory),
+                    timeout=self.health_timeout_s,
+                )
+            except TimeoutError as exc:
+                state = self.states[source]
+                state.ready = False
+                state.tool_count = 0
+                state.error = "mcp_timeout"
+                self.tools_by_source[source] = []
+                log_exception(
+                    "mcp_health_timeout",
+                    exc,
+                    category="mcp_timeout",
+                    owner=self.owner,
+                    source=source,
+                    timeout_seconds=self.health_timeout_s,
+                )
             except Exception as exc:
+                state = self.states[source]
                 safe = classify_exception(exc)
                 state.ready = False
                 state.tool_count = 0
                 state.error = safe.category
-                log_exception("mcp_health_probe_failed", exc, category=safe.category, owner=self.owner, source=source)
+                self.tools_by_source[source] = []
+                log_exception("mcp_health_failed", exc, category=safe.category, owner=self.owner, source=source)
         return self.health()
 
     async def _connect_source(self, config: dict[str, Any]) -> None:
+        source = config["source"]
+        async with self._source_locks[source]:
+            await self._connect_source_unlocked(config)
+
+    async def _connect_source_unlocked(self, config: dict[str, Any]) -> None:
         source = config["source"]
         state = self.states[source]
         client = HyruleMCPClient(config.get("command"), env=config.get("env"), url=config.get("url"))
@@ -163,6 +169,42 @@ class MCPRuntime:
                     owner=self.owner,
                     source=source,
                 )
+
+    async def _refresh_source_health(self, source: str, config_factory: Any) -> None:
+        async with self._source_locks[source]:
+            state = self.states[source]
+            client = self.clients.get(source)
+            if client is None:
+                if state.ready:
+                    return
+                try:
+                    config = config_factory()
+                except Exception as exc:
+                    safe = classify_exception(exc)
+                    state.ready = False
+                    state.tool_count = 0
+                    state.error = safe.category
+                    self.tools_by_source[source] = []
+                    log_exception("mcp_health_config_failed", exc, category=safe.category, owner=self.owner, source=source)
+                    return
+                await self._connect_source_unlocked(config)
+                return
+
+            try:
+                tool_count = await client.check_health()
+            except Exception as exc:
+                snapshot = client.state_snapshot() if hasattr(client, "state_snapshot") else None
+                safe = classify_exception(exc)
+                state.ready = False
+                state.tool_count = 0
+                state.error = getattr(getattr(snapshot, "state", None), "value", None) or safe.category
+                self.tools_by_source[source] = []
+                log_exception("mcp_health_probe_failed", exc, category=safe.category, owner=self.owner, source=source)
+                return
+
+            state.tool_count = tool_count
+            state.ready = tool_count > 0
+            state.error = None
 
     async def _connect_and_register(self, client: HyruleMCPClient, source: str) -> int:
         await client.connect()
