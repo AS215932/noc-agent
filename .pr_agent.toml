@@ -1,0 +1,42 @@
+# PR-Agent (advisory) configuration for AS215932/noc-agent.
+# Replaces hosted Sourcery. Runs only on the unprivileged hyrule-public-pr
+# runner with read/comment-only perms, on our OpenRouter key.
+
+[config]
+git_provider = "github"
+# deepseek-v4-flash / minimax-m2.7 are custom models -> need custom_model_max_tokens.
+model = "openrouter/deepseek/deepseek-v4-flash"
+fallback_models = ["openrouter/minimax/minimax-m2.7"]
+custom_model_max_tokens = 128000
+temperature = 0.2
+use_repo_settings_file = true
+publish_output = true
+
+[github_action_config]
+auto_review = true
+auto_describe = false
+auto_improve = true
+
+[pr_reviewer]
+require_security_review = true
+require_tests_review = true
+require_score_review = true
+require_estimate_effort_to_review = true
+extra_instructions = """
+This is noc-agent: the autonomous NOC triage agent (Alertmanager/Icinga2
+webhooks -> PydanticAI investigation -> Discord), Python 3.14 + langgraph +
+redis checkpoints + an MCP client. HIGHEST RISK is the agent/tool-execution
+boundary. Flag, with specifics:
+- prompt-injection paths where untrusted alert / webhook / Discord content
+  reaches the model or influences tool calls;
+- unvalidated model output that drives execution or remediation;
+- unbounded or un-capped tool calls / retries;
+- graph state that is not JSON-serializable or not Redis-checkpoint-safe;
+- mutation of module-global agents (esp. in tests);
+- missing schema validation on MCP tool invocations; secrets in files.
+Preserve the read-only / diagnostic-first posture unless an explicit
+human-approval gate exists. Do not restate the diff.
+"""
+
+[pr_description]
+publish_description_as_comment = true
