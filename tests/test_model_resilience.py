@@ -69,6 +69,64 @@ def _plan_args() -> dict:
     }
 
 
+def test_default_model_config_uses_openrouter_chain(monkeypatch):
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.delenv("NOC_AGENT_CONFIG", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+
+    config = load_model_config()
+
+    assert config.configured_models == [
+        "openrouter:deepseek/deepseek-v4-pro",
+        "openrouter:anthropic/claude-sonnet-4.6",
+    ]
+    assert config.unsupported_models == []
+    assert config.missing_credentials == []
+
+
+def test_openrouter_missing_key_is_reported_without_marking_model_unsupported(monkeypatch):
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    config = load_model_config()
+
+    assert config.unsupported_models == []
+    assert any("OPENROUTER_API_KEY" in item for item in config.missing_credentials)
+
+
+def test_model_env_overrides_config_file(monkeypatch, tmp_path):
+    config_path = tmp_path / "noc-agent.toml"
+    config_path.write_text(
+        '[model]\nprimary = "openrouter:deepseek/deepseek-v4-pro"\nfallbacks = ["openrouter:anthropic/claude-sonnet-4.6"]\n'
+    )
+    monkeypatch.setenv("NOC_AGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("AGENT_MODEL", "google-gla:gemini-3.1-pro-preview")
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    config = load_model_config()
+
+    assert config.configured_models == ["google-gla:gemini-3.1-pro-preview"]
+    assert config.missing_credentials == []
+
+
+def test_model_config_parse_error_degrades_health_without_leaking_secret(monkeypatch, tmp_path):
+    config_path = tmp_path / "bad.toml"
+    config_path.write_text('[model]\nprimary = "openrouter:deepseek/deepseek-v4-pro"\nsecret = "do-not-leak"\ninvalid = [')
+    monkeypatch.setenv("NOC_AGENT_CONFIG", str(config_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+
+    config = load_model_config()
+
+    assert config.config_errors
+    assert "do-not-leak" not in str(config.config_errors)
+
+
 def test_model_config_reports_missing_credentials(monkeypatch):
     monkeypatch.setenv("AGENT_MODEL", "google-gla:gemini-3.1-pro-preview")
     monkeypatch.setenv("AGENT_FALLBACK_MODELS", "anthropic:claude-sonnet-4-5")
@@ -239,4 +297,5 @@ async def test_metrics_endpoint_exposes_model_metrics():
     body = response.body.decode()
 
     assert "noc_agent_model_run_attempts_total" in body
+    assert "noc_agent_openrouter_credit_probe_ok" in body
     assert response.media_type.startswith("text/plain")

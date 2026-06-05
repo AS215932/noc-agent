@@ -1,0 +1,20 @@
+[model]
+primary = "openrouter:deepseek/deepseek-v4-pro"
+fallbacks = ["openrouter:anthropic/claude-sonnet-4.6"]
+
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+management_api_key_env = "OPENROUTER_MANAGEMENT_API_KEY"
+app_title = "AS215932 NOC Agent"
+app_url = ""
+credit_monitoring_enabled = true
+credit_probe_timeout_seconds = 5.0
+credit_probe_cache_seconds = 60
+warn_remaining_usd = 5.0
+critical_remaining_usd = 1.0
+
+[providers.google]
+enabled = true
+api_key_env = "GOOGLE_API_KEY"
+gemini_api_key_env = "GEMINI_API_KEY"
+quota_project_id_env = "GEMINI_QUOTA_PROJECT_ID"
