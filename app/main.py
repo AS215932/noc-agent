@@ -18,7 +18,7 @@ from app.mail import check_mailbox_connection, process_mailbox_once, MailSetting
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
 from app.model_metrics import metrics_response, record_failure, record_success, start_run
-from app.quota import check_gemini_quota
+from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
 from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
@@ -33,7 +33,6 @@ discord_bot_task = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 
 REQUIRED_CONFIG = [
-    "GEMINI_API_KEY",
     "DISCORD_WEBHOOK_URL",
     "HYRULE_MCP_CMD",
     "HYRULE_MCP_URL",
@@ -744,7 +743,9 @@ async def health_mcp(response: Response):
 
 @app.get("/health/config")
 async def health_config(response: Response):
+    model_config = load_model_config()
     missing = [name for name in REQUIRED_CONFIG if not os.getenv(name)]
+    missing.extend(_missing_model_provider_config(model_config.active_model_chain, model_config.provider_api_key_envs))
     if os.getenv("HYRULE_MCP_URL"):
         missing = [name for name in missing if name != "HYRULE_MCP_CMD"]
     if os.getenv("HYRULE_MCP_CMD"):
@@ -753,6 +754,7 @@ async def health_config(response: Response):
         missing = [name for name in missing if name != "XO_MCP_CMD"]
     if os.getenv("XO_MCP_CMD"):
         missing = [name for name in missing if name != "XO_MCP_URL"]
+    missing = sorted(set(missing))
     disabled = []
     if os.getenv("NOC_AGENT_DISABLE_MCP") == "1":
         disabled.append("mcp")
@@ -769,27 +771,66 @@ async def health_config(response: Response):
     }
 
 
+def _missing_model_provider_config(active_models: list[str], provider_api_key_envs: dict[str, str]) -> list[str]:
+    missing: list[str] = []
+    providers = {_provider_from_model_name(model) for model in active_models}
+    if "openrouter" in providers:
+        env_name = provider_api_key_envs.get("openrouter", "OPENROUTER_API_KEY")
+        if not (os.getenv(env_name) or os.getenv("OPENROUTER_API_KEY")):
+            missing.append(env_name)
+    if providers.intersection({"google", "google-gla"}):
+        if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
+            missing.append("GOOGLE_API_KEY or GEMINI_API_KEY")
+    if "google-vertex" in providers:
+        if not (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GOOGLE_API_KEY")):
+            missing.append("GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_API_KEY")
+    direct_provider_envs = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "openai-chat": "OPENAI_API_KEY",
+        "openai-responses": "OPENAI_API_KEY",
+    }
+    for provider, env_name in direct_provider_envs.items():
+        if provider in providers and not os.getenv(env_name):
+            missing.append(env_name)
+    return missing
+
+
+def _provider_from_model_name(model_name: str) -> str:
+    if ":" in model_name:
+        return model_name.split(":", 1)[0]
+    if model_name.startswith("gemini"):
+        return "google-gla"
+    if model_name.startswith("claude"):
+        return "anthropic"
+    if model_name.startswith(("gpt", "o1", "o3")):
+        return "openai"
+    return "unknown"
+
+
 @app.get("/health/model")
 async def health_model(response: Response):
     config = load_model_config()
-    quota = check_gemini_quota()
+    provider_monitoring = check_model_provider_credits(config)
     health = MODEL_STATE.health()
-    if quota.status == "degraded":
+    if provider_monitoring.status == "degraded":
         health["status"] = "degraded"
     if health["status"] != "ok":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    provider_health = provider_monitoring.health_value()
     return {
         **health,
         "primary_model": config.primary_model,
         "fallback_models": config.fallback_models,
-        "quota_monitoring": quota.status,
-        "quota": quota.health_value(),
+        "provider_monitoring": provider_health,
+        "quota_monitoring": provider_monitoring.status,
+        "quota": provider_health,
     }
 
 
 @app.get("/metrics")
 async def metrics():
-    check_gemini_quota()
+    check_model_provider_credits(load_model_config())
     body, content_type = metrics_response()
     return Response(content=body, media_type=content_type)
 

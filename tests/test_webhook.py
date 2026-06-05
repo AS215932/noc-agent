@@ -123,6 +123,55 @@ async def test_health_config_reports_missing_mail_password(monkeypatch):
     assert response["mail_polling"] == "disabled"
     assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
+
+@pytest.mark.asyncio
+async def test_health_config_requires_openrouter_key_by_default(monkeypatch):
+    for name in (
+        "DISCORD_WEBHOOK_URL",
+        "HYRULE_MCP_CMD",
+        "XO_MCP_CMD",
+        "XO_TOKEN",
+        "ICINGA_API_USER",
+        "ICINGA_API_PASSWORD",
+        "MAIL_IMAP_PASSWORD",
+    ):
+        monkeypatch.setenv(name, "set")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    http_response = Response()
+
+    response = await health_config(http_response)
+
+    assert response["status"] == "degraded"
+    assert "OPENROUTER_API_KEY" in response["missing"]
+    assert "GEMINI_API_KEY" not in response["missing"]
+
+
+@pytest.mark.asyncio
+async def test_health_config_does_not_require_gemini_for_openrouter(monkeypatch):
+    for name in (
+        "DISCORD_WEBHOOK_URL",
+        "HYRULE_MCP_CMD",
+        "XO_MCP_CMD",
+        "XO_TOKEN",
+        "ICINGA_API_USER",
+        "ICINGA_API_PASSWORD",
+        "MAIL_IMAP_PASSWORD",
+        "OPENROUTER_API_KEY",
+    ):
+        monkeypatch.setenv(name, "set")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    http_response = Response()
+
+    response = await health_config(http_response)
+
+    assert "GEMINI_API_KEY" not in response["missing"]
+    assert "OPENROUTER_API_KEY" not in response["missing"]
+
 @pytest.mark.asyncio
 async def test_health_mail_checks_connection(mocker):
     mocker.patch("app.main.check_mailbox_connection", return_value={"status": "ok"})

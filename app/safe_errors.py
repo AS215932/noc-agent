@@ -156,7 +156,7 @@ def _quota_exhausted(provider: str, model_name: str) -> SafeError:
         model_name=model_name,
         public_message="The configured AI model quota is exhausted or too low for this run.",
         operator_next_steps=[
-            "Check `/health/model` and the Gemini quota dashboard.",
+            "Check `/health/model` and provider credit or quota dashboards, including OpenRouter key limits when OpenRouter is active.",
             "Verify fallback model credentials are configured.",
             "Escalate the original alert to a human operator if it is still firing.",
         ],
@@ -171,7 +171,7 @@ def _rate_limited(provider: str, model_name: str) -> SafeError:
         public_message="The AI provider is rate limiting the agent right now.",
         operator_next_steps=[
             "Wait briefly or use the configured fallback model.",
-            "Review recent alert volume and model usage metrics.",
+            "Review recent alert volume, OpenRouter key limits, and model usage metrics.",
         ],
     )
 

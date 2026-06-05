@@ -96,8 +96,40 @@ instead of inventing a configuration story.
 - `DISCORD_ALLOWED_GUILD_IDS`
 - `DISCORD_ALLOWED_CHANNEL_IDS`
 - `DISCORD_ALLOWED_ROLE_IDS`
+- `OPENROUTER_API_KEY` for the default model backend
+- Optional `OPENROUTER_MANAGEMENT_API_KEY` for account-wide credit monitoring
+- Optional `OPENROUTER_APP_TITLE` and `OPENROUTER_APP_URL` for OpenRouter attribution
 
 The legacy `HYRULE_MCP_CMD` path remains accepted for compatibility.
+
+## Model backend configuration
+
+Model selection is configurable via TOML. Lookup order is:
+
+1. `NOC_AGENT_CONFIG`
+2. `/etc/noc-agent/config.toml`
+3. `config/noc-agent.toml`
+4. built-in defaults
+
+The default chain is OpenRouter DeepSeek V4 Pro with Claude Sonnet 4.6 as a fallback:
+
+```toml
+[model]
+primary = "openrouter:deepseek/deepseek-v4-pro"
+fallbacks = ["openrouter:anthropic/claude-sonnet-4.6"]
+```
+
+Any OpenRouter model can be selected with `openrouter:<model-slug>`. Secrets stay in environment variables, not in the config file. `AGENT_MODEL` and `AGENT_FALLBACK_MODELS` still override the config file for emergency changes.
+
+Google/Gemini remains supported for future use:
+
+```toml
+[model]
+primary = "google-gla:gemini-3.1-pro"
+fallbacks = []
+```
+
+For the new default backend, migrate from `GEMINI_API_KEY` to `OPENROUTER_API_KEY`. `/health/model` reports active models plus OpenRouter key-limit and usage status. `/metrics` exports OpenRouter credit/usage gauges.
 
 ## Tests
 

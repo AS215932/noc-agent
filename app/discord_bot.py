@@ -853,7 +853,6 @@ def _icinga_problem_overview(text: str, object_type: str) -> str:
 
 def _missing_config() -> list[str]:
     required = [
-        "GEMINI_API_KEY",
         "DISCORD_WEBHOOK_URL",
         "HYRULE_MCP_URL",
         "XO_MCP_URL",
@@ -862,4 +861,15 @@ def _missing_config() -> list[str]:
         "ICINGA_API_PASSWORD",
         "MAIL_IMAP_PASSWORD",
     ]
-    return [name for name in required if not os.getenv(name)]
+    try:
+        from app.model_config import load_model_config
+
+        model_config = load_model_config()
+        if any(model.startswith("openrouter:") for model in model_config.active_model_chain):
+            required.append(model_config.provider_api_key_envs.get("openrouter", "OPENROUTER_API_KEY"))
+        if any(model.startswith(("google:", "google-gla:", "google-vertex:")) or model.startswith("gemini") for model in model_config.active_model_chain):
+            if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
+                required.append("GOOGLE_API_KEY or GEMINI_API_KEY")
+    except Exception:
+        required.append("OPENROUTER_API_KEY")
+    return sorted({name for name in required if " or " in name or not os.getenv(name)})

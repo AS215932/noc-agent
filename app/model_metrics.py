@@ -78,6 +78,9 @@ class ModelRuntimeState:
     missing_credentials: list[str] = field(default_factory=list)
     unsupported_models: list[str] = field(default_factory=list)
     active_model_chain: list[str] = field(default_factory=list)
+    config_source: str | None = None
+    config_errors: list[str] = field(default_factory=list)
+    provider_api_key_envs: dict[str, str] = field(default_factory=dict)
     last_success_at: float | None = None
     last_success_model: str | None = None
     last_failure_at: float | None = None
@@ -85,7 +88,7 @@ class ModelRuntimeState:
     last_failure_model: str | None = None
 
     def health(self) -> dict[str, Any]:
-        status = "degraded" if (self.missing_credentials or self.unsupported_models) else "ok"
+        status = "degraded" if (self.missing_credentials or self.unsupported_models or self.config_errors) else "ok"
         if self._has_recent_runtime_failure():
             status = "degraded"
         return {"status": status, **asdict(self)}
@@ -107,12 +110,18 @@ def set_model_config(
     missing_credentials: list[str],
     unsupported_models: list[str],
     active_model_chain: list[str],
+    config_source: str | None = None,
+    config_errors: list[str] | None = None,
+    provider_api_key_envs: dict[str, str] | None = None,
 ) -> None:
     STATE.configured_models = configured_models
     STATE.missing_credentials = missing_credentials
     STATE.unsupported_models = unsupported_models
     STATE.active_model_chain = active_model_chain
-    MODEL_DEGRADED.set(1 if missing_credentials or unsupported_models else 0)
+    STATE.config_source = config_source
+    STATE.config_errors = list(config_errors or [])
+    STATE.provider_api_key_envs = dict(provider_api_key_envs or {})
+    MODEL_DEGRADED.set(1 if missing_credentials or unsupported_models or STATE.config_errors else 0)
 
 
 def start_run(agent: str) -> float:
