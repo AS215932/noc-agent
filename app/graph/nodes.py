@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
+import os
+import time
 from typing import Any
+from uuid import uuid4
 
 from langgraph.types import interrupt
 from pydantic_ai.toolsets import FunctionToolset
@@ -158,6 +164,7 @@ class NodeRunner:
             evidence_refs=evidence_refs,
             drift_findings=list(state.get("drift_findings", [])),
             proposed_remediation=list(proposed),
+            structured_actions=_structured_actions(state, proposed),
             validation_status="needs_more_evidence" if finding.confidence < 0.8 else "validated",
             human_review_rationale=synthesis.human_escalation_reason or "Diagnostic tranche requires human review before any execution.",
         )
@@ -212,18 +219,43 @@ class NodeRunner:
             assert_json_serializable_state(update)
             return update
 
-        actions = _approved_restart_actions(state)
+        actions = _stored_structured_actions(state)
         results = []
         for action in actions:
+            action_class = action.get("type")
+            arguments = dict(action.get("inputs") or {})
+            arguments["action_authorization"] = _action_authorization(state, action)
+            tool_name = None
+            if action_class == "restart_service":
+                tool_name = "os_service_restart"
+            elif action_class == "acknowledge_icinga":
+                tool_name = "icinga_acknowledge_alert"
+                arguments = {
+                    "host_name": arguments.get("host") or arguments.get("host_name"),
+                    "service_name": arguments.get("service") or arguments.get("service_name"),
+                    "author": decision.get("operator", "noc-agent"),
+                    "comment": arguments.get("comment") or decision.get("comment", "Approved by NOC operator."),
+                    "action_authorization": arguments["action_authorization"],
+                }
+            if tool_name is None:
+                results.append({"action": action, "ok": False, "result": {"error_type": "policy_blocked", "sanitized_error": "Unsupported action type"}})
+                continue
             try:
                 result = await self.runtime.mcp_runtime.call_tool(
                     "hyrule",
-                    "os_service_restart",
-                    {"host": action["host"], "service": action["service"]},
+                    tool_name,
+                    arguments,
                 )
             except Exception as exc:
                 result = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
-            results.append({"action": action, "result": _jsonish(result), "ok": bool(isinstance(result, dict) and result.get("ok"))})
+            results.append({
+                "action": action,
+                "approved_by": decision.get("operator", ""),
+                "approval_comment": decision.get("comment", ""),
+                "approved_at": decision.get("decided_at") or utc_now(),
+                "result": _jsonish(result),
+                "ok": bool(isinstance(result, dict) and result.get("ok")),
+            })
 
         if not actions:
             approval_state = "approved_no_executable_action"
@@ -245,7 +277,8 @@ class NodeRunner:
         results = []
         for item in executed:
             action = item.get("action") or {}
-            host = str(action.get("host") or "")
+            inputs = action.get("inputs") if isinstance(action.get("inputs"), dict) else action
+            host = str(inputs.get("host") or inputs.get("host_name") or "")
             instance = _prometheus_instance_for(host)
             if not instance:
                 results.append({"host": host, "ok": False, "error": "No Prometheus instance mapping for host", "attempts": []})
@@ -358,13 +391,28 @@ _PROMETHEUS_NODE_INSTANCES = {
 }
 
 
-def _approved_restart_actions(state: WorkflowState) -> list[dict[str, str]]:
+def _structured_actions(state: WorkflowState, proposed: list[str]) -> list[dict[str, Any]]:
+    return _approved_restart_actions(state, proposed) + _approved_icinga_ack_actions(state, proposed)
+
+
+def _stored_structured_actions(state: WorkflowState) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for proposal in state.get("proposals", []):
+        if not isinstance(proposal, dict):
+            continue
+        for action in proposal.get("structured_actions") or []:
+            if isinstance(action, dict):
+                actions.append(action)
+    return actions
+
+
+def _approved_restart_actions(state: WorkflowState, proposed: list[str] | None = None) -> list[dict[str, Any]]:
     synthesis = DiagnosticSynthesis.model_validate(state["diagnostic_synthesis"])
     text = " ".join(
         [
             synthesis.incident_summary,
             " ".join(synthesis.affected_objects),
-            _flatten_text(state.get("proposals", [])),
+            _flatten_text(proposed or []),
             _flatten_text(state.get("normalized_alert", {})),
         ]
     ).lower()
@@ -374,7 +422,48 @@ def _approved_restart_actions(state: WorkflowState) -> list[dict[str, str]]:
     for alias, canonical in _ROUTER_ALIASES.items():
         if alias in text and canonical not in hosts:
             hosts.append(canonical)
-    return [{"type": "restart_service", "host": host, "service": "node_exporter"} for host in hosts]
+    return [
+        {
+            "action_id": f"act-{uuid4()}",
+            "type": "restart_service",
+            "inputs": {"host": host, "service": "node_exporter"},
+        }
+        for host in hosts
+    ]
+
+
+def _approved_icinga_ack_actions(state: WorkflowState, proposed: list[str] | None = None) -> list[dict[str, Any]]:
+    text = " ".join([_flatten_text(proposed or []), _flatten_text(state.get("normalized_alert", {}))]).lower()
+    if "ack" not in text and "acknowledge" not in text:
+        return []
+    labels = ((state.get("normalized_alert") or {}).get("commonLabels") or {})
+    host = labels.get("host") or labels.get("hostname")
+    service = labels.get("service") or labels.get("check_command")
+    if not host:
+        return []
+    return [
+        {
+            "action_id": f"act-{uuid4()}",
+            "type": "acknowledge_icinga",
+            "inputs": {"host": host, "service": service or "", "comment": "Approved NOC acknowledgement."},
+        }
+    ]
+
+
+def _action_authorization(state: WorkflowState, action: dict[str, Any]) -> dict[str, Any]:
+    expiry = int(time.time()) + int(os.getenv("NOC_ACTION_AUTH_TTL_SECONDS", "300"))
+    payload = {
+        "action_id": str(action.get("action_id") or ""),
+        "case_id": str(state.get("incident_id") or ""),
+        "operator": str((state.get("operator_decision") or {}).get("operator") or "noc-agent"),
+        "action_class": str(action.get("type") or ""),
+        "expiry": expiry,
+    }
+    secret = os.getenv("HYRULE_MCP_ACTION_SIGNING_SECRET") or os.getenv("NOC_APPROVAL_SIGNING_SECRET", "")
+    if secret:
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        payload["signature"] = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return payload
 
 
 def _prometheus_instance_for(host: str) -> str | None:

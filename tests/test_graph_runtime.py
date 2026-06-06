@@ -224,6 +224,61 @@ async def test_approved_restart_proposal_executes_node_exporter_restart():
     runner = NodeRunner(runtime)
     synthesis = DiagnosticSynthesis(incident_summary="node_exporter down", affected_objects=["cr1.nl1"])
     state = {
+        "incident_id": "incident-1",
+        "operator_decision": {"decision": "approved", "operator": "pytest"},
+        "diagnostic_synthesis": synthesis.model_dump(mode="json"),
+        "normalized_alert": {},
+        "proposals": [
+            {
+                "proposed_remediation": ["Restart node_exporter on cr1.nl1"],
+                "structured_actions": [
+                    {
+                        "action_id": "act-1",
+                        "type": "restart_service",
+                        "inputs": {"host": "cr1-nl1", "service": "node_exporter"},
+                    }
+                ],
+            }
+        ],
+        "executed_actions": [],
+    }
+
+    update = await runner.execute_approved_remediation(state)
+
+    assert runtime.mcp_runtime.calls == [
+        (
+            "hyrule",
+            "os_service_restart",
+            {
+                "host": "cr1-nl1",
+                "service": "node_exporter",
+                "action_authorization": {
+                    "action_id": "act-1",
+                    "case_id": "incident-1",
+                    "operator": "pytest",
+                    "action_class": "restart_service",
+                    "expiry": runtime.mcp_runtime.calls[0][2]["action_authorization"]["expiry"],
+                },
+            },
+        )
+    ]
+    assert update["approval_state"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_text_only_proposal_does_not_execute_remediation():
+    class FakeMCPRuntime:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, source, name, arguments):
+            self.calls.append((source, name, arguments))
+            return {"ok": True, "tool": name}
+
+    runtime = type("Runtime", (), {"mcp_runtime": FakeMCPRuntime()})()
+    runner = NodeRunner(runtime)
+    synthesis = DiagnosticSynthesis(incident_summary="node_exporter down", affected_objects=["cr1.nl1"])
+    state = {
         "operator_decision": {"decision": "approved", "operator": "pytest"},
         "diagnostic_synthesis": synthesis.model_dump(mode="json"),
         "normalized_alert": {},
@@ -233,10 +288,8 @@ async def test_approved_restart_proposal_executes_node_exporter_restart():
 
     update = await runner.execute_approved_remediation(state)
 
-    assert runtime.mcp_runtime.calls == [
-        ("hyrule", "os_service_restart", {"host": "cr1-nl1", "service": "node_exporter"})
-    ]
-    assert update["approval_state"] == "executed"
+    assert runtime.mcp_runtime.calls == []
+    assert update["approval_state"] == "approved_no_executable_action"
 
 
 @pytest.mark.asyncio

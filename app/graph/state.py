@@ -44,6 +44,7 @@ class ChangeProposal(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     drift_findings: list[str] = Field(default_factory=list)
     proposed_remediation: list[str] = Field(default_factory=list)
+    structured_actions: list[dict[str, Any]] = Field(default_factory=list)
     validation_status: Literal["not_run", "validated", "needs_more_evidence"] = "not_run"
     human_review_rationale: str = ""
 
