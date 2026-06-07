@@ -12,11 +12,11 @@ import uvicorn
 from contextlib import asynccontextmanager, suppress
 
 from app import log
-from app.agent import noc_triage_agent, noc_mail_agent
-from app.discord import Verbosity, send_discord_notification, send_case_notification, notify_start, notify_finish
+from app.agent import noc_triage_agent
+from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
 from app.discord import install_bot_notifier, install_case_notifier
 from app.discord_bot import build_bot
-from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
+from app.mail import check_mailbox_connection, process_mailbox_once
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
 from app.model_metrics import metrics_response, record_failure, record_success, start_run
@@ -422,7 +422,6 @@ def _case_update_fields(case: dict, event: dict) -> list[dict]:
 
 
 def _case_update_title(action: str, case: dict, event: dict) -> str:
-    display = case_display_title(case, event)
     if action == "recovered":
         return f"✅ {case.get('case_number', 'NOC')}: recovered, cooling down"
     if action == "reopened":

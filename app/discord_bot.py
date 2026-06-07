@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from app import log
-from app.agent import noc_triage_agent
 from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
 from app.mcp_runtime import MCPRuntime
 from app.safe_errors import classify_exception, log_exception
@@ -99,11 +98,11 @@ class NOCDiscordBot:
         if channel is None:
             return
         embed = discord.Embed(title=title, description=description, color=color)
-        for field in fields or []:
+        for embed_field in fields or []:
             embed.add_field(
-                name=str(field.get("name", "Field")),
-                value=str(field.get("value", "")),
-                inline=bool(field.get("inline", False)),
+                name=str(embed_field.get("name", "Field")),
+                value=str(embed_field.get("value", "")),
+                inline=bool(embed_field.get("inline", False)),
             )
         await channel.send(embed=embed)
 
@@ -121,11 +120,11 @@ class NOCDiscordBot:
         if channel is None:
             return
         embed = discord.Embed(title=title, description=description, color=color)
-        for field in fields or []:
+        for embed_field in fields or []:
             embed.add_field(
-                name=str(field.get("name", "Field")),
-                value=str(field.get("value", "")),
-                inline=bool(field.get("inline", False)),
+                name=str(embed_field.get("name", "Field")),
+                value=str(embed_field.get("value", "")),
+                inline=bool(embed_field.get("inline", False)),
             )
         message = self._case_messages.get(case_id)
         if message is not None and callable(getattr(message, "edit", None)):
@@ -574,7 +573,7 @@ async def run_fast_status_check(target: str, qualifiers: dict[str, str] | None, 
 
     runtime_health = runtime.health()
     if _is_noc_target(target):
-        checks.append(f"NOC API health: ok")
+        checks.append("NOC API health: ok")
         checks.append(
             "MCP health: "
             f"{runtime_health['status']} "
@@ -762,7 +761,7 @@ def _format_status_overview(overview: StatusOverview) -> str:
 
 
 def _format_check_line(check: str) -> str:
-    return f"- {check}" if "\n" not in check else f"- {check}"
+    return f"- {check}"
 
 
 async def _format_pending() -> str:

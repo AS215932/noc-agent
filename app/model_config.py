@@ -5,7 +5,7 @@ from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.models.fallback import FallbackModel
 
-from app.config import DEFAULT_FALLBACK_MODELS, DEFAULT_PRIMARY_MODEL, NocAgentSettings, load_settings
+from app.config import DEFAULT_PRIMARY_MODEL, NocAgentSettings, load_settings
 from app.model_metrics import record_fallback_attempt, set_model_config
 from app.safe_errors import classify_exception
 

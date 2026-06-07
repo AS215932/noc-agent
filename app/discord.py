@@ -20,7 +20,13 @@ def get_verbosity() -> Verbosity:
     level_str = os.environ.get("LOG_LEVEL_DISCORD", "INFO").upper()
     return getattr(Verbosity, level_str, Verbosity.INFO)
 
-async def send_discord_notification(title: str, description: str, color: int = 0x3498db, fields: list[dict[str, Any]] = None, level: Verbosity = Verbosity.INFO):
+async def send_discord_notification(
+    title: str,
+    description: str,
+    color: int = 0x3498db,
+    fields: list[dict[str, Any]] | None = None,
+    level: Verbosity = Verbosity.INFO,
+):
     """
     Sends an embed message to a Discord webhook.
     """

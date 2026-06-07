@@ -9,7 +9,7 @@ from email.parser import BytesParser
 from email.utils import getaddresses
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.agent import MailDraftPlan, noc_mail_agent
 from app.model_metrics import record_failure, record_success, start_run

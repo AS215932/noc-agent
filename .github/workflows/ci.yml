@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: [self-hosted, linux, x64, hyrule-public-pr]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Sync deps
+        run: ~/.local/bin/uv sync --frozen --group dev
+
+      - name: Ruff
+        run: ~/.local/bin/uv run ruff check .
+
+      - name: Mypy
+        run: ~/.local/bin/uv run mypy app
+
+      - name: Pytest
+        run: ~/.local/bin/uv run pytest -q
