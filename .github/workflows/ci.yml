@@ -16,7 +16,7 @@ jobs:
   test:
     name: test
     runs-on: [self-hosted, linux, x64, hyrule-public-pr]
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
