@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from app import log
-from app.agent import noc_triage_agent
 from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
 from app.mcp_runtime import MCPRuntime
 from app.safe_errors import classify_exception, log_exception
@@ -26,6 +25,7 @@ Notifier = Callable[..., Awaitable[None]]
 DEFAULT_INVESTIGATION_TIMEOUT_SECONDS = 240
 THREAD_MESSAGE_LIMIT = 1400
 INCIDENT_ID_RE = re.compile(r"^(?:inc|incident)[-_][0-9a-f-]+$", re.IGNORECASE)
+CASE_NUMBER_RE = re.compile(r"^NOC-\d{8}-\d{3}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,8 @@ class NOCDiscordBot:
         self.allowed_guilds = _csv_ints("DISCORD_ALLOWED_GUILD_IDS")
         self.allowed_channels = _csv_ints("DISCORD_ALLOWED_CHANNEL_IDS")
         self.allowed_roles = _csv_ints("DISCORD_ALLOWED_ROLE_IDS")
+        self.allowed_users = _csv_ints("DISCORD_ALLOWED_USER_IDS")
+        self.admin_roles = _csv_ints("DISCORD_ADMIN_ROLE_IDS")
         self.investigation_timeout_s = float(
             os.getenv("DISCORD_INVESTIGATION_TIMEOUT_SECONDS", str(DEFAULT_INVESTIGATION_TIMEOUT_SECONDS))
         )
@@ -96,11 +98,11 @@ class NOCDiscordBot:
         if channel is None:
             return
         embed = discord.Embed(title=title, description=description, color=color)
-        for field in fields or []:
+        for embed_field in fields or []:
             embed.add_field(
-                name=str(field.get("name", "Field")),
-                value=str(field.get("value", "")),
-                inline=bool(field.get("inline", False)),
+                name=str(embed_field.get("name", "Field")),
+                value=str(embed_field.get("value", "")),
+                inline=bool(embed_field.get("inline", False)),
             )
         await channel.send(embed=embed)
 
@@ -118,11 +120,11 @@ class NOCDiscordBot:
         if channel is None:
             return
         embed = discord.Embed(title=title, description=description, color=color)
-        for field in fields or []:
+        for embed_field in fields or []:
             embed.add_field(
-                name=str(field.get("name", "Field")),
-                value=str(field.get("value", "")),
-                inline=bool(field.get("inline", False)),
+                name=str(embed_field.get("name", "Field")),
+                value=str(embed_field.get("value", "")),
+                inline=bool(embed_field.get("inline", False)),
             )
         message = self._case_messages.get(case_id)
         if message is not None and callable(getattr(message, "edit", None)):
@@ -156,14 +158,14 @@ class NOCDiscordBot:
 
         @self.tree.command(name="noc_pending", description="List pending NOC proposals.")
         async def noc_pending(interaction):
-            if not self._authorized(interaction):
+            if not await self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
             incidents = await pending_summaries()
             if not incidents:
                 await interaction.response.send_message("No pending NOC proposals.", ephemeral=True)
                 return
-            lines = [f"`{item['incident_id']}` {item['title']}" for item in incidents[:10]]
+            lines = [f"`{item.get('case_number') or 'NOC'}` `{item['incident_id']}` {item['title']}" for item in incidents[:10]]
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
         @self.tree.command(name="noc_investigate", description="Start an operator-requested NOC investigation.")
@@ -172,18 +174,18 @@ class NOCDiscordBot:
 
         @self.tree.command(name="noc_status", description="Show one NOC incident.")
         async def noc_status(interaction, incident_id: str):
-            if not self._authorized(interaction):
+            if not await self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
             summary = await summary_for(incident_id)
             await interaction.response.send_message(
-                "Incident not found." if summary is None else f"`{incident_id}` {summary['status']}: {summary['title']}",
+                "Incident not found." if summary is None else _summary_line(summary),
                 ephemeral=True,
             )
 
         @self.tree.command(name="noc_decide", description="Approve, reject, or acknowledge a NOC proposal.")
         async def noc_decide(interaction, incident_id: str, decision: str, comment: str = ""):
-            if not self._authorized(interaction):
+            if not await self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
             operator = str(getattr(interaction.user, "id", "discord"))
@@ -197,7 +199,7 @@ class NOCDiscordBot:
                 },
             ))
             await interaction.response.send_message(
-                "Incident not found." if summary is None else f"Recorded `{decision}` for `{incident_id}`.",
+                "Incident not found." if summary is None else f"Recorded `{decision}` for `{summary.get('case_number') or incident_id}` (`{summary.get('incident_id')}`).",
                 ephemeral=True,
             )
 
@@ -208,7 +210,7 @@ class NOCDiscordBot:
             await self.handle_operator_message(message)
 
     async def handle_investigation_interaction(self, interaction, prompt: str) -> None:
-        if not self._authorized(interaction):
+        if not await self._authorized(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
         operator = str(getattr(getattr(interaction, "user", None), "id", "discord"))
@@ -288,7 +290,7 @@ class NOCDiscordBot:
             ))
             await _safe_send(
                 message.reply,
-                "Incident not found." if summary is None else f"Recorded `{intent.decision}` for `{intent.incident_id}`.",
+                "Incident not found." if summary is None else f"Recorded `{intent.decision}` for `{summary.get('case_number') or intent.incident_id}` (`{summary.get('incident_id')}`).",
             )
             return
 
@@ -335,8 +337,9 @@ class NOCDiscordBot:
                 confidence=plan.confidence_score,
                 severity=plan.severity,
             )
+            case_number = state.get("case_number") or incident_id
             await send(
-                f"Investigation `{incident_id}` is waiting for review: {plan.incident_summary}\n"
+                f"Investigation `{case_number}` (`{incident_id}`) is waiting for review: {plan.incident_summary}\n"
                 f"Confidence: {plan.confidence_score * 100:.1f}% | Severity: {plan.severity}"
             )
         except TimeoutError:
@@ -378,24 +381,79 @@ class NOCDiscordBot:
         task.add_done_callback(_done)
         return task
 
-    def _authorized(self, interaction) -> bool:
-        if self.allowed_guilds and getattr(interaction.guild, "id", None) not in self.allowed_guilds:
-            return False
-        if self.allowed_channels and getattr(interaction.channel, "id", None) not in self.allowed_channels:
-            return False
-        if not self.allowed_roles:
-            return True
-        roles = getattr(interaction.user, "roles", [])
-        return any(getattr(role, "id", None) in self.allowed_roles for role in roles)
+    async def _authorized(self, interaction) -> bool:
+        roles = await self._interaction_roles(interaction)
+        return self._authorize_subject(
+            guild=getattr(interaction, "guild", None),
+            channel=getattr(interaction, "channel", None),
+            user=getattr(interaction, "user", None),
+            roles=roles,
+            source="slash",
+        )
 
     def _message_authorized(self, message) -> bool:
-        if self.allowed_guilds and getattr(message.guild, "id", None) not in self.allowed_guilds:
-            return False
-        if self.allowed_channels and getattr(message.channel, "id", None) not in self.allowed_channels:
-            return False
-        if not self.allowed_roles:
+        return self._authorize_subject(
+            guild=getattr(message, "guild", None),
+            channel=getattr(message, "channel", None),
+            user=getattr(message, "author", None),
+            roles=getattr(message.author, "roles", []),
+            source="mention",
+        )
+
+    async def _interaction_roles(self, interaction) -> list[Any]:
+        roles = list(getattr(getattr(interaction, "user", None), "roles", []) or [])
+        role_ids = {getattr(role, "id", None) for role in roles if getattr(role, "id", None) is not None}
+        if roles and (not self.allowed_roles or role_ids.intersection(self.allowed_roles)):
+            return roles
+        member = getattr(interaction, "user", None)
+        guild = getattr(interaction, "guild", None)
+        user_id = getattr(member, "id", None)
+        if guild is None or user_id is None:
+            return roles
+        get_member = getattr(guild, "get_member", None)
+        fetched = get_member(user_id) if callable(get_member) else None
+        if fetched is None:
+            fetch_member = getattr(guild, "fetch_member", None)
+            if callable(fetch_member):
+                try:
+                    fetched = await fetch_member(user_id)
+                except Exception as exc:
+                    safe = classify_exception(exc)
+                    log_exception("discord_member_role_lookup_failed", exc, category=safe.category, user_id=user_id)
+        return list(getattr(fetched, "roles", []) or roles)
+
+    def _authorize_subject(self, *, guild, channel, user, roles: list[Any], source: str) -> bool:
+        guild_id = getattr(guild, "id", None)
+        channel_id = getattr(channel, "id", None)
+        parent_channel_id = getattr(getattr(channel, "parent", None), "id", None) or getattr(channel, "parent_id", None)
+        user_id = getattr(user, "id", None)
+        role_ids = {getattr(role, "id", None) for role in roles if getattr(role, "id", None) is not None}
+
+        if user_id in self.allowed_users or role_ids.intersection(self.admin_roles):
             return True
-        return any(getattr(role, "id", None) in self.allowed_roles for role in getattr(message.author, "roles", []))
+
+        guild_ok = not self.allowed_guilds or guild_id in self.allowed_guilds
+        channel_ok = not self.allowed_channels or channel_id in self.allowed_channels or parent_channel_id in self.allowed_channels
+        role_ok = not self.allowed_roles or bool(role_ids.intersection(self.allowed_roles))
+        if guild_ok and channel_ok and role_ok:
+            return True
+
+        log.warning(
+            "discord_auth_denied",
+            source=source,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            parent_channel_id=parent_channel_id,
+            user_id=user_id,
+            observed_role_ids=sorted(role_ids),
+            configured_guild_ids=sorted(self.allowed_guilds),
+            configured_channel_ids=sorted(self.allowed_channels),
+            configured_role_ids=sorted(self.allowed_roles),
+            guild_ok=guild_ok,
+            channel_ok=channel_ok,
+            role_ok=role_ok,
+        )
+        return False
 
 
 def build_bot() -> NOCDiscordBot | None:
@@ -484,7 +542,7 @@ def parse_discord_operator_request(text: str) -> OperatorIntent:
         if routed is not None:
             return routed
         target = _clean_target(rest)
-        if INCIDENT_ID_RE.match(target):
+        if INCIDENT_ID_RE.match(target) or CASE_NUMBER_RE.match(target):
             return OperatorIntent(type="incident_status", raw_text=raw, incident_id=target)
         return OperatorIntent(type="status", raw_text=raw, target=target)
 
@@ -515,7 +573,7 @@ async def run_fast_status_check(target: str, qualifiers: dict[str, str] | None, 
 
     runtime_health = runtime.health()
     if _is_noc_target(target):
-        checks.append(f"NOC API health: ok")
+        checks.append("NOC API health: ok")
         checks.append(
             "MCP health: "
             f"{runtime_health['status']} "
@@ -703,7 +761,7 @@ def _format_status_overview(overview: StatusOverview) -> str:
 
 
 def _format_check_line(check: str) -> str:
-    return f"- {check}" if "\n" not in check else f"- {check}"
+    return f"- {check}"
 
 
 async def _format_pending() -> str:
@@ -711,7 +769,7 @@ async def _format_pending() -> str:
     if not incidents:
         return "No pending NOC proposals."
     lines = ["Pending NOC proposals:"]
-    lines.extend(f"- `{item['incident_id']}` {item['title']}" for item in incidents[:10])
+    lines.extend(f"- `{item.get('case_number') or 'NOC'}` `{item['incident_id']}` {item['title']}" for item in incidents[:10])
     return "\n".join(lines)
 
 
@@ -719,7 +777,14 @@ async def _format_incident_status(incident_id: str) -> str:
     summary = await summary_for(incident_id)
     if summary is None:
         return "Incident not found."
-    return f"`{incident_id}` {summary['status']}: {summary['title']}"
+    return _summary_line(summary)
+
+
+def _summary_line(summary: dict[str, Any]) -> str:
+    case_number = summary.get("case_number") or "NOC"
+    incident_id = summary.get("incident_id") or ""
+    marker = " pending approval" if summary.get("status") == "waiting_approval" else ""
+    return f"`{case_number}` `{incident_id}` {summary['status']}{marker}: {summary['title']}"
 
 
 def _help_text() -> str:

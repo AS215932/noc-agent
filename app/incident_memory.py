@@ -36,6 +36,7 @@ class _LocalIncidentMemory:
     summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
     cases: dict[str, dict[str, Any]] = field(default_factory=dict)
     events: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    case_number_index: dict[str, str] = field(default_factory=dict)
     fingerprint_index: dict[str, str] = field(default_factory=dict)
     resource_open_cases: dict[str, set[str]] = field(default_factory=dict)
     daily_counters: dict[str, int] = field(default_factory=dict)
@@ -116,6 +117,23 @@ class IncidentMemory:
         async with self._local.lock:
             return list(self._local.summaries.values())
 
+    async def list_cases(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if self._redis is not None:
+            cases: list[dict[str, Any]] = []
+            async for key in self._redis.scan_iter("noc:case:*"):
+                key_text = _redis_text(key)
+                if ":events:" in key_text or ":fingerprint:" in key_text or ":number:" in key_text or ":daily:" in key_text:
+                    continue
+                raw = await self._redis.get(key)
+                if raw:
+                    cases.append(json.loads(raw))
+            cases.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+            return cases[:limit]
+        async with self._local.lock:
+            cases = [dict(case) for case in self._local.cases.values()]
+            cases.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+            return cases[:limit]
+
     async def intake_alert(self, alert_payload: dict[str, Any]) -> CaseIntakeResult:
         event = case_event_from_alert(alert_payload)
         if self._redis is not None:
@@ -123,7 +141,22 @@ class IncidentMemory:
         async with self._local.lock:
             return await self._intake_alert_local_locked(event, alert_payload, time.time())
 
+    async def resolve_case_identifier(self, identifier: str) -> str | None:
+        identifier = str(identifier or "").strip()
+        if not identifier:
+            return None
+        if self._redis is not None:
+            if await self._redis.exists(f"noc:case:{identifier}"):
+                return identifier
+            mapped = await self._redis.get(f"noc:case:number:{identifier.upper()}")
+            return _redis_text(mapped) if mapped else None
+        async with self._local.lock:
+            if identifier in self._local.cases:
+                return identifier
+            return self._local.case_number_index.get(identifier.upper())
+
     async def get_case(self, incident_id: str) -> dict[str, Any] | None:
+        incident_id = await self.resolve_case_identifier(incident_id) or str(incident_id or "").strip()
         if self._redis is not None:
             incident_id = _redis_text(incident_id)
             raw = await self._redis.get(f"noc:case:{incident_id}")
@@ -133,6 +166,7 @@ class IncidentMemory:
             return dict(case) if case else None
 
     async def case_events(self, incident_id: str) -> list[dict[str, Any]]:
+        incident_id = await self.resolve_case_identifier(incident_id) or str(incident_id or "").strip()
         if self._redis is not None:
             incident_id = _redis_text(incident_id)
             raw = await self._redis.lrange(f"noc:case:events:{incident_id}", 0, -1)
@@ -140,7 +174,49 @@ class IncidentMemory:
         async with self._local.lock:
             return list(self._local.events.get(incident_id, []))
 
+    async def case_detail(self, identifier: str) -> dict[str, Any] | None:
+        incident_id = await self.resolve_case_identifier(identifier)
+        if not incident_id:
+            return None
+        case = await self.get_case(incident_id)
+        if not case:
+            return None
+        summary = await self.get_summary(incident_id)
+        events = await self.case_events(incident_id)
+        return {"case": case, "summary": summary, "events": events}
+
+    async def append_operator_comment(self, identifier: str, operator: str, comment: str) -> dict[str, Any] | None:
+        incident_id = await self.resolve_case_identifier(identifier)
+        if not incident_id:
+            return None
+        event = {
+            "received_at": utc_now(),
+            "event_type": "operator_comment",
+            "operator": str(operator or "operator"),
+            "summary": str(comment or "").strip(),
+        }
+        if self._redis is not None:
+            await self._redis.rpush(f"noc:case:events:{incident_id}", json.dumps(event))
+            await self._redis.ltrim(f"noc:case:events:{incident_id}", -MAX_CASE_EVENTS, -1)
+            await self._redis.expire(f"noc:case:events:{incident_id}", CASE_HISTORY_SECONDS)
+            case = await self.get_case(incident_id)
+            if case:
+                case["updated_at"] = utc_now()
+                await self._store_case_redis(case)
+                return case
+            return None
+        async with self._local.lock:
+            case = self._local.cases.get(incident_id)
+            if not case:
+                return None
+            self._local.events.setdefault(incident_id, []).append(event)
+            self._local.events[incident_id] = self._local.events[incident_id][-MAX_CASE_EVENTS:]
+            case["updated_at"] = utc_now()
+            self._local.cases[incident_id] = case
+            return dict(case)
+
     async def update_case(self, incident_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+        incident_id = await self.resolve_case_identifier(incident_id) or str(incident_id or "").strip()
         fields = _jsonish_dict(fields)
         fields["updated_at"] = utc_now()
         if self._redis is not None:
@@ -276,6 +352,7 @@ class IncidentMemory:
             child_case["linked_parent_case"] = parent_case["incident_id"]
             child_case["parents_checked"] = parents_checked
             self._local.cases[child_case["incident_id"]] = child_case
+            self._local.case_number_index[child_case["case_number"].upper()] = child_case["incident_id"]
             self._local.events[child_case["incident_id"]] = [event]
             self._local.fingerprint_index[event["fingerprint"]] = parent_case["incident_id"]
             parent_event = dict(event)
@@ -293,6 +370,7 @@ class IncidentMemory:
 
         case = self._create_case_local_locked(event, alert_payload, now, status="investigating")
         self._local.cases[case["incident_id"]] = case
+        self._local.case_number_index[case["case_number"].upper()] = case["incident_id"]
         self._local.fingerprint_index[fingerprint] = case["incident_id"]
         self._local.resource_open_cases.setdefault(case["resource_id"], set()).add(case["incident_id"])
         self._local.events[case["incident_id"]] = [event]
@@ -674,6 +752,8 @@ class IncidentMemory:
             self._local.fingerprint_index[fingerprint] = case["incident_id"]
         if resource:
             self._local.resource_open_cases.setdefault(resource, set()).add(case["incident_id"])
+        if case.get("case_number"):
+            self._local.case_number_index[str(case["case_number"]).upper()] = case["incident_id"]
 
     async def _sync_case_indexes_redis(self, case: dict[str, Any]) -> None:
         if case.get("status") not in OPEN_CASE_STATUSES:
@@ -708,6 +788,12 @@ class IncidentMemory:
     async def _store_case_redis(self, case: dict[str, Any]) -> None:
         case = _jsonish_dict(case)
         await self._redis.set(f"noc:case:{case['incident_id']}", json.dumps(case), ex=CASE_HISTORY_SECONDS)
+        if case.get("case_number"):
+            await self._redis.set(
+                f"noc:case:number:{str(case['case_number']).upper()}",
+                case["incident_id"],
+                ex=CASE_HISTORY_SECONDS,
+            )
         expiry_at = _case_expiry_ts(case)
         if expiry_at is None:
             await self._redis.zrem(CASE_EXPIRY_INDEX_KEY, case["incident_id"])

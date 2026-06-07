@@ -92,6 +92,9 @@ async def run_investigation_graph(
     mcp_runtime=None,
     case: dict[str, Any] | None = None,
 ) -> tuple[DiagnosticSynthesis, WorkflowState]:
+    if case is None:
+        intake = await INCIDENT_MEMORY.intake_alert(alert_payload)
+        case = intake.case
     incident_id = case["incident_id"] if case else str(uuid4())
     thread_id = case.get("thread_id") if case and case.get("thread_id") else str(uuid4())
     case_context = await INCIDENT_MEMORY.case_context(incident_id) if case else {}
@@ -162,10 +165,14 @@ async def pending_summaries() -> list[dict[str, Any]]:
 
 
 async def summary_for(incident_id: str) -> dict[str, Any] | None:
-    return await INCIDENT_MEMORY.get_summary(incident_id)
+    resolved = await INCIDENT_MEMORY.resolve_case_identifier(incident_id)
+    return await INCIDENT_MEMORY.get_summary(resolved or incident_id)
 
 
 async def record_operator_decision(incident_id: str, decision: dict[str, Any], mcp_runtime=None) -> dict[str, Any] | None:
+    resolved = await INCIDENT_MEMORY.resolve_case_identifier(incident_id)
+    incident_id = resolved or incident_id
+    decision = {**decision, "incident_id": incident_id}
     summary = await INCIDENT_MEMORY.get_summary(incident_id)
     if not summary:
         return None
@@ -203,6 +210,8 @@ async def record_operator_decision(incident_id: str, decision: dict[str, Any], m
 
 
 async def resume_investigation(incident_id: str, decision: dict[str, Any], mcp_runtime=None) -> WorkflowState | None:
+    resolved = await INCIDENT_MEMORY.resolve_case_identifier(incident_id)
+    incident_id = resolved or incident_id
     summary = await INCIDENT_MEMORY.get_summary(incident_id)
     if not summary or not summary.get("thread_id"):
         return None

@@ -4,23 +4,26 @@ import fcntl
 import hashlib
 import hmac
 import json
-from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Response, status
+from html import escape
+from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Query, Request, Response, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 from contextlib import asynccontextmanager, suppress
 
 from app import log
-from app.agent import noc_triage_agent, noc_mail_agent
-from app.discord import Verbosity, send_discord_notification, send_case_notification, notify_start, notify_finish
+from app.agent import noc_triage_agent
+from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
 from app.discord import install_bot_notifier, install_case_notifier
 from app.discord_bot import build_bot
-from app.mail import check_mailbox_connection, process_mailbox_once, MailSettings
+from app.mail import check_mailbox_connection, process_mailbox_once
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
 from app.model_metrics import metrics_response, record_failure, record_success, start_run
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
+import app.graph_runtime as graph_runtime
 from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
 from app.incident_memory import CaseIntakeResult, RECOVERY_COOLDOWN_SECONDS, case_display_title, case_event_from_alert
 from app.noc_state import ApprovalDecision
@@ -419,7 +422,6 @@ def _case_update_fields(case: dict, event: dict) -> list[dict]:
 
 
 def _case_update_title(action: str, case: dict, event: dict) -> str:
-    display = case_display_title(case, event)
     if action == "recovered":
         return f"✅ {case.get('case_number', 'NOC')}: recovered, cooling down"
     if action == "reopened":
@@ -650,6 +652,11 @@ class TaskRequest(BaseModel):
     prompt: str
 
 
+class ManualInvestigationRequest(BaseModel):
+    prompt: str
+    operator: str = "web"
+
+
 class LocalDecisionRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected|acknowledged)$")
     operator: str
@@ -658,6 +665,16 @@ class LocalDecisionRequest(BaseModel):
 
 class SignedApprovalRequest(LocalDecisionRequest):
     incident_id: str
+
+
+class CommentRequest(BaseModel):
+    operator: str = "web"
+    comment: str
+
+
+class FastStatusRequest(BaseModel):
+    target: str
+    qualifiers: dict[str, str] = Field(default_factory=dict)
 
 @app.post("/task", response_model=MailPollResponse)
 async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
@@ -702,6 +719,124 @@ async def incident_status(incident_id: str, x_noc_control_token: str | None = He
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return summary
+
+
+@app.get("/control", response_class=HTMLResponse)
+async def control_ui(request: Request, token: str | None = Query(default=None)):
+    _require_control_request(request, token)
+    return HTMLResponse(_control_html(token or ""))
+
+
+@app.get("/control/cases")
+async def control_cases(request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
+    _require_control_request(request, token, x_noc_control_token)
+    cases = await graph_runtime.INCIDENT_MEMORY.list_cases()
+    pending = {item["incident_id"] for item in await pending_summaries()}
+    return {
+        "status": "ok",
+        "cases": [
+            {
+                "incident_id": case.get("incident_id"),
+                "case_number": case.get("case_number"),
+                "status": case.get("status"),
+                "severity": (case.get("latest_event") or {}).get("severity") or (case.get("latest_event") or {}).get("state"),
+                "resource_id": case.get("resource_id"),
+                "title": case.get("title"),
+                "event_count": case.get("event_count", 0),
+                "updated_at": case.get("updated_at"),
+                "pending_approval": case.get("incident_id") in pending or case.get("status") == "waiting_approval",
+            }
+            for case in cases
+        ],
+    }
+
+
+@app.get("/control/cases/{case_id}")
+async def control_case_detail(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
+    _require_control_request(request, token, x_noc_control_token)
+    detail = await graph_runtime.INCIDENT_MEMORY.case_detail(case_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return {"status": "ok", **detail}
+
+
+@app.get("/control/cases/{case_id}/events")
+async def control_case_events(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
+    _require_control_request(request, token, x_noc_control_token)
+    resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return {"status": "ok", "events": await graph_runtime.INCIDENT_MEMORY.case_events(resolved)}
+
+
+@app.post("/control/cases/{case_id}/comment")
+async def control_case_comment(
+    case_id: str,
+    request_body: CommentRequest,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    case = await graph_runtime.INCIDENT_MEMORY.append_operator_comment(case_id, request_body.operator, request_body.comment)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return {"status": "ok", "case": case}
+
+
+@app.post("/control/cases/{case_id}/decision")
+async def control_case_decision(
+    case_id: str,
+    request_body: LocalDecisionRequest,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Case not found")
+    decision = ApprovalDecision(incident_id=resolved, **request_body.model_dump())
+    summary = await record_operator_decision(resolved, decision.model_dump(), mcp_runtime=mcp_runtime)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    await graph_runtime.INCIDENT_MEMORY.append_operator_comment(
+        resolved,
+        request_body.operator,
+        f"Decision {request_body.decision}: {request_body.comment}".strip(),
+    )
+    return {"status": "ok", "incident": summary}
+
+
+@app.post("/control/cases/investigate")
+async def control_manual_investigation(
+    request_body: ManualInvestigationRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    alert_payload = _manual_investigation_payload(request_body.prompt, "web", request_body.operator)
+    result = await intake_alert(alert_payload)
+    if result.case is None:
+        raise HTTPException(status_code=409, detail=f"Manual investigation was not queued: {result.action}")
+    background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
+    return {"status": "accepted", "case": result.case, "case_number": result.case.get("case_number"), "incident_id": result.case.get("incident_id")}
+
+
+@app.post("/control/status")
+async def control_fast_status(
+    request_body: FastStatusRequest,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    from app.discord_bot import run_fast_status_check
+
+    overview = await run_fast_status_check(request_body.target, request_body.qualifiers, mcp_runtime)
+    return {"status": "ok", "overview": overview.__dict__}
 
 
 @app.post("/control/incidents/{incident_id}/decision")
@@ -860,8 +995,141 @@ def _require_control_token(header_value: str | None) -> None:
     expected = os.getenv("NOC_CONTROL_TOKEN", "").strip()
     if not expected:
         raise HTTPException(status_code=503, detail="Local control plane is not configured")
+    header_value = header_value if isinstance(header_value, str) else None
     if not header_value or not hmac.compare_digest(header_value, expected):
         raise HTTPException(status_code=401, detail="Invalid control token")
+
+
+def _require_control_request(request: Request, token: str | None = None, header_value: str | None = None) -> None:
+    auth = request.headers.get("authorization", "")
+    bearer = auth.removeprefix("Bearer ").strip() if auth.lower().startswith("bearer ") else ""
+    header_value = header_value if isinstance(header_value, str) else None
+    _require_control_token(header_value or request.headers.get("x-noc-control-token") or bearer or token)
+
+
+def _manual_investigation_payload(prompt: str, source: str, operator: str) -> dict:
+    return {
+        "source": source,
+        "status": "firing",
+        "groupLabels": {"alertname": "Operator Investigation", "host": "manual"},
+        "commonLabels": {"severity": "manual", "host": "manual", "operator": operator},
+        "commonAnnotations": {"summary": prompt},
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {"alertname": "Operator Investigation", "host": "manual", "state": "MANUAL"},
+                "annotations": {"summary": prompt},
+            }
+        ],
+    }
+
+
+def _control_html(token: str) -> str:
+    safe_token = escape(token, quote=True)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NOC Control</title>
+  <style>
+    :root {{ color-scheme: light dark; --line:#d8dee4; --muted:#6b7280; --bg:#f7f8fa; --panel:#fff; --text:#111827; --accent:#0f766e; --warn:#b45309; }}
+    @media (prefers-color-scheme: dark) {{ :root {{ --line:#30363d; --muted:#9ca3af; --bg:#0d1117; --panel:#161b22; --text:#f3f4f6; --accent:#2dd4bf; --warn:#f59e0b; }} }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }}
+    header {{ display:flex; gap:12px; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:2; }}
+    h1 {{ font-size:18px; margin:0; }}
+    main {{ display:grid; grid-template-columns:minmax(280px,420px) 1fr; min-height:calc(100vh - 58px); }}
+    aside {{ border-right:1px solid var(--line); background:var(--panel); overflow:auto; }}
+    section {{ padding:16px; overflow:auto; }}
+    input, textarea, button, select {{ font:inherit; border:1px solid var(--line); border-radius:6px; padding:8px 10px; background:var(--panel); color:var(--text); }}
+    button {{ cursor:pointer; background:var(--accent); color:white; border-color:var(--accent); }}
+    button.secondary {{ background:transparent; color:var(--text); }}
+    .toolbar {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+    .case {{ display:grid; gap:4px; padding:12px 14px; border-bottom:1px solid var(--line); cursor:pointer; }}
+    .case:hover {{ background:color-mix(in srgb, var(--accent) 8%, transparent); }}
+    .case strong {{ font-size:13px; }}
+    .meta {{ color:var(--muted); font-size:12px; }}
+    .badge {{ display:inline-block; border:1px solid var(--line); border-radius:999px; padding:1px 7px; font-size:12px; color:var(--muted); }}
+    .pending {{ color:var(--warn); border-color:var(--warn); }}
+    .grid {{ display:grid; gap:12px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .timeline {{ display:grid; gap:10px; }}
+    .event {{ border-left:3px solid var(--line); padding-left:10px; }}
+    pre {{ white-space:pre-wrap; overflow:auto; background:var(--bg); padding:10px; border-radius:6px; }}
+    textarea {{ width:100%; min-height:80px; }}
+    @media (max-width: 820px) {{ main {{ grid-template-columns:1fr; }} aside {{ border-right:0; border-bottom:1px solid var(--line); max-height:45vh; }} }}
+  </style>
+</head>
+<body>
+<header>
+  <h1>NOC Control</h1>
+  <div class="toolbar">
+    <input id="token" type="password" placeholder="Control token" value="{safe_token}" autocomplete="off">
+    <button id="saveToken" class="secondary">Save</button>
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+<main>
+  <aside><div id="cases"></div></aside>
+  <section class="grid">
+    <div class="panel">
+      <form id="investigate" class="grid">
+        <strong>Manual Investigation</strong>
+        <textarea name="prompt" placeholder="Describe what to investigate"></textarea>
+        <div class="toolbar"><input name="operator" placeholder="Operator" value="web"><button>Start</button></div>
+      </form>
+    </div>
+    <div class="panel">
+      <form id="fastStatus" class="toolbar">
+        <input name="target" placeholder="Fast status target">
+        <button>Status</button>
+      </form>
+      <pre id="statusOut"></pre>
+    </div>
+    <div id="detail" class="grid"></div>
+  </section>
+</main>
+<script>
+const tokenInput = document.querySelector('#token');
+const casesEl = document.querySelector('#cases');
+const detailEl = document.querySelector('#detail');
+const statusOut = document.querySelector('#statusOut');
+tokenInput.value = tokenInput.value || sessionStorage.getItem('nocToken') || '';
+function token() {{ return tokenInput.value.trim(); }}
+function headers() {{ return {{'content-type':'application/json','x-noc-control-token':token()}}; }}
+async function api(path, opts={{}}) {{
+  const res = await fetch(path, {{...opts, headers: {{...headers(), ...(opts.headers||{{}})}}}});
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}}
+function esc(v) {{ return String(v ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
+async function loadCases() {{
+  const data = await api('/control/cases');
+  casesEl.innerHTML = data.cases.map(c => `<div class="case" data-id="${{esc(c.case_number||c.incident_id)}}"><strong>${{esc(c.case_number)}} <span class="badge ${{c.pending_approval?'pending':''}}">${{esc(c.status)}}</span></strong><span>${{esc(c.title||c.resource_id)}}</span><span class="meta">${{esc(c.severity||'')}} events=${{esc(c.event_count)}} updated=${{esc(c.updated_at||'')}}</span></div>`).join('');
+  document.querySelectorAll('.case').forEach(el => el.onclick = () => loadDetail(el.dataset.id));
+}}
+async function loadDetail(id) {{
+  const data = await api('/control/cases/' + encodeURIComponent(id));
+  const c = data.case, s = data.summary || {{}};
+  detailEl.innerHTML = `<div class="panel"><h2>${{esc(c.case_number)}} <span class="badge">${{esc(c.status)}}</span></h2><p class="meta">${{esc(c.incident_id)}} · ${{esc(c.resource_id)}} · updated ${{esc(c.updated_at)}}</p><p>${{esc(s.title || c.diagnostic_summary || c.title || '')}}</p><div class="toolbar"><button data-decision="approved">Approve</button><button data-decision="rejected" class="secondary">Reject</button><button data-decision="acknowledged" class="secondary">Acknowledge</button></div><textarea id="comment" placeholder="Comment"></textarea><div class="toolbar"><input id="operator" value="web"><button id="addComment" class="secondary">Comment</button></div></div><div class="panel"><strong>Proposal</strong><pre>${{esc(JSON.stringify(s.proposals || [], null, 2))}}</pre></div><div class="panel"><strong>Execution</strong><pre>${{esc(JSON.stringify({{executed_actions:s.executed_actions||c.executed_actions||[], verification_results:s.verification_results||c.verification_results||[]}}, null, 2))}}</pre></div><div class="panel timeline"><strong>Timeline</strong>${{data.events.map(e => `<div class="event"><span class="meta">${{esc(e.received_at)}} · ${{esc(e.event_type||e.state||'event')}}</span><div>${{esc(e.summary||'')}}</div></div>`).join('')}}</div>`;
+  detailEl.querySelectorAll('[data-decision]').forEach(btn => btn.onclick = async () => {{
+    await api('/control/cases/' + encodeURIComponent(id) + '/decision', {{method:'POST', body:JSON.stringify({{decision:btn.dataset.decision, operator:document.querySelector('#operator').value||'web', comment:document.querySelector('#comment').value||''}})}});
+    await loadDetail(id); await loadCases();
+  }});
+  detailEl.querySelector('#addComment').onclick = async () => {{
+    await api('/control/cases/' + encodeURIComponent(id) + '/comment', {{method:'POST', body:JSON.stringify({{operator:document.querySelector('#operator').value||'web', comment:document.querySelector('#comment').value||''}})}});
+    await loadDetail(id); await loadCases();
+  }};
+}}
+document.querySelector('#saveToken').onclick = () => sessionStorage.setItem('nocToken', token());
+document.querySelector('#refresh').onclick = () => loadCases().catch(e => alert(e.message));
+document.querySelector('#investigate').onsubmit = async e => {{ e.preventDefault(); const fd = new FormData(e.target); await api('/control/cases/investigate', {{method:'POST', body:JSON.stringify(Object.fromEntries(fd))}}); e.target.prompt.value=''; await loadCases(); }};
+document.querySelector('#fastStatus').onsubmit = async e => {{ e.preventDefault(); const fd = new FormData(e.target); const data = await api('/control/status', {{method:'POST', body:JSON.stringify({{target:fd.get('target'), qualifiers:{{}}}})}}); statusOut.textContent = JSON.stringify(data.overview, null, 2); }};
+loadCases().catch(e => {{ casesEl.innerHTML = '<div class="case">Authorization required or API unavailable.</div>'; }});
+</script>
+</body>
+</html>"""
 
 
 def _require_signed_callback(request: SignedApprovalRequest, signature: str | None) -> None:

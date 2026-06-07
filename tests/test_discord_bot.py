@@ -56,6 +56,15 @@ class FakeMessage:
         return thread
 
 
+class FakeGuild:
+    def __init__(self, member=None, guild_id=1):
+        self.id = guild_id
+        self.member = member
+
+    def get_member(self, user_id):
+        return self.member
+
+
 class FakeThread:
     def __init__(self, name):
         self.name = name
@@ -143,7 +152,9 @@ def _diagnostic_synthesis() -> DiagnosticSynthesis:
         ("pending", "pending", "", "", ""),
         ("show pending", "pending", "", "", ""),
         ("status inc-abc123?", "incident_status", "", "inc-abc123", ""),
+        ("status NOC-20260605-007", "incident_status", "", "NOC-20260605-007", ""),
         ("show incident incident-1", "incident_status", "", "incident-1", ""),
+        ("approve NOC-20260605-007 looks good", "decision", "", "NOC-20260605-007", "approved"),
         ("approve inc-abc looks good", "decision", "", "inc-abc", "approved"),
         ("reject inc-abc hold", "decision", "", "inc-abc", "rejected"),
         ("wat", "help", "", "", ""),
@@ -197,6 +208,42 @@ async def test_bot_start_uses_shared_mcp_runtime(monkeypatch):
     await bot.start()
 
     assert calls == ["connect", ("start", "token"), "disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_slash_authorization_accepts_operations_role_from_member_lookup(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_ROLE_IDS", "1412603664484270130")
+    bot = NOCDiscordBot()
+    interaction = FakeInteraction()
+    interaction.user.roles = []
+    interaction.guild = FakeGuild(member=SimpleNamespace(roles=[SimpleNamespace(id=1412603664484270130)]))
+
+    assert await bot._authorized(interaction) is True
+
+
+@pytest.mark.asyncio
+async def test_thread_message_authorized_by_parent_channel(monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNEL_IDS", "99")
+    bot = NOCDiscordBot()
+    message = FakeMessage("<@123> status noc")
+    message.channel = SimpleNamespace(id=100, parent=SimpleNamespace(id=99))
+
+    assert bot._message_authorized(message) is True
+
+
+@pytest.mark.asyncio
+async def test_wrong_guild_channel_role_is_denied(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_GUILD_IDS", "10")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNEL_IDS", "20")
+    monkeypatch.setenv("DISCORD_ALLOWED_ROLE_IDS", "30")
+    bot = NOCDiscordBot()
+    interaction = FakeInteraction()
+    interaction.guild = SimpleNamespace(id=11)
+    interaction.channel = SimpleNamespace(id=21)
+    interaction.user.roles = [SimpleNamespace(id=31)]
+
+    assert await bot._authorized(interaction) is False
 
 
 @pytest.mark.asyncio
