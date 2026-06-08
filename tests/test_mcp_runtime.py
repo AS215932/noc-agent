@@ -67,6 +67,9 @@ class FakeMCPClient:
         self.disconnected = True
         self.session = None
 
+    async def force_disconnect(self):
+        await self.disconnect()
+
 
 @pytest.fixture(autouse=True)
 def fake_client(monkeypatch):
@@ -244,7 +247,7 @@ async def test_runtime_live_health_times_out_stale_probe(monkeypatch):
     monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
     monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
     monkeypatch.setenv("XO_MCP_URL", "http://127.0.0.1:8766/mcp")
-    monkeypatch.setenv("MCP_HEALTH_TIMEOUT_SECONDS", "0.01")
+    monkeypatch.setenv("MCP_HEALTH_TIMEOUT_SECONDS", "0.05")
     FakeMCPClient.health_delay_s = 1
     runtime = MCPRuntime(owner="test")
 
@@ -254,6 +257,16 @@ async def test_runtime_live_health_times_out_stale_probe(monkeypatch):
     assert health["status"] == "degraded"
     assert health["sources"]["hyrule"]["error"] == "mcp_timeout"
     assert health["sources"]["xo"]["error"] == "mcp_timeout"
+    assert runtime.clients == {}
+    assert all(client.disconnected for client in FakeMCPClient.instances)
+
+    FakeMCPClient.health_delay_s = 0
+    await runtime.connect_tools(FakeAgent())
+    health = await runtime.live_health()
+
+    assert health["status"] == "ok"
+    assert health["sources"]["hyrule"]["tool_count"] == 1
+    assert health["sources"]["xo"]["tool_count"] == 1
 
 
 @pytest.mark.asyncio

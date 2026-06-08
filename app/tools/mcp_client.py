@@ -139,6 +139,25 @@ class HyruleMCPClient:
         self.session = None
         self._exit_stack = AsyncExitStack()
 
+    async def force_disconnect(self) -> None:
+        """Tear down a stuck owner task without routing through its command queue."""
+        send = self._command_send
+        task = self._owner_task
+        self._command_send = None
+        if send is not None:
+            await send.aclose()
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._owner_task = None
+        self.session = None
+        self._exit_stack = AsyncExitStack()
+        self._set_snapshot(MCPClientState.SHUTDOWN, error=None)
+
     async def reconnect(self) -> None:
         if self._owner_running():
             await self._send_command(MCPCommandType.RECONNECT, timeout_s=self.operation_timeout_s)

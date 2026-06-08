@@ -88,11 +88,7 @@ class MCPRuntime:
                     timeout=self.health_timeout_s,
                 )
             except TimeoutError as exc:
-                state = self.states[source]
-                state.ready = False
-                state.tool_count = 0
-                state.error = "mcp_timeout"
-                self.tools_by_source[source] = []
+                await self._reset_timed_out_source(source)
                 log_exception(
                     "mcp_health_timeout",
                     exc,
@@ -205,6 +201,28 @@ class MCPRuntime:
             state.tool_count = tool_count
             state.ready = tool_count > 0
             state.error = None
+
+    async def _reset_timed_out_source(self, source: str) -> None:
+        async with self._source_locks[source]:
+            client = self.clients.pop(source, None)
+            state = self.states[source]
+            state.ready = False
+            state.tool_count = 0
+            state.error = "mcp_timeout"
+            self.tools_by_source[source] = []
+
+        if client is None:
+            return
+
+        try:
+            force_disconnect = getattr(client, "force_disconnect", None)
+            if force_disconnect is not None:
+                await force_disconnect()
+            else:
+                await client.disconnect()
+        except Exception as exc:
+            safe = classify_exception(exc)
+            log_exception("mcp_timeout_disconnect_failed", exc, category=safe.category, owner=self.owner, source=source)
 
     async def _connect_and_register(self, client: HyruleMCPClient, source: str) -> int:
         await client.connect()
