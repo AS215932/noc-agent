@@ -114,6 +114,44 @@ def test_openrouter_key_credit_probe_degrades_on_low_remaining_limit(monkeypatch
     assert status.providers["openrouter"]["key"]["limit_remaining"] == 0.5
 
 
+def test_openrouter_key_credit_probe_scales_threshold_to_small_key_limit(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr("app.quota._OPENROUTER_CACHE", None)
+
+    def fake_get(url, **_kwargs):
+        return httpx.Response(
+            200,
+            json={"data": {"limit": 5, "limit_remaining": 5, "usage": 0}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    status = check_openrouter_credits(load_settings())
+
+    assert status.status == "ok"
+    assert status.providers["openrouter"]["key"]["limit_remaining"] == 5
+
+
+def test_openrouter_key_credit_probe_warns_near_small_key_limit_exhaustion(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr("app.quota._OPENROUTER_CACHE", None)
+
+    def fake_get(url, **_kwargs):
+        return httpx.Response(
+            200,
+            json={"data": {"limit": 5, "limit_remaining": 0.75, "usage": 4.25}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    status = check_openrouter_credits(load_settings())
+
+    assert status.status == "degraded"
+    assert "warning threshold" in status.providers["openrouter"]["key"]["message"]
+
+
 def test_openrouter_key_credit_probe_treats_null_limit_remaining_as_unlimited(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setattr("app.quota._OPENROUTER_CACHE", None)
