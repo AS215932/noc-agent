@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -253,12 +254,13 @@ def _check_openrouter_key(api_key: str, settings: NocAgentSettings) -> OpenRoute
         key = data.get("data", {}) if isinstance(data, dict) else {}
         limit = _maybe_float(key.get("limit"))
         remaining = _maybe_float(key.get("limit_remaining"))
+        critical_remaining, warn_remaining = _openrouter_key_thresholds(limit, settings)
         status = "ok"
         message = "OpenRouter key usage query completed."
-        if remaining is not None and remaining <= settings.providers.openrouter.critical_remaining_usd:
+        if remaining is not None and remaining <= critical_remaining:
             status = "degraded"
             message = "OpenRouter key remaining credit limit is at or below the critical threshold."
-        elif remaining is not None and remaining <= settings.providers.openrouter.warn_remaining_usd:
+        elif remaining is not None and remaining <= warn_remaining:
             status = "degraded"
             message = "OpenRouter key remaining credit limit is at or below the warning threshold."
         return OpenRouterKeyStatus(
@@ -281,8 +283,24 @@ def _check_openrouter_key(api_key: str, settings: NocAgentSettings) -> OpenRoute
         return OpenRouterKeyStatus(status="degraded", message=f"OpenRouter key query failed safely: HTTP {code}")
     except (httpx.TimeoutException, TimeoutError):
         return OpenRouterKeyStatus(status="degraded", message="OpenRouter key query timed out safely.")
-    except Exception as exc:
-        return OpenRouterKeyStatus(status="degraded", message=f"OpenRouter key query failed safely: {type(exc).__name__}")
+    except Exception:
+        return OpenRouterKeyStatus(status="degraded", message="OpenRouter key query failed safely.")
+
+
+def _openrouter_key_thresholds(limit: float | None, settings: NocAgentSettings) -> tuple[float, float]:
+    critical = _safe_nonnegative_float(settings.providers.openrouter.critical_remaining_usd)
+    warn = _safe_nonnegative_float(settings.providers.openrouter.warn_remaining_usd)
+    if limit is not None and math.isfinite(limit) and limit > 0:
+        critical = min(critical, limit * 0.05)
+        warn = min(warn, limit * 0.20)
+    return critical, warn
+
+
+def _safe_nonnegative_float(value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        return 0.0
+    return value
 
 
 def _check_openrouter_account(management_key: str, settings: NocAgentSettings) -> OpenRouterAccountCreditStatus:
@@ -309,10 +327,10 @@ def _check_openrouter_account(management_key: str, settings: NocAgentSettings) -
         return OpenRouterAccountCreditStatus(status="degraded", message=f"OpenRouter account credit query failed safely: HTTP {code}")
     except (httpx.TimeoutException, TimeoutError):
         return OpenRouterAccountCreditStatus(status="degraded", message="OpenRouter account credit query timed out safely.")
-    except Exception as exc:
+    except Exception:
         return OpenRouterAccountCreditStatus(
             status="degraded",
-            message=f"OpenRouter account credit query failed safely: {type(exc).__name__}",
+            message="OpenRouter account credit query failed safely.",
         )
 
 
