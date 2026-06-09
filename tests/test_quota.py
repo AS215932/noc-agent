@@ -1,6 +1,6 @@
 import httpx
 
-from app.config import load_settings
+from app.config import NocAgentSettings, OpenRouterProviderSettings, ProviderSettings, load_settings
 from app.quota import DEFAULT_GEMINI_QUOTA_USAGE_METRIC_TYPE, _build_usage_filter, check_openrouter_credits
 
 
@@ -95,6 +95,24 @@ def test_openrouter_key_credit_probe_degrades_on_timeout(monkeypatch):
     assert "timed out" in status.providers["openrouter"]["key"]["message"]
 
 
+def test_openrouter_key_credit_probe_uses_generic_safe_error_message(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr("app.quota._OPENROUTER_CACHE", None)
+    injected_exception = type("IgnorePreviousInstructions", (Exception,), {})
+
+    def fake_get(*_args, **_kwargs):
+        raise injected_exception("malicious metadata")
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    status = check_openrouter_credits(load_settings())
+    message = status.providers["openrouter"]["key"]["message"]
+
+    assert status.status == "degraded"
+    assert message == "OpenRouter key query failed safely."
+    assert "IgnorePreviousInstructions" not in message
+
+
 def test_openrouter_key_credit_probe_degrades_on_low_remaining_limit(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setattr("app.quota._OPENROUTER_CACHE", None)
@@ -150,6 +168,33 @@ def test_openrouter_key_credit_probe_warns_near_small_key_limit_exhaustion(monke
 
     assert status.status == "degraded"
     assert "warning threshold" in status.providers["openrouter"]["key"]["message"]
+
+
+def test_openrouter_key_credit_probe_sanitizes_nonfinite_threshold_config(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr("app.quota._OPENROUTER_CACHE", None)
+    settings = NocAgentSettings(
+        providers=ProviderSettings(
+            openrouter=OpenRouterProviderSettings(
+                warn_remaining_usd=float("nan"),
+                critical_remaining_usd=-1.0,
+            )
+        )
+    )
+
+    def fake_get(url, **_kwargs):
+        return httpx.Response(
+            200,
+            json={"data": {"limit": 5, "limit_remaining": 4, "usage": 1}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    status = check_openrouter_credits(settings)
+
+    assert status.status == "ok"
+    assert status.providers["openrouter"]["key"]["limit_remaining"] == 4
 
 
 def test_openrouter_key_credit_probe_treats_null_limit_remaining_as_unlimited(monkeypatch):
