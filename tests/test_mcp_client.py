@@ -20,6 +20,7 @@ The key invariants we lock down:
 """
 
 from types import SimpleNamespace
+from contextlib import suppress
 import asyncio
 
 from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
@@ -495,6 +496,38 @@ async def test_caller_timeout_abandons_hung_owner_operation(monkeypatch, owner_c
         assert await client.check_health() == 1
     finally:
         await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_force_disconnect_does_not_wait_for_slow_cancelled_owner():
+    class FakeSend:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    async def slow_cancel_cleanup():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(60)
+
+    client = HyruleMCPClient(url="http://mcp.test/mcp")
+    send = FakeSend()
+    task = asyncio.create_task(slow_cancel_cleanup())
+    client._command_send = send
+    client._owner_task = task
+
+    try:
+        await asyncio.wait_for(client.force_disconnect(), timeout=0.05)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    assert send.closed is True
+    assert client._command_send is None
+    assert client._owner_task is None
 
 
 @pytest.mark.asyncio

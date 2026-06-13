@@ -3,6 +3,7 @@ import json
 import asyncio
 import random
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable
@@ -90,7 +91,7 @@ class HyruleMCPClient:
         self._exit_stack = AsyncExitStack()
         self._reconnect_lock = asyncio.Lock()
         self.connect_timeout_s = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
-        self.health_timeout_s = float(os.getenv("MCP_HEALTH_TIMEOUT_SECONDS", "5"))
+        self.health_timeout_s = float(os.getenv("MCP_HEALTH_TIMEOUT_SECONDS", "10"))
         self.operation_timeout_s = float(os.getenv("MCP_OPERATION_TIMEOUT_SECONDS", "30"))
         self.shutdown_timeout_s = float(os.getenv("MCP_SHUTDOWN_TIMEOUT_SECONDS", "5"))
         self._command_send: Any | None = None
@@ -140,19 +141,29 @@ class HyruleMCPClient:
         self._exit_stack = AsyncExitStack()
 
     async def force_disconnect(self) -> None:
-        """Tear down a stuck owner task without routing through its command queue."""
+        """Best-effort teardown for a stuck owner task.
+
+        This path is used after a health-probe timeout. It must not raise:
+        the runtime has already marked the source degraded and removed the
+        client, and any cleanup exception would only obscure recovery. Some
+        anyio stream contexts can raise RuntimeError during cancellation if
+        their cancel scope is unwound from a different task; treat that the
+        same as a cancelled owner task and allow the next health check to
+        create a fresh client/session.
+        """
         send = self._command_send
         task = self._owner_task
         self._command_send = None
         if send is not None:
-            await send.aclose()
+            try:
+                await send.aclose()
+            except Exception:
+                pass
         if task is not None and not task.done():
             task.cancel()
-        if task is not None:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            task.add_done_callback(_consume_task_exception)
+        elif task is not None:
+            _consume_task_exception(task)
         self._owner_task = None
         self.session = None
         self._exit_stack = AsyncExitStack()
@@ -473,6 +484,11 @@ class HyruleMCPClient:
             next_reconnect_at=next_reconnect_at,
             reconnect_backoff_s=reconnect_backoff_s,
         )
+
+
+def _consume_task_exception(task: asyncio.Task) -> None:
+    with suppress(asyncio.CancelledError, Exception):
+        task.exception()
 
 
 def _looks_like_stale_session(exc: BaseException) -> bool:
