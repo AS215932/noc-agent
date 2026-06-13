@@ -26,6 +26,7 @@ class MCPRuntime:
         self.owner = owner
         self.connect_timeout_s = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
         self.health_timeout_s = float(os.getenv("MCP_HEALTH_TIMEOUT_SECONDS", "10"))
+        self.shutdown_timeout_s = float(os.getenv("MCP_SHUTDOWN_TIMEOUT_SECONDS", "5"))
         self.clients: dict[str, HyruleMCPClient] = {}
         self.tools_by_source: dict[str, list[Any]] = {"hyrule": [], "xo": []}
         self.states: dict[str, MCPSourceState] = {
@@ -217,9 +218,9 @@ class MCPRuntime:
         try:
             force_disconnect = getattr(client, "force_disconnect", None)
             if force_disconnect is not None:
-                await asyncio.wait_for(force_disconnect(), timeout=self.connect_timeout_s)
+                await force_disconnect()
             else:
-                await asyncio.wait_for(client.disconnect(), timeout=self.connect_timeout_s)
+                await asyncio.wait_for(client.disconnect(), timeout=self.shutdown_timeout_s)
         except Exception as exc:
             safe = classify_exception(exc)
             log_exception("mcp_timeout_disconnect_failed", exc, category=safe.category, owner=self.owner, source=source)

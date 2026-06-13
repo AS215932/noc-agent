@@ -3,6 +3,7 @@ import json
 import asyncio
 import random
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable
@@ -160,13 +161,9 @@ class HyruleMCPClient:
                 pass
         if task is not None and not task.done():
             task.cancel()
-        if task is not None:
-            try:
-                await task
-            except (asyncio.CancelledError, RuntimeError):
-                pass
-            except Exception:
-                pass
+            task.add_done_callback(_consume_task_exception)
+        elif task is not None:
+            _consume_task_exception(task)
         self._owner_task = None
         self.session = None
         self._exit_stack = AsyncExitStack()
@@ -487,6 +484,11 @@ class HyruleMCPClient:
             next_reconnect_at=next_reconnect_at,
             reconnect_backoff_s=reconnect_backoff_s,
         )
+
+
+def _consume_task_exception(task: asyncio.Task) -> None:
+    with suppress(asyncio.CancelledError, Exception):
+        task.exception()
 
 
 def _looks_like_stale_session(exc: BaseException) -> bool:
