@@ -1,9 +1,9 @@
-# AS215932 NOC Agent
+# Hyrule Networks (AS215932) NOC Agent
 
-`noc-agent` is the operator-facing investigation service for AS215932. It
-accepts monitoring events, runs structured incident analysis, records
-human-review proposals, and keeps a fallback local control plane available even
-when chat tooling is unreachable.
+`noc-agent` is the operator-facing investigation service for Hyrule Networks
+(AS215932). It accepts monitoring events, runs structured incident analysis,
+records human-review proposals, and keeps a fallback local control plane available
+even when chat tooling is unreachable.
 
 ## Runtime shape
 
@@ -134,3 +134,7 @@ For the new default backend, migrate from `GEMINI_API_KEY` to `OPENROUTER_API_KE
 ## Tests
 
 See [TESTING.md](TESTING.md).
+
+---
+
+*Part of [Hyrule Networks (AS215932)](https://github.com/AS215932).*
