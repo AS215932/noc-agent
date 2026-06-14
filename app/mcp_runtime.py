@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
 from app import log
@@ -26,6 +27,7 @@ class MCPRuntime:
         self.owner = owner
         self.connect_timeout_s = float(os.getenv("MCP_CONNECT_TIMEOUT_SECONDS", "15"))
         self.health_timeout_s = float(os.getenv("MCP_HEALTH_TIMEOUT_SECONDS", "10"))
+        self.health_url_timeout_s = float(os.getenv("MCP_HEALTH_URL_TIMEOUT_SECONDS", "3"))
         self.shutdown_timeout_s = float(os.getenv("MCP_SHUTDOWN_TIMEOUT_SECONDS", "5"))
         self.clients: dict[str, HyruleMCPClient] = {}
         self.tools_by_source: dict[str, list[Any]] = {"hyrule": [], "xo": []}
@@ -170,19 +172,32 @@ class MCPRuntime:
     async def _refresh_source_health(self, source: str, config_factory: Any) -> None:
         async with self._source_locks[source]:
             state = self.states[source]
+            try:
+                config = config_factory()
+            except Exception as exc:
+                safe = classify_exception(exc)
+                state.ready = False
+                state.tool_count = 0
+                state.error = safe.category
+                self.tools_by_source[source] = []
+                log_exception("mcp_health_config_failed", exc, category=safe.category, owner=self.owner, source=source)
+                return
+
+            health_url = config.get("health_url")
+            if health_url and state.tool_count > 0:
+                try:
+                    if await self._probe_health_url(health_url):
+                        state.ready = True
+                        state.error = None
+                        return
+                except Exception as exc:
+                    safe = classify_exception(exc)
+                    log_exception("mcp_health_url_probe_failed", exc, category=safe.category, owner=self.owner, source=source)
+                    # Fall through to the full MCP health probe.
+
             client = self.clients.get(source)
             if client is None:
                 if state.ready:
-                    return
-                try:
-                    config = config_factory()
-                except Exception as exc:
-                    safe = classify_exception(exc)
-                    state.ready = False
-                    state.tool_count = 0
-                    state.error = safe.category
-                    self.tools_by_source[source] = []
-                    log_exception("mcp_health_config_failed", exc, category=safe.category, owner=self.owner, source=source)
                     return
                 await self._connect_source_unlocked(config)
                 return
@@ -202,6 +217,19 @@ class MCPRuntime:
             state.tool_count = tool_count
             state.ready = tool_count > 0
             state.error = None
+
+    async def _probe_health_url(self, health_url: str) -> bool:
+        """Lightweight HTTP probe of the gateway's native /health endpoint.
+
+        Streamable-HTTP MCP gateways (e.g. supergateway for XO) can take
+        several seconds to churn sessions when a full ``tools/list`` round-trip
+        is used. Their dedicated health endpoint is stateless and fast, so we
+        use it as the primary liveness signal once we have already loaded the
+        tool list. A failure here falls back to the full MCP health probe.
+        """
+        async with httpx.AsyncClient(timeout=self.health_url_timeout_s) as client:
+            response = await client.get(health_url)
+            return response.status_code == 200
 
     async def _reset_timed_out_source(self, source: str) -> None:
         async with self._source_locks[source]:
@@ -264,7 +292,12 @@ class MCPRuntime:
     def _hyrule_config() -> dict[str, Any]:
         url = os.getenv("HYRULE_MCP_URL", "").strip()
         command = None if url else shlex.split(os.environ["HYRULE_MCP_CMD"])
-        return {"source": "hyrule", "command": command, "url": url or None}
+        return {
+            "source": "hyrule",
+            "command": command,
+            "url": url or None,
+            "health_url": os.getenv("HYRULE_MCP_HEALTH_URL", "").strip() or None,
+        }
 
     @staticmethod
     def _xo_config() -> dict[str, Any]:
@@ -273,7 +306,13 @@ class MCPRuntime:
         env = os.environ.copy()
         env.setdefault("XO_URL", "https://xo.servify.network")
         env.setdefault("XO_MCP_ENABLE_ACTIONS", "0")
-        return {"source": "xo", "command": command, "url": url or None, "env": env}
+        return {
+            "source": "xo",
+            "command": command,
+            "url": url or None,
+            "health_url": os.getenv("XO_MCP_HEALTH_URL", "").strip() or None,
+            "env": env,
+        }
 
 
 TRIAGE_TOOLS = {

@@ -33,6 +33,7 @@ class FakeMCPClient:
         self.url = url
         self.session = None
         self.disconnected = False
+        self.check_health_called = False
         FakeMCPClient.instances.append(self)
 
     async def connect(self):
@@ -47,6 +48,7 @@ class FakeMCPClient:
         return [SimpleNamespace(name=f"{prefix}_tool", description="tool")]
 
     async def check_health(self):
+        self.check_health_called = True
         if self.url == FakeMCPClient.fail_url:
             raise RuntimeError("health failed")
         if FakeMCPClient.health_delay_s:
@@ -330,3 +332,93 @@ async def test_runtime_disconnect_closes_clients(monkeypatch):
 
     assert all(client.disconnected for client in FakeMCPClient.instances)
     assert runtime.health()["status"] == "degraded"
+
+
+class FakeHttpxClient:
+    def __init__(self, *, status_code: int = 200, raise_exc: BaseException | None = None):
+        self.status_code = status_code
+        self.raise_exc = raise_exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url: str):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+
+        class Response:
+            pass
+
+        Response.status_code = self.status_code
+        return Response()
+
+
+def _patch_httpx(monkeypatch, *, status_code: int = 200, raise_exc: BaseException | None = None):
+    def _async_client(**kwargs):
+        return FakeHttpxClient(status_code=status_code, raise_exc=raise_exc)
+
+    monkeypatch.setattr("app.mcp_runtime.httpx.AsyncClient", _async_client)
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_gateway_health_url_when_available(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    hyrule_url = "http://127.0.0.1:8765/mcp"
+    xo_url = "http://127.0.0.1:8766/mcp"
+    monkeypatch.setenv("HYRULE_MCP_URL", hyrule_url)
+    monkeypatch.setenv("XO_MCP_URL", xo_url)
+    monkeypatch.setenv("HYRULE_MCP_HEALTH_URL", "http://127.0.0.1:8765/health")
+    monkeypatch.setenv("XO_MCP_HEALTH_URL", "http://127.0.0.1:8766/health")
+    _patch_httpx(monkeypatch, status_code=200)
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    # Simulate a stale full-check failure; the gateway health URL should still
+    # report the source ready so monitoring probes don't flap on slow MCP sessions.
+    FakeMCPClient.fail_url = hyrule_url
+    health = await runtime.live_health()
+
+    assert health["status"] == "ok"
+    hyrule_client = next(c for c in FakeMCPClient.instances if c.url == hyrule_url)
+    xo_client = next(c for c in FakeMCPClient.instances if c.url == xo_url)
+    assert hyrule_client.check_health_called is False
+    assert xo_client.check_health_called is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_falls_back_to_full_health_when_gateway_health_fails(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    xo_url = "http://127.0.0.1:8766/mcp"
+    monkeypatch.setenv("HYRULE_MCP_URL", "http://127.0.0.1:8765/mcp")
+    monkeypatch.setenv("XO_MCP_URL", xo_url)
+    monkeypatch.setenv("XO_MCP_HEALTH_URL", "http://127.0.0.1:8766/health")
+    _patch_httpx(monkeypatch, status_code=503)
+    runtime = MCPRuntime(owner="test")
+
+    await runtime.connect_tools(FakeAgent())
+    FakeMCPClient.fail_url = xo_url
+    health = await runtime.live_health()
+
+    assert health["status"] == "degraded"
+    assert health["sources"]["xo"]["ready"] is False
+    xo_client = next(c for c in FakeMCPClient.instances if c.url == xo_url)
+    assert xo_client.check_health_called is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_ignores_health_url_until_tools_are_known(monkeypatch):
+    monkeypatch.delenv("NOC_AGENT_DISABLE_MCP", raising=False)
+    hyrule_url = "http://127.0.0.1:8765/mcp"
+    monkeypatch.setenv("HYRULE_MCP_URL", hyrule_url)
+    monkeypatch.setenv("HYRULE_MCP_HEALTH_URL", "http://127.0.0.1:8765/health")
+    # If the health URL were consulted before tools were loaded, this would raise.
+    _patch_httpx(monkeypatch, raise_exc=RuntimeError("health url consulted too early"))
+    runtime = MCPRuntime(owner="test")
+
+    health = await runtime.live_health()
+
+    assert health["sources"]["hyrule"]["ready"] is True
+    assert health["sources"]["hyrule"]["tool_count"] == 1

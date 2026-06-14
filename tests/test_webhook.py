@@ -79,6 +79,22 @@ async def test_health_mcp_requires_registered_tools(mocker):
     runtime.states["xo"].ready = True
     runtime.states["xo"].tool_count = 3
     mocker.patch("app.main.mcp_runtime", runtime)
+    mocker.patch.object(
+        runtime,
+        "live_health",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "status": "degraded",
+            "hyrule": False,
+            "xo": True,
+            "hyrule_tool_count": 0,
+            "xo_tool_count": 3,
+            "sources": {
+                "hyrule": {"ready": False, "tool_count": 0, "error": None},
+                "xo": {"ready": True, "tool_count": 3, "error": None},
+            },
+        },
+    )
     http_response = Response()
 
     response = await health_mcp(http_response)
@@ -87,6 +103,7 @@ async def test_health_mcp_requires_registered_tools(mocker):
     assert response["hyrule"] is False
     assert response["xo"] is True
     assert response["hyrule_tool_count"] == 0
+    assert response["xo_tool_count"] == 3
     assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
 
