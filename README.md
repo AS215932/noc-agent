@@ -59,6 +59,33 @@ nocctl decide <incident-id> approved --operator svag --comment "reviewed"
 In production this is intended to run on `noc` over existing SSH/VPN access,
 with `NOC_CONTROL_URL=http://127.0.0.1:8000`.
 
+## Approved remediation (gated, no-op first)
+
+Approved remediation execution is **off by default**. An approved proposal only
+runs when `NOC_ENABLE_APPROVED_EXECUTION=1`, and even then the first phase is
+inert: with `NOC_ENABLE_NOOP_ROLLBACK_GUARDS=1`, execution routes through the
+hyrule-mcp no-op rollback guards (`prepare_commit_confirm` →, on verify,
+`confirm_change` or `rollback_change`) with `action_class="noop_rollback_guard"`
+— **no service restart, no FRR/PF/nftables/WireGuard mutation**. Each execution
+record carries `execution_mode`, `guard_id`, an `authorization_fingerprint`
+(the raw HMAC signature is never persisted), and an `execution_audit` trail.
+
+| State | Meaning |
+|---|---|
+| `execution_disabled` | approved but `NOC_ENABLE_APPROVED_EXECUTION` is off |
+| `noop_guards_prepared` | no-op guard installed for each action |
+| `verified` | guard confirmed (no-op execution finalized) |
+| `verification_failed` | guard could not confirm; rolled back |
+
+Operators can mint a signed authorization offline (matching the MCP HMAC scheme)
+for manual/smoke use:
+
+```bash
+nocctl approvals sign --proposal-id <case> --action-id <id> --operator svag --action-class noop_rollback_guard --ttl 300
+```
+
+Signing requires `HYRULE_MCP_ACTION_SIGNING_SECRET` (or `NOC_APPROVAL_SIGNING_SECRET`).
+
 ## Discord bot
 
 When `DISCORD_BOT_TOKEN` is present, the service starts a `discord.py` bot that
@@ -91,7 +118,10 @@ instead of inventing a configuration story.
 - `NOC_REDIS_URL`
 - `HYRULE_MCP_URL`
 - `NOC_CONTROL_TOKEN`
-- `NOC_APPROVAL_SIGNING_SECRET`
+- `NOC_APPROVAL_SIGNING_SECRET` (also accepts `HYRULE_MCP_ACTION_SIGNING_SECRET`)
+- `NOC_ENABLE_APPROVED_EXECUTION` (default `0`; master switch for any execution)
+- `NOC_ENABLE_NOOP_ROLLBACK_GUARDS` (default `0`; route execution through inert no-op guards)
+- `NOC_ACTION_AUTH_TTL_SECONDS` (default `300`)
 - `DISCORD_BOT_TOKEN`
 - `DISCORD_ALLOWED_GUILD_IDS`
 - `DISCORD_ALLOWED_CHANNEL_IDS`

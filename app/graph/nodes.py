@@ -219,48 +219,28 @@ class NodeRunner:
             assert_json_serializable_state(update)
             return update
 
+        # Execution is gated off by default: an approved proposal never touches a
+        # host unless NOC_ENABLE_APPROVED_EXECUTION=1. When NOC_ENABLE_NOOP_
+        # ROLLBACK_GUARDS=1, execution routes through inert no-op rollback guards
+        # (no real mutation) instead of the privileged action tools.
+        if not _flag("NOC_ENABLE_APPROVED_EXECUTION"):
+            update = {"current_step": "execute_approved_remediation", "updated_at": utc_now(), "approval_state": "execution_disabled"}
+            assert_json_serializable_state(update)
+            return update
+
+        noop_guards = _flag("NOC_ENABLE_NOOP_ROLLBACK_GUARDS")
         actions = _stored_structured_actions(state)
         results = []
         for action in actions:
-            action_class = action.get("type")
-            arguments = dict(action.get("inputs") or {})
-            arguments["action_authorization"] = _action_authorization(state, action)
-            tool_name = None
-            if action_class == "restart_service":
-                tool_name = "os_service_restart"
-            elif action_class == "acknowledge_icinga":
-                tool_name = "icinga_acknowledge_alert"
-                arguments = {
-                    "host_name": arguments.get("host") or arguments.get("host_name"),
-                    "service_name": arguments.get("service") or arguments.get("service_name"),
-                    "author": decision.get("operator", "noc-agent"),
-                    "comment": arguments.get("comment") or decision.get("comment", "Approved by NOC operator."),
-                    "action_authorization": arguments["action_authorization"],
-                }
-            if tool_name is None:
-                results.append({"action": action, "ok": False, "result": {"error_type": "policy_blocked", "sanitized_error": "Unsupported action type"}})
-                continue
-            try:
-                result = await self.runtime.mcp_runtime.call_tool(
-                    "hyrule",
-                    tool_name,
-                    arguments,
-                )
-            except Exception as exc:
-                result = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
-            results.append({
-                "action": action,
-                "approved_by": decision.get("operator", ""),
-                "approval_comment": decision.get("comment", ""),
-                "approved_at": decision.get("decided_at") or utc_now(),
-                "result": _jsonish(result),
-                "ok": bool(isinstance(result, dict) and result.get("ok")),
-            })
+            if noop_guards:
+                results.append(await self._prepare_noop_guard(state, action, decision))
+            else:
+                results.append(await self._execute_real_action(state, action, decision))
 
         if not actions:
             approval_state = "approved_no_executable_action"
         elif all(item["ok"] for item in results):
-            approval_state = "executed"
+            approval_state = "noop_guards_prepared" if noop_guards else "executed"
         else:
             approval_state = "execution_failed"
         update = {
@@ -272,10 +252,96 @@ class NodeRunner:
         assert_json_serializable_state(update)
         return update
 
+    async def _execute_real_action(self, state: WorkflowState, action: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+        action_class = action.get("type")
+        arguments = dict(action.get("inputs") or {})
+        arguments["action_authorization"] = _action_authorization(state, action)
+        tool_name = None
+        if action_class == "restart_service":
+            tool_name = "os_service_restart"
+        elif action_class == "acknowledge_icinga":
+            tool_name = "icinga_acknowledge_alert"
+            arguments = {
+                "host_name": arguments.get("host") or arguments.get("host_name"),
+                "service_name": arguments.get("service") or arguments.get("service_name"),
+                "author": decision.get("operator", "noc-agent"),
+                "comment": arguments.get("comment") or decision.get("comment", "Approved by NOC operator."),
+                "action_authorization": arguments["action_authorization"],
+            }
+        if tool_name is None:
+            return {"action": action, "ok": False, "result": {"error_type": "policy_blocked", "sanitized_error": "Unsupported action type"}}
+        try:
+            result = await self.runtime.mcp_runtime.call_tool("hyrule", tool_name, arguments)
+        except Exception as exc:
+            result = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
+        return {
+            "action": action,
+            "execution_mode": "real_action",
+            "approved_by": decision.get("operator", ""),
+            "approval_comment": decision.get("comment", ""),
+            "approved_at": decision.get("decided_at") or utc_now(),
+            "result": _jsonish(result),
+            "ok": bool(isinstance(result, dict) and result.get("ok")),
+        }
+
+    async def _prepare_noop_guard(self, state: WorkflowState, action: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+        auth = _action_authorization(state, action, action_class="noop_rollback_guard")
+        inputs = dict(action.get("inputs") or {})
+        host = str(inputs.get("host") or inputs.get("host_name") or "")
+        arguments = {
+            "host": host,
+            "service": inputs.get("service") or inputs.get("service_name"),
+            "action_authorization": auth,
+        }
+        try:
+            result = await self.runtime.mcp_runtime.call_tool("hyrule", "prepare_commit_confirm", arguments)
+        except Exception as exc:
+            result = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
+        guard = result.get("guard") if isinstance(result, dict) else None
+        guard_id = guard.get("guard_id") if isinstance(guard, dict) else None
+        ok = guard_id is not None
+        return {
+            "action": action,
+            "execution_mode": "noop_guard",
+            "guard_id": guard_id,
+            "approval_source": "operator_signed",
+            "authorization_fingerprint": _authorization_fingerprint(auth),
+            "approved_by": decision.get("operator", ""),
+            "approved_at": decision.get("decided_at") or utc_now(),
+            "result": _jsonish(result),
+            "execution_audit": [{"ts": utc_now(), "event": "guard_prepared" if ok else "guard_prepare_failed", "operator": decision.get("operator", ""), "guard_id": guard_id}],
+            "ok": ok,
+        }
+
+    async def _finalize_noop_guard(self, state: WorkflowState, item: dict[str, Any]) -> dict[str, Any]:
+        guard_id = item.get("guard_id")
+        action = item.get("action") or {}
+        if not guard_id:
+            return {"guard_id": None, "mode": "noop_guard", "ok": False, "event": "missing_guard"}
+        auth = _action_authorization(state, action, action_class="noop_rollback_guard")
+        # An inert no-op guard changes nothing, so a successful confirm finalizes
+        # execution; a confirm failure falls back to an explicit rollback.
+        try:
+            result = await self.runtime.mcp_runtime.call_tool("hyrule", "confirm_change", {"guard_id": guard_id, "action_authorization": auth})
+        except Exception as exc:
+            result = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
+        guard = result.get("guard") if isinstance(result, dict) else None
+        confirmed = isinstance(guard, dict) and guard.get("status") == "confirmed"
+        if confirmed:
+            return {"guard_id": guard_id, "mode": "noop_guard", "ok": True, "event": "guard_confirmed", "result": _jsonish(result)}
+        try:
+            rollback = await self.runtime.mcp_runtime.call_tool("hyrule", "rollback_change", {"guard_id": guard_id, "action_authorization": auth})
+        except Exception as exc:
+            rollback = {"ok": False, "error_type": type(exc).__name__, "sanitized_error": str(exc)}
+        return {"guard_id": guard_id, "mode": "noop_guard", "ok": False, "event": "guard_rolled_back", "result": _jsonish(rollback)}
+
     async def verify_remediation(self, state: WorkflowState) -> dict[str, Any]:
         executed = [item for item in state.get("executed_actions", []) if item.get("ok")]
         results = []
         for item in executed:
+            if item.get("execution_mode") == "noop_guard":
+                results.append(await self._finalize_noop_guard(state, item))
+                continue
             action = item.get("action") or {}
             inputs = action.get("inputs") if isinstance(action.get("inputs"), dict) else action
             host = str(inputs.get("host") or inputs.get("host_name") or "")
@@ -450,13 +516,19 @@ def _approved_icinga_ack_actions(state: WorkflowState, proposed: list[str] | Non
     ]
 
 
-def _action_authorization(state: WorkflowState, action: dict[str, Any]) -> dict[str, Any]:
+def _flag(name: str) -> bool:
+    return os.getenv(name, "0") == "1"
+
+
+def _action_authorization(
+    state: WorkflowState, action: dict[str, Any], *, action_class: str | None = None
+) -> dict[str, Any]:
     expiry = int(time.time()) + int(os.getenv("NOC_ACTION_AUTH_TTL_SECONDS", "300"))
     payload = {
         "action_id": str(action.get("action_id") or ""),
         "case_id": str(state.get("incident_id") or ""),
         "operator": str((state.get("operator_decision") or {}).get("operator") or "noc-agent"),
-        "action_class": str(action.get("type") or ""),
+        "action_class": action_class or str(action.get("type") or ""),
         "expiry": expiry,
     }
     secret = os.getenv("HYRULE_MCP_ACTION_SIGNING_SECRET") or os.getenv("NOC_APPROVAL_SIGNING_SECRET", "")
@@ -464,6 +536,15 @@ def _action_authorization(state: WorkflowState, action: dict[str, Any]) -> dict[
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         payload["signature"] = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return payload
+
+
+def _authorization_fingerprint(authorization: dict[str, Any]) -> str:
+    """Stable fingerprint of an authorization for audit, without persisting the
+    raw HMAC signature."""
+    signature = str(authorization.get("signature") or "")
+    if not signature:
+        return ""
+    return "sha256:" + hashlib.sha256(signature.encode()).hexdigest()[:32]
 
 
 def _prometheus_instance_for(host: str) -> str | None:

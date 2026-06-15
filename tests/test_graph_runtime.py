@@ -211,7 +211,9 @@ async def test_inject_case_event_retries_without_as_node(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_approved_restart_proposal_executes_node_exporter_restart():
+async def test_approved_restart_proposal_executes_node_exporter_restart(monkeypatch):
+    monkeypatch.setenv("NOC_ENABLE_APPROVED_EXECUTION", "1")
+
     class FakeMCPRuntime:
         def __init__(self):
             self.calls = []
@@ -266,7 +268,9 @@ async def test_approved_restart_proposal_executes_node_exporter_restart():
 
 
 @pytest.mark.asyncio
-async def test_text_only_proposal_does_not_execute_remediation():
+async def test_text_only_proposal_does_not_execute_remediation(monkeypatch):
+    monkeypatch.setenv("NOC_ENABLE_APPROVED_EXECUTION", "1")
+
     class FakeMCPRuntime:
         def __init__(self):
             self.calls = []
