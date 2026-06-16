@@ -122,7 +122,15 @@ class IncidentMemory:
             cases: list[dict[str, Any]] = []
             async for key in self._redis.scan_iter("noc:case:*"):
                 key_text = _redis_text(key)
-                if ":events:" in key_text or ":fingerprint:" in key_text or ":number:" in key_text or ":daily:" in key_text:
+                # Skip non-string index keys (e.g. the noc:case:expiry zset),
+                # which would raise WRONGTYPE on GET.
+                if (
+                    ":events:" in key_text
+                    or ":fingerprint:" in key_text
+                    or ":number:" in key_text
+                    or ":daily:" in key_text
+                    or ":expiry" in key_text
+                ):
                     continue
                 raw = await self._redis.get(key)
                 if raw:

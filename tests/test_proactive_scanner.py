@@ -113,10 +113,14 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
         {
             "changes(up[2h])": _vector(({"instance": "api:9100", "job": "node-infra"}, "9")),
             "increase(node_systemd_service_restart_total[2h])": _vector(
-                ({"instance": "api:9100", "name": "hyrule-cloud"}, "4"),
+                ({"instance": "api:9100", "name": "hyrule-cloud"}, "6"),
+                ({"instance": "api:9100", "name": "cloud-init-main.service"}, "5"),  # benign → ignored
             ),
-            'node_systemd_unit_state{state="failed"}': _vector(
+            # The failed-unit query now requires a recent transition; the mock
+            # only returns units that already satisfy it.
+            "node_systemd_unit_state": _vector(
                 ({"instance": "mon:9100", "name": "vector"}, "1"),
+                ({"instance": "rtr:9100", "name": "unbound-resolvconf.service"}, "1"),  # benign → ignored
             ),
         }
     )
@@ -124,11 +128,29 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
     assert scrape and scrape[0].severity == "HIGH" and scrape[0].category == "scrape"
 
     churn = await scanner.rule_service_churn(_ctx(runtime))
-    cats = {hs.title.split()[0] for hs in churn}
-    assert any(hs.severity == "HIGH" for hs in churn)
-    assert any("failed" in hs.summary for hs in churn)
-    assert len(churn) == 2
-    assert cats  # smoke: titles populated
+    units = {hs.key for hs in churn}
+    # benign cloud-init / *-resolvconf units are filtered out
+    assert units == {"api:hyrule-cloud", "mon:vector"}
+    churn_hs = next(hs for hs in churn if hs.key == "api:hyrule-cloud")
+    failed_hs = next(hs for hs in churn if hs.key == "mon:vector")
+    assert churn_hs.severity == "HIGH"  # 6 restarts
+    assert failed_hs.severity == "MEDIUM" and "failed state within the last 2h" in failed_hs.summary
+
+
+def test_benign_unit_matcher_filters_known_noise():
+    m = scanner._benign_unit_matcher()
+    for unit in ("cloud-init-main.service", "cloud-init-network", "unbound-resolvconf.service", "openipmi", "cloud-final.service"):
+        assert scanner._is_benign_unit(unit, m), unit
+    for unit in ("hyrule-cloud", "vector.service", "apache2.service", "knot.service"):
+        assert not scanner._is_benign_unit(unit, m), unit
+
+
+def test_benign_unit_matcher_env_extension(monkeypatch):
+    monkeypatch.setenv("NOC_PROACTIVE_IGNORE_UNITS", "apache2, foo.*")
+    m = scanner._benign_unit_matcher()
+    assert scanner._is_benign_unit("apache2.service", m)
+    assert scanner._is_benign_unit("foobar", m)
+    assert not scanner._is_benign_unit("hyrule-cloud", m)
 
 
 @pytest.mark.asyncio
