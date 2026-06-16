@@ -89,3 +89,92 @@ async def test_handoff_swallows_errors():
 
     handoff = GitHubHandoff(token="t", repo="r", requester=boom)
     assert await handoff.ensure_candidate_issue(_hotspot()) is None
+
+
+# --- GitHub App auth ------------------------------------------------------
+
+
+def _test_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+@pytest.mark.asyncio
+async def test_github_app_auth_mints_and_caches():
+    from app.proactive.handoff import GitHubAppAuth
+
+    calls = []
+
+    async def fake_request(method, path, *, params=None, json=None, headers=None):
+        calls.append((method, path))
+        assert headers and headers["Authorization"].startswith("Bearer ")
+        if path.endswith("/installation"):
+            return 200, {"id": 42}
+        if path.endswith("/access_tokens"):
+            return 201, {"token": "ghs_minted", "expires_at": "2999-01-01T00:00:00Z"}
+        raise AssertionError(path)
+
+    auth = GitHubAppAuth(
+        app_id="4071799", private_key=_test_pem(), repo="AS215932/network-operations", requester=fake_request
+    )
+    assert await auth.token() == "ghs_minted"
+    assert ("GET", "/repos/AS215932/network-operations/installation") in calls
+    # second call is served from cache (no extra resolve/mint round-trips)
+    n = len(calls)
+    assert await auth.token() == "ghs_minted"
+    assert len(calls) == n
+
+
+@pytest.mark.asyncio
+async def test_github_app_auth_skips_lookup_with_explicit_installation_id():
+    from app.proactive.handoff import GitHubAppAuth
+
+    async def fake_request(method, path, *, params=None, json=None, headers=None):
+        assert not path.endswith("/installation")  # must not look it up
+        return 201, {"token": "ghs_x", "expires_at": "2999-01-01T00:00:00Z"}
+
+    auth = GitHubAppAuth(app_id="1", private_key=_test_pem(), repo="o/r", installation_id=99, requester=fake_request)
+    assert await auth.token() == "ghs_x"
+
+
+def test_handoff_from_env_prefers_app(monkeypatch, tmp_path):
+    from app.proactive.handoff import handoff_from_env
+
+    pem_file = tmp_path / "app.pem"
+    pem_file.write_text("-----BEGIN PRIVATE KEY-----\nstub\n-----END PRIVATE KEY-----")
+    monkeypatch.setenv("NOC_GITHUB_APP_ID", "4071799")
+    monkeypatch.setenv("NOC_GITHUB_APP_PRIVATE_KEY_PATH", str(pem_file))
+    monkeypatch.setenv("NOC_GITHUB_TOKEN", "pat_should_be_ignored")
+    handoff = handoff_from_env("AS215932/network-operations")
+    assert handoff is not None
+    assert handoff._token_provider is not None  # App mode wins over PAT
+
+
+def test_handoff_from_env_falls_back_to_pat(monkeypatch):
+    from app.proactive.handoff import handoff_from_env
+
+    for var in ("NOC_GITHUB_APP_ID", "NOC_GITHUB_APP_PRIVATE_KEY", "NOC_GITHUB_APP_PRIVATE_KEY_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NOC_GITHUB_TOKEN", "pat_x")
+    handoff = handoff_from_env("o/r")
+    assert handoff is not None and handoff._token_provider is None and handoff._token == "pat_x"
+
+
+def test_handoff_from_env_none_when_unconfigured(monkeypatch):
+    from app.proactive.handoff import handoff_from_env
+
+    for var in (
+        "NOC_GITHUB_APP_ID",
+        "NOC_GITHUB_APP_PRIVATE_KEY",
+        "NOC_GITHUB_APP_PRIVATE_KEY_PATH",
+        "NOC_GITHUB_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert handoff_from_env("o/r") is None

@@ -143,7 +143,9 @@ Proactive config (in-code defaults are conservative; the deployment env enables 
 - `NOC_PROACTIVE_HANDOFF_ENABLED` (default `0`) + `NOC_PROACTIVE_HANDOFF_REPO` (default `AS215932/network-operations`)
 - `NOC_PROACTIVE_SEVERITY_FLOOR` (default `MEDIUM`)
 - `NOC_PROACTIVE_MEMORY_DIR` (default `/var/lib/noc-agent/memory`) / `NOC_PROACTIVE_STATE_DIR` (default `/var/lib/noc-agent/proactive`)
-- `NOC_GITHUB_TOKEN` (issues-scoped; required only for handoff)
+- Handoff auth (only needed when `NOC_PROACTIVE_HANDOFF_ENABLED=1`), in preference order:
+  - **GitHub App (recommended):** `NOC_GITHUB_APP_ID` + the private key via `NOC_GITHUB_APP_PRIVATE_KEY_PATH` (a PEM file; Vault Agent renders it on `noc`) or inline `NOC_GITHUB_APP_PRIVATE_KEY`. The installation is auto-resolved from the repo; override with `NOC_GITHUB_APP_INSTALLATION_ID`. The app mints short-lived installation tokens at call time (cached). App needs Issues: read/write + Metadata: read on the handoff repo.
+  - **PAT fallback:** `NOC_GITHUB_TOKEN` (fine-grained, issues-scoped).
 - `NOC_PROACTIVE_ICINGA_URL` / `NOC_PROACTIVE_ICINGA_CHECK` (optional passive heartbeat; reuses `ICINGA_API_USER`/`ICINGA_API_PASSWORD`)
 
 Settings can also be set under a `[proactive]` table in the model-config TOML;
