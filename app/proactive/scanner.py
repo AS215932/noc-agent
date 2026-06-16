@@ -16,6 +16,8 @@ via :meth:`MCPRuntime.call_tool`), wrapped so a single rule failure degrades to
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -28,6 +30,35 @@ from app.safe_errors import classify_exception, log_exception
 
 # Filesystem fstypes that are not real persistent storage.
 _FS_EXCLUDE = r'fstype!~"tmpfs|ramfs|overlay|squashfs|devtmpfs|fuse.*|nsfs|autofs"'
+
+# Systemd units that are routinely/benignly "failed" and are not actionable
+# early-warning signals: cloud-init oneshots that exit non-zero by design,
+# resolvconf shims, IPMI on VMs without a BMC, etc. A chronically-failed unit
+# (e.g. an abandoned apache2 dead for months) is steady state, not an emerging
+# problem — so the failed-unit rule also requires a *recent* transition. Extend
+# the ignore list at deploy time with NOC_PROACTIVE_IGNORE_UNITS (comma list of
+# substrings/regex fragments).
+_BENIGN_UNIT_PATTERNS: tuple[str, ...] = (
+    r"cloud-init.*",
+    r"cloud-config.*",
+    r"cloud-final.*",
+    r".*-resolvconf",
+    r"openipmi",
+    r"ipmi.*",
+)
+
+
+def _benign_unit_matcher() -> re.Pattern[str]:
+    patterns = list(_BENIGN_UNIT_PATTERNS)
+    extra = os.getenv("NOC_PROACTIVE_IGNORE_UNITS", "").strip()
+    if extra:
+        patterns.extend(p.strip() for p in extra.split(",") if p.strip())
+    return re.compile(r"^(?:" + "|".join(patterns) + r")(?:\.service)?$", re.IGNORECASE)
+
+
+def _is_benign_unit(unit: str, matcher: re.Pattern[str]) -> bool:
+    name = unit[:-len(".service")] if unit.endswith(".service") else unit
+    return bool(matcher.match(unit) or matcher.match(name))
 
 
 @dataclass(slots=True)
@@ -266,11 +297,19 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
 
 
 async def rule_service_churn(ctx: ScanContext) -> list[Hotspot]:
-    """Systemd unit restart churn or a failed unit."""
+    """Recent systemd restart churn, or a *newly* failed unit.
+
+    Deliberately ignores chronically-failed and benign units: a unit dead for
+    weeks is steady state (Icinga/reactive owns it), and oneshots like
+    cloud-init are "failed" by design. We require a recent state transition and
+    skip the benign-unit list so the proactive digest stays actionable."""
     hotspots: dict[str, Hotspot] = {}
+    benign = _benign_unit_matcher()
     for sample in await ctx.prom("increase(node_systemd_service_restart_total[2h]) >= 3"):
         host = instance_host(sample.labels.get("instance", "")) or "host"
         unit = sample.labels.get("name") or sample.labels.get("unit") or "unit"
+        if _is_benign_unit(unit, benign):
+            continue
         restarts = int(sample.value)
         sev: Severity = "HIGH" if restarts >= 6 else "MEDIUM"
         key = f"{host}:{unit}"
@@ -294,24 +333,33 @@ async def rule_service_churn(ctx: ScanContext) -> list[Hotspot]:
             recommended_checks=[f"os_service_logs {unit} on {host}", "check for crash loop / config error"],
             suggested_specialist="infrastructure",
         )
-    for sample in await ctx.prom('node_systemd_unit_state{state="failed"} == 1'):
+    # Only units that *entered* failed within the window — not chronic failures.
+    recent_failed = (
+        'node_systemd_unit_state{state="failed"} == 1 '
+        'and changes(node_systemd_unit_state{state="failed"}[2h]) > 0'
+    )
+    for sample in await ctx.prom(recent_failed):
         host = instance_host(sample.labels.get("instance", "")) or "host"
         unit = sample.labels.get("name") or sample.labels.get("unit") or "unit"
+        if _is_benign_unit(unit, benign):
+            continue
         key = f"{host}:{unit}"
+        if key in hotspots:  # already flagged for churn (a stronger signal)
+            continue
         hotspots[key] = Hotspot(
             rule_id="service_churn",
             key=key,
             category="service",
-            severity="HIGH",
-            score=340.0,
-            title=f"{unit} failed on {host}",
+            severity="MEDIUM",
+            score=250.0,
+            title=f"{unit} recently failed on {host}",
             resource=host,
-            summary=f"systemd unit {unit} on {host} is in failed state.",
+            summary=f"systemd unit {unit} on {host} entered the failed state within the last 2h.",
             evidence=[
                 HotspotEvidence(
                     label=f"unit state {host}/{unit}",
-                    query='node_systemd_unit_state{state="failed"}',
-                    value="failed",
+                    query='node_systemd_unit_state{state="failed"} and changes(...[2h]) > 0',
+                    value="failed (recent transition)",
                     threshold="active",
                 )
             ],
