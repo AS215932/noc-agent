@@ -23,6 +23,8 @@ from app.model_metrics import metrics_response, record_failure, record_success, 
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
+from app.config import load_proactive_settings
+from app.proactive.loop import ProactiveLoop
 import app.graph_runtime as graph_runtime
 from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
 from app.incident_memory import CaseIntakeResult, RECOVERY_COOLDOWN_SECONDS, case_display_title, case_event_from_alert
@@ -33,7 +35,10 @@ mail_poller_task = None
 mail_poller_lock_fd = None
 discord_bot = None
 discord_bot_task = None
+proactive_loop = None
+proactive_lock_fd = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
+PROACTIVE_LOCK_PATH = os.getenv("PROACTIVE_LOCK_PATH", "/var/lib/noc-agent/proactive-instance.lock")
 
 REQUIRED_CONFIG = [
     "DISCORD_WEBHOOK_URL",
@@ -67,6 +72,29 @@ def _release_mail_poller_lock(lock_fd: int | None):
     os.close(lock_fd)
 
 
+def _try_acquire_proactive_lock() -> int | None:
+    """Singleton guard so only one worker drives the proactive loop (mirrors the
+    mail-poller lock). Per-cycle exclusivity is additionally enforced by the
+    ledger run-lock."""
+    os.makedirs(os.path.dirname(PROACTIVE_LOCK_PATH), exist_ok=True)
+    lock_fd = os.open(PROACTIVE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o640)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return None
+    os.ftruncate(lock_fd, 0)
+    os.write(lock_fd, str(os.getpid()).encode())
+    return lock_fd
+
+
+def _release_proactive_lock(lock_fd: int | None):
+    if lock_fd is None:
+        return
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+
+
 async def _mail_poll_loop(lock_fd: int):
     log.info("mail_poll_loop_starting", interval_seconds=300)
     try:
@@ -87,6 +115,8 @@ async def lifespan(app: FastAPI):
     global mail_poller_lock_fd
     global discord_bot
     global discord_bot_task
+    global proactive_loop
+    global proactive_lock_fd
     log.info("startup_begin")
 
     mcp_runtime = MCPRuntime(owner="api")
@@ -114,7 +144,42 @@ async def lifespan(app: FastAPI):
     else:
         log.info("discord_bot_embedded_disabled")
 
+    proactive_settings = load_proactive_settings()
+    if proactive_settings.enabled:
+        proactive_lock_fd = _try_acquire_proactive_lock()
+        if proactive_lock_fd is None:
+            log.info("proactive_loop_disabled", reason="lock-held-by-other-worker")
+        else:
+            try:
+                from app.proactive.memory import ProactiveMemory
+
+                proactive_memory = ProactiveMemory(proactive_settings.memory_dir)
+                proactive_memory.ensure()
+                proactive_loop = ProactiveLoop(
+                    mcp_runtime,
+                    settings=proactive_settings,
+                    investigator=_proactive_investigator(proactive_settings),
+                    incident_memory=graph_runtime.INCIDENT_MEMORY,
+                    memory=proactive_memory,
+                )
+                proactive_loop.start()
+            except Exception as e:
+                safe = classify_exception(e)
+                log_exception("proactive_loop_start_failed", e, category=safe.category)
+                _release_proactive_lock(proactive_lock_fd)
+                proactive_lock_fd = None
+                proactive_loop = None
+    else:
+        log.info("proactive_loop_disabled", reason="NOC_PROACTIVE_ENABLED-not-set")
+
     yield
+
+    if proactive_loop is not None:
+        await proactive_loop.stop()
+        proactive_loop = None
+    if proactive_lock_fd is not None:
+        _release_proactive_lock(proactive_lock_fd)
+        proactive_lock_fd = None
 
     if discord_bot_task:
         discord_bot_task.cancel()
@@ -139,6 +204,15 @@ async def lifespan(app: FastAPI):
 
 def _embedded_discord_bot_enabled() -> bool:
     return os.getenv("NOC_AGENT_START_EMBEDDED_BOT", "").strip() == "1"
+
+
+def _proactive_investigator(settings):
+    """Investigator callable the proactive loop uses for autonomous (non-shadow)
+    investigation: synthetic alert → existing investigation graph, with heavy
+    read-only probes stripped unless ``auto_heavy_probes`` is set."""
+    from app.proactive.investigate import build_investigator
+
+    return build_investigator(mcp_runtime, settings)
 
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
@@ -493,7 +567,8 @@ async def _handle_case_update(result: CaseIntakeResult) -> None:
     )
 
 
-async def investigate_alert(alert_payload: dict, model=None, case: dict | None = None):
+async def investigate_alert(alert_payload: dict, model=None, case: dict | None = None, *, mcp_runtime=None):
+    runtime = mcp_runtime if mcp_runtime is not None else globals()["mcp_runtime"]
     event = (case or {}).get("latest_event") or case_event_from_alert(alert_payload)
     display_title = case_display_title(case, event)
     if _is_recovery_alert(alert_payload):
@@ -522,7 +597,7 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
 
     run_started = start_run("triage")
     try:
-        plan, graph_state = await run_investigation_graph(alert_payload, model=model, mcp_runtime=mcp_runtime, case=case)
+        plan, graph_state = await run_investigation_graph(alert_payload, model=model, mcp_runtime=runtime, case=case)
         record_success("triage", run_started, _SyntheticRunResult())
     except Exception as e:
         safe = classify_exception(e)
@@ -540,7 +615,9 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
             is_error=True,
             safe_category=safe.category,
         )
-        return
+        # Return None so callers (e.g. the proactive investigator) can tell a
+        # swallowed triage failure from a successful investigation.
+        return None
 
     log.info(
         "investigation_complete",
@@ -567,6 +644,7 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
         color=color,
         fields=fields,
     )
+    return plan
 
 
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
@@ -837,6 +915,78 @@ async def control_fast_status(
 
     overview = await run_fast_status_check(request_body.target, request_body.qualifiers, mcp_runtime)
     return {"status": "ok", "overview": overview.__dict__}
+
+
+@app.get("/control/proactive/status")
+async def control_proactive_status(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    from pathlib import Path as _Path
+
+    from app.proactive.ledger import load_ledger
+
+    settings = load_proactive_settings()
+    running = proactive_loop is not None and proactive_loop.running
+    return {
+        "status": "ok",
+        "running": running,
+        "paused": bool(proactive_loop.paused) if proactive_loop is not None else None,
+        "settings": {
+            "enabled": settings.enabled,
+            "shadow": settings.shadow,
+            "interval_s": settings.interval_s,
+            "deep_scan_s": settings.deep_scan_s,
+            "max_investigations_per_cycle": settings.max_investigations_per_cycle,
+            "max_investigations_per_day": settings.max_investigations_per_day,
+            "max_cost_usd_per_day": settings.max_cost_usd_per_day,
+            "auto_heavy_probes": settings.auto_heavy_probes,
+            "handoff_enabled": settings.handoff_enabled,
+            "severity_floor": settings.severity_floor,
+        },
+        "ledger_today": load_ledger(_Path(settings.state_dir)),
+    }
+
+
+@app.post("/control/proactive/pause")
+async def control_proactive_pause(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    if proactive_loop is None:
+        raise HTTPException(status_code=409, detail="Proactive loop is not running")
+    proactive_loop.pause()
+    return {"status": "ok", "paused": True}
+
+
+@app.post("/control/proactive/resume")
+async def control_proactive_resume(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    if proactive_loop is None:
+        raise HTTPException(status_code=409, detail="Proactive loop is not running")
+    proactive_loop.resume()
+    return {"status": "ok", "paused": False}
+
+
+@app.post("/control/proactive/run-once")
+async def control_proactive_run_once(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    if proactive_loop is None:
+        raise HTTPException(status_code=409, detail="Proactive loop is not running")
+    report = await proactive_loop.run_once()
+    return {"status": "ok", "report": report.model_dump(mode="json")}
 
 
 @app.post("/control/incidents/{incident_id}/decision")
