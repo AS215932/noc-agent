@@ -42,6 +42,10 @@ New control-plane interfaces:
 - `GET /control/incidents/{incident_id}`
 - `POST /control/incidents/{incident_id}/decision`
 - `POST /approval/resume`
+- `GET /control/proactive/status`
+- `POST /control/proactive/pause`
+- `POST /control/proactive/resume`
+- `POST /control/proactive/run-once`
 
 The `/control/...` endpoints require `X-NOC-Control-Token`. The signed resume
 endpoint requires an HMAC signature using `NOC_APPROVAL_SIGNING_SECRET`.
@@ -85,6 +89,64 @@ nocctl approvals sign --proposal-id <case> --action-id <id> --operator svag --ac
 ```
 
 Signing requires `HYRULE_MCP_ACTION_SIGNING_SECRET` (or `NOC_APPROVAL_SIGNING_SECRET`).
+
+## Proactive loop
+
+Beyond the reactive webhook path, `noc-agent` runs an **active operator loop**
+(`app/proactive/`) that continuously looks for trouble *before* an alert fires.
+It is **enabled in production** (the deployment env sets `NOC_PROACTIVE_ENABLED=1`);
+the in-code default stays `0` so local dev and the test suite never spin it up.
+It is read-only, budgeted, and modelled on the production `engineering-loop`
+(run-lock + per-day ledger + budgets + Icinga heartbeat) and
+`hyperliquid-trading-agent` (continuous observe → propose → evaluate → learn)
+loops. The conservative budgets — 1 investigation/cycle, 12/day, $10/day,
+`MEDIUM` severity floor, heavy probes proposed not auto-run — are the live
+safety rails.
+
+Each cycle:
+
+1. **Scan** — cheap read-only sweep of Prometheus/Icinga (`app/proactive/scanner.py`)
+   for precursors the reactive tripwires fire on only *after* they harden: a BGP
+   peer that just left Established or is flapping, a filesystem projected to fill
+   within 24h, a scrape target flapping, restart churn / failed units,
+   intermittent ICMP on a mesh link, certs near expiry.
+2. **Rank & gate** — score by severity, snapshot a decision context, and gate
+   expensive investigation against the daily ledger and severity floor
+   (`app/proactive/governance.py`, `app/proactive/ledger.py`).
+3. **Investigate** — render the top hotspot as a synthetic alert and run it
+   through the *same* investigation graph the webhooks use, with heavy read-only
+   probes (`tcpdump_capture`, `dns_probe_burst`, `multi_source_probe`) stripped
+   unless `NOC_PROACTIVE_AUTO_HEAVY_PROBES=1` (`app/proactive/investigate.py`).
+4. **Report** — a Discord digest plus an optional Icinga passive heartbeat.
+5. **Hand off** — when a finding needs a config/docs change, open an idempotent
+   `loop:candidate` GitHub issue (`app/proactive/handoff.py`); a human promotes
+   it to `loop:approved` and the engineering-loop drafts the PR.
+6. **Learn** — record predictions, correlate them with later real alerts, and
+   propose candidate lessons under `NOC_PROACTIVE_MEMORY_DIR`
+   (`app/proactive/memory.py`); humans merge proposals into `lessons/`.
+
+To canary cheaply, set `NOC_PROACTIVE_SHADOW=1` (scan-and-report only, no
+autonomous investigation) and flip it back to `0` once the scanners look right.
+To pause production at any time, set `NOC_PROACTIVE_ENABLED=0` and re-apply, or
+hit `POST /control/proactive/pause`.
+
+Proactive config (in-code defaults are conservative; the deployment env enables it):
+
+- `NOC_PROACTIVE_ENABLED` (in-code default `0`, **deployed `1`**; loop not mounted unless `1`)
+- `NOC_PROACTIVE_SHADOW` (in-code default `1`, **deployed `0`**; `1` = report hotspots only)
+- `NOC_PROACTIVE_INTERVAL_S` (default `120`) / `NOC_PROACTIVE_DEEP_SCAN_S` (default `900`)
+- `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_CYCLE` (default `1`)
+- `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_DAY` (default `12`)
+- `NOC_PROACTIVE_MAX_COST_USD_PER_DAY` (default `10`)
+- `NOC_PROACTIVE_AUTO_HEAVY_PROBES` (default `0`; propose heavy probes instead of auto-running)
+- `NOC_PROACTIVE_HANDOFF_ENABLED` (default `0`) + `NOC_PROACTIVE_HANDOFF_REPO` (default `AS215932/network-operations`)
+- `NOC_PROACTIVE_SEVERITY_FLOOR` (default `MEDIUM`)
+- `NOC_PROACTIVE_MEMORY_DIR` (default `/var/lib/noc-agent/memory`) / `NOC_PROACTIVE_STATE_DIR` (default `/var/lib/noc-agent/proactive`)
+- `NOC_GITHUB_TOKEN` (issues-scoped; required only for handoff)
+- `NOC_PROACTIVE_ICINGA_URL` / `NOC_PROACTIVE_ICINGA_CHECK` (optional passive heartbeat; reuses `ICINGA_API_USER`/`ICINGA_API_PASSWORD`)
+
+Settings can also be set under a `[proactive]` table in the model-config TOML;
+environment variables take precedence.
 
 ## Discord bot
 

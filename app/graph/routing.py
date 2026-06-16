@@ -42,6 +42,13 @@ def instance_host(instance: str) -> str:
 
 def supervisor_route(state: WorkflowState) -> dict[str, str]:
     labels = labels_from_alert(state["normalized_alert"])
+    hint = str(labels.get("specialist_hint") or "").strip()
+    if hint in ("bgp", "security_firewall", "infrastructure"):
+        return {
+            "active_specialist": hint,
+            "specialist_type": hint,
+            "routing_reason": "Explicit specialist hint from alert labels.",
+        }
     blob = " ".join(str(value) for value in [labels, state["normalized_alert"]]).lower()
     if any(token in blob for token in ("bgp", "peer", "route", "frr", "ospf")):
         specialist = "bgp"

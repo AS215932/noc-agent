@@ -365,6 +365,17 @@ INFRASTRUCTURE_TOOLS = {
 }
 
 
+# Heavy read-only probes: still read-only, but they consume real resources
+# (packet capture, burst probing, fan-out) and so are escalated rather than
+# auto-run during proactive investigation when nothing has actually failed yet.
+# The proactive loop strips these unless NOC_PROACTIVE_AUTO_HEAVY_PROBES=1.
+PROACTIVE_HEAVY_TOOLS = {
+    "tcpdump_capture",
+    "dns_probe_burst",
+    "multi_source_probe",
+}
+
+
 def _allowed_tool_names(specialist: str | None) -> set[str]:
     if specialist == "bgp":
         return BGP_TOOLS
