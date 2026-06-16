@@ -138,6 +138,7 @@ Proactive config (in-code defaults are conservative; the deployment env enables 
 - `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_CYCLE` (default `1`)
 - `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_DAY` (default `12`)
 - `NOC_PROACTIVE_MAX_COST_USD_PER_DAY` (default `10`)
+- `NOC_PROACTIVE_COST_USD_PER_INVESTIGATION` (default `0.05`; flat estimate charged to the daily $ cap until per-run token→USD metering lands — the count cap is the primary budget)
 - `NOC_PROACTIVE_AUTO_HEAVY_PROBES` (default `0`; propose heavy probes instead of auto-running)
 - `NOC_PROACTIVE_HANDOFF_ENABLED` (default `0`) + `NOC_PROACTIVE_HANDOFF_REPO` (default `AS215932/network-operations`)
 - `NOC_PROACTIVE_SEVERITY_FLOOR` (default `MEDIUM`)

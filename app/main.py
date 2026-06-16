@@ -615,7 +615,9 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
             is_error=True,
             safe_category=safe.category,
         )
-        return
+        # Return None so callers (e.g. the proactive investigator) can tell a
+        # swallowed triage failure from a successful investigation.
+        return None
 
     log.info(
         "investigation_complete",
@@ -642,6 +644,7 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
         color=color,
         fields=fields,
     )
+    return plan
 
 
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:

@@ -84,18 +84,31 @@ def build_investigator(mcp_runtime: Any, settings: ProactiveLoopSettings) -> Inv
             allow_heavy=settings.auto_heavy_probes,
         )
         try:
-            await investigate_alert(payload, case=intake.case, mcp_runtime=runtime)
+            synthesis = await investigate_alert(payload, case=intake.case, mcp_runtime=runtime)
         except Exception as exc:  # surfaced to the loop's error list
             safe = classify_exception(exc)
             log_exception("proactive_investigation_graph_failed", exc, category=safe.category, hotspot=hotspot.key)
             raise
 
+        if synthesis is None:
+            # investigate_alert swallows graph/model errors and returns None on
+            # failure. Do NOT count a failed run as an investigation, and do not
+            # hand off on scanner evidence alone — only successful synthesis
+            # counts and is eligible for a loop:candidate issue.
+            log.info("proactive_investigation_unsuccessful", hotspot=hotspot.key, reason="no_synthesis")
+            return None
+
         incident_id = intake.case.get("incident_id")
         handoff_url = await _maybe_handoff(hotspot, settings, incident_id=incident_id, decision=decision)
-        # cost_usd is left at 0.0 until per-run token→USD accounting lands
-        # (shared gap with engineering-loop); the daily investigation count is
-        # the hard budget for now.
-        return InvestigationOutcome(incident_id=incident_id, cost_usd=0.0, handoff_url=handoff_url)
+        # Per-run token→USD metering is not yet plumbed, so charge a conservative
+        # flat estimate per investigation. This keeps the daily *dollar* budget
+        # (max_cost_usd_per_day) meaningful rather than a no-op; the per-day
+        # investigation *count* remains the primary hard cap.
+        return InvestigationOutcome(
+            incident_id=incident_id,
+            cost_usd=settings.cost_usd_per_investigation,
+            handoff_url=handoff_url,
+        )
 
     return investigate
 

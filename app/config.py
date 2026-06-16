@@ -65,6 +65,7 @@ class ProactiveLoopSettings:
     max_investigations_per_cycle: int = 1
     max_investigations_per_day: int = 12
     max_cost_usd_per_day: float = 10.0
+    cost_usd_per_investigation: float = 0.05
     auto_heavy_probes: bool = False
     handoff_enabled: bool = False
     handoff_repo: str = "AS215932/network-operations"
@@ -147,6 +148,9 @@ def load_proactive_settings() -> ProactiveLoopSettings:
             "NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_DAY", base.max_investigations_per_day
         ),
         max_cost_usd_per_day=_env_float("NOC_PROACTIVE_MAX_COST_USD_PER_DAY", base.max_cost_usd_per_day),
+        cost_usd_per_investigation=_env_float(
+            "NOC_PROACTIVE_COST_USD_PER_INVESTIGATION", base.cost_usd_per_investigation
+        ),
         auto_heavy_probes=_env_bool("NOC_PROACTIVE_AUTO_HEAVY_PROBES", base.auto_heavy_probes),
         handoff_enabled=_env_bool("NOC_PROACTIVE_HANDOFF_ENABLED", base.handoff_enabled),
         handoff_repo=_env_str("NOC_PROACTIVE_HANDOFF_REPO", base.handoff_repo),
@@ -175,6 +179,9 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
             table, "max_investigations_per_day", defaults.max_investigations_per_day, errors
         ),
         max_cost_usd_per_day=_float_value(table, "max_cost_usd_per_day", defaults.max_cost_usd_per_day, errors),
+        cost_usd_per_investigation=_float_value(
+            table, "cost_usd_per_investigation", defaults.cost_usd_per_investigation, errors
+        ),
         auto_heavy_probes=_bool_value(table, "auto_heavy_probes", defaults.auto_heavy_probes, errors),
         handoff_enabled=_bool_value(table, "handoff_enabled", defaults.handoff_enabled, errors),
         handoff_repo=_str_value(table, "handoff_repo", defaults.handoff_repo, errors),

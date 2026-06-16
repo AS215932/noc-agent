@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 Severity = Literal["HIGH", "MEDIUM", "LOW"]
@@ -55,6 +55,18 @@ _SEVERITY_RANK: dict[str, int] = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def sanitize_label(value: object, *, limit: int = 160) -> str:
+    """Defang an untrusted telemetry value before it is embedded into hotspot
+    text (which becomes Discord output, a synthetic-alert payload, and ultimately
+    LLM prompt context). Prometheus labels can be derived from external sources
+    (DNS, service discovery, a compromised exporter), so collapse all whitespace
+    (kills newline-based prompt injection), drop non-printable characters, and
+    cap the length to bound prompt bloat."""
+    text = " ".join(str(value).split())
+    text = "".join(ch for ch in text if ch.isprintable())
+    return text[:limit]
 
 
 def severity_rank(severity: str) -> int:
@@ -98,6 +110,25 @@ class Hotspot(BaseModel):
     )
     change_rationale: str = ""
     detected_at: str = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def _sanitize_untrusted_text(self) -> "Hotspot":
+        # Hotspot text is built from raw telemetry labels; scrub it once here so
+        # nothing downstream (Discord, synthetic alert, LLM prompt) sees raw,
+        # attacker-influencable label content.
+        self.key = sanitize_label(self.key, limit=200)
+        self.resource = sanitize_label(self.resource, limit=120)
+        self.title = sanitize_label(self.title, limit=200)
+        self.summary = sanitize_label(self.summary, limit=600)
+        self.change_rationale = sanitize_label(self.change_rationale, limit=300)
+        self.recommended_checks = [sanitize_label(c, limit=200) for c in self.recommended_checks]
+        for ev in self.evidence:
+            ev.label = sanitize_label(ev.label, limit=160)
+            ev.value = sanitize_label(ev.value, limit=200)
+            ev.threshold = sanitize_label(ev.threshold, limit=120)
+            ev.detail = sanitize_label(ev.detail, limit=200)
+            # ev.query is loop-authored PromQL, not untrusted input.
+        return self
 
     def fingerprint(self) -> str:
         payload = f"{self.rule_id}|{self.key}"
