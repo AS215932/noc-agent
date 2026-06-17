@@ -93,6 +93,11 @@ class ProactiveLoop:
         self._task: asyncio.Task[None] | None = None
         self._last_deep_scan = 0.0
         self._state_dir = Path(self.settings.state_dir)
+        # Digest de-dup: remember the last reported hotspot set + when, so an
+        # unchanged set doesn't re-post every scan cycle (it re-asserts at most
+        # every report_reassert_s).
+        self._last_report_signature: frozenset[tuple[str, str]] | None = None
+        self._last_report_ts = 0.0
 
     # --- lifecycle --------------------------------------------------------
 
@@ -270,12 +275,32 @@ class ProactiveLoop:
 
     # --- reporting --------------------------------------------------------
 
+    def _should_report(self, report: ProactiveCycleReport) -> bool:
+        """Post a digest only when the hotspot set changes (new/resolved/severity)
+        or something was investigated/handed off — with a periodic re-assert for
+        a persistent set. Prevents the same digest spamming every scan cycle."""
+        signature = frozenset((h.fingerprint(), h.severity) for h in report.hotspots)
+        now = time.time()
+        if report.investigated or report.handoffs:
+            self._last_report_signature, self._last_report_ts = signature, now
+            return True
+        if not report.hotspots:
+            self._last_report_signature = frozenset()  # next hotspot counts as changed
+            return False  # stay quiet on clean cycles
+        changed = signature != self._last_report_signature
+        stale = (now - self._last_report_ts) >= max(1, self.settings.report_reassert_s)
+        if changed or stale:
+            self._last_report_signature, self._last_report_ts = signature, now
+            return True
+        return False
+
     async def _safe_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:
-        try:
-            await self._reporter(report, gate)
-        except Exception as exc:
-            safe = classify_exception(exc)
-            log_exception("proactive_report_failed", exc, category=safe.category)
+        if self._should_report(report):
+            try:
+                await self._reporter(report, gate)
+            except Exception as exc:
+                safe = classify_exception(exc)
+                log_exception("proactive_report_failed", exc, category=safe.category)
         try:
             await _heartbeat(report)
         except Exception as exc:
