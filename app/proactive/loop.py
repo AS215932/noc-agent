@@ -93,6 +93,11 @@ class ProactiveLoop:
         self._task: asyncio.Task[None] | None = None
         self._last_deep_scan = 0.0
         self._state_dir = Path(self.settings.state_dir)
+        # Digest de-dup: remember the last reported hotspot set + when, so an
+        # unchanged set doesn't re-post every scan cycle (it re-asserts at most
+        # every report_reassert_s).
+        self._last_report_signature: frozenset[tuple[str, str]] | None = None
+        self._last_report_ts = 0.0
 
     # --- lifecycle --------------------------------------------------------
 
@@ -270,12 +275,38 @@ class ProactiveLoop:
 
     # --- reporting --------------------------------------------------------
 
+    def _report_decision(
+        self, report: ProactiveCycleReport
+    ) -> tuple[bool, frozenset[tuple[str, str]], float]:
+        """Decide whether to post a digest WITHOUT mutating de-dup state (state is
+        committed only after a successful send). Posts when the hotspot set
+        changes (new/resolved/severity), something was investigated/handed off,
+        the set goes all-clear, or the persistent set is due a re-assert.
+        Returns ``(should_post, signature, now)``."""
+        signature = frozenset((h.fingerprint(), h.severity) for h in report.hotspots)
+        now = time.time()
+        if report.investigated or report.handoffs:
+            return True, signature, now
+        if not report.hotspots:
+            # All-clear: post once iff we previously reported an active set, so
+            # operators get confirmation the issue resolved.
+            return bool(self._last_report_signature), signature, now
+        changed = signature != self._last_report_signature
+        stale = (now - self._last_report_ts) >= max(1, self.settings.report_reassert_s)
+        return (changed or stale), signature, now
+
     async def _safe_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:
-        try:
-            await self._reporter(report, gate)
-        except Exception as exc:
-            safe = classify_exception(exc)
-            log_exception("proactive_report_failed", exc, category=safe.category)
+        should, signature, now = self._report_decision(report)
+        if should:
+            try:
+                await self._reporter(report, gate)
+            except Exception as exc:
+                safe = classify_exception(exc)
+                log_exception("proactive_report_failed", exc, category=safe.category)
+            else:
+                # Commit de-dup state only after a successful send, so a transient
+                # webhook failure doesn't suppress the next retry.
+                self._last_report_signature, self._last_report_ts = signature, now
         try:
             await _heartbeat(report)
         except Exception as exc:
@@ -284,7 +315,15 @@ class ProactiveLoop:
 
     async def _default_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:
         if not report.hotspots and not report.investigated:
-            return  # stay quiet on clean idle cycles
+            # Reached only on an all-clear transition (the dedup gate suppresses
+            # steady-state empty cycles), so confirm the resolution.
+            await send_discord_notification(
+                title="✅ Proactive sweep: all clear",
+                description="All previously flagged hotspots have resolved.",
+                color=0x2ECC71,
+                level=Verbosity.INFO,
+            )
+            return
         top = report.top(6)
         prefix = "🛰️ Proactive sweep"
         if self.settings.shadow:
