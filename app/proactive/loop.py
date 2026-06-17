@@ -99,6 +99,7 @@ class ProactiveLoop:
             self.suppressions = SuppressionStore(self._state_dir / "suppressions.json")
         self.running = False
         self.paused = False
+        self.last_report: ProactiveCycleReport | None = None
         self._task: asyncio.Task[None] | None = None
         self._last_deep_scan = 0.0
         # Digest de-dup: remember the last reported hotspot set + when, so an
@@ -205,6 +206,7 @@ class ProactiveLoop:
             release_lock(lock)
 
         report.finished_at = utc_now()
+        self.last_report = report  # surfaced read-only to the control dashboard
         return report
 
     async def _investigate(
