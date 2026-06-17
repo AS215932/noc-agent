@@ -142,8 +142,13 @@ curl -XPOST -H "x-noc-control-token: $TOK" http://127.0.0.1:8000/control/proacti
   -d '{"fingerprint":"<ack id>","reason":"tracked in network-operations#268","ttl_hours":168}'
 ```
 
-From the Discord bot (the friendlier path — the ack id is right there in the
-digest): `/noc_ack ack_id:<id> [reason:…] [hours:…]`, `/noc_unack ack_id:<id>`,
+From the **web dashboard** (`GET /control`): a "Proactive loop" panel lists the
+current hotspots (status, ack id, summary) with inline **Ack** buttons + a
+reason/hours field, and the muted list with **Unack** — backed by
+`/control/proactive/status` (which now returns `hotspots` + `suppressions`).
+
+From the **Discord bot** (the ack id is right there in the digest):
+`/noc_ack ack_id:<id> [reason:…] [hours:…]`, `/noc_unack ack_id:<id>`,
 `/noc_acks`. The ack id is matched as a prefix (git short-SHA style), so the
 short id shown in the digest works.
 

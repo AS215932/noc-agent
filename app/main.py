@@ -947,7 +947,27 @@ async def control_proactive_status(
             "severity_floor": settings.severity_floor,
         },
         "ledger_today": load_ledger(_Path(settings.state_dir)),
+        "hotspots": _proactive_hotspots_view(),
+        "suppressions": _suppression_store().active(),
     }
+
+
+def _proactive_hotspots_view() -> list[dict]:
+    """The last cycle's (un-suppressed) hotspots, shaped for the dashboard."""
+    if proactive_loop is None or proactive_loop.last_report is None:
+        return []
+    return [
+        {
+            "ack_id": h.fingerprint()[:12],
+            "severity": h.severity,
+            "category": h.category,
+            "title": h.title,
+            "resource": h.resource,
+            "summary": h.summary,
+            "warrants_change": h.warrants_change,
+        }
+        for h in proactive_loop.last_report.top(20)
+    ]
 
 
 @app.post("/control/proactive/pause")
@@ -1234,6 +1254,60 @@ def _manual_investigation_payload(prompt: str, source: str, operator: str) -> di
     }
 
 
+# Proactive panel markup + script. Kept as plain strings (interpolated into the
+# template) so their braces don't collide with the f-string's brace escaping.
+_PROACTIVE_PANEL = """
+    <div class="panel">
+      <div class="toolbar"><strong>Proactive loop</strong><span id="proStatus" class="meta"></span></div>
+      <div id="proHotspots" class="grid"></div>
+      <details><summary class="meta">Muted (acked) hotspots</summary><div id="proSuppressions" class="grid"></div></details>
+    </div>"""
+
+_PROACTIVE_JS = """
+function _sevEmoji(s){ return ({HIGH:'\\u{1F534}',MEDIUM:'\\u{1F7E0}',LOW:'\\u{1F7E2}'})[s] || '\\u2022'; }
+async function loadProactive(){
+  let d;
+  try { d = await api('/control/proactive/status'); }
+  catch(e){ const el=document.querySelector('#proStatus'); if(el) el.textContent='unavailable'; return; }
+  const st = d.settings || {};
+  document.querySelector('#proStatus').textContent =
+    (d.running ? 'running' : 'stopped') + (d.paused ? ' (paused)' : '') + ' \\u00b7 ' +
+    (st.shadow ? 'shadow' : 'autonomous') + ' \\u00b7 today ' +
+    ((d.ledger_today||{}).investigations ?? 0) + '/' + (st.max_investigations_per_day ?? '?');
+  const hs = d.hotspots || [];
+  document.querySelector('#proHotspots').innerHTML = hs.length ? hs.map(h =>
+    '<div class="panel"><strong>' + _sevEmoji(h.severity) + ' ' + esc(h.title) + '</strong>' +
+    '<div class="meta">' + esc(h.resource) + ' \\u00b7 ' + esc(h.category) + ' \\u00b7 ack id <code>' + esc(h.ack_id) + '</code></div>' +
+    '<div>' + esc(h.summary) + '</div>' +
+    '<div class="toolbar"><input placeholder="reason (e.g. tracked in #268)" data-reason="' + esc(h.ack_id) + '">' +
+    '<input type="number" min="0" placeholder="hours" style="width:80px" data-hours="' + esc(h.ack_id) + '">' +
+    '<button data-ack="' + esc(h.ack_id) + '">Ack</button></div></div>'
+  ).join('') : '<div class="meta">No active hotspots.</div>';
+  document.querySelectorAll('[data-ack]').forEach(b => b.onclick = async () => {
+    const id = b.dataset.ack;
+    const r = document.querySelector('[data-reason="' + id + '"]');
+    const hr = document.querySelector('[data-hours="' + id + '"]');
+    const hours = parseInt((hr && hr.value) || '0', 10) || 0;
+    try { await api('/control/proactive/ack', {method:'POST', body: JSON.stringify({fingerprint:id, reason:(r&&r.value)||'', ttl_hours: hours||null, operator:'web'})}); await loadProactive(); }
+    catch(e){ alert(e.message); }
+  });
+  const sup = d.suppressions || {};
+  const keys = Object.keys(sup);
+  document.querySelector('#proSuppressions').innerHTML = keys.length ? keys.map(fp =>
+    '<div class="meta"><code>' + esc(fp) + '</code> ' + esc(sup[fp].reason || 'no reason') +
+    ' <button class="secondary" data-unack="' + esc(fp) + '">Unack</button></div>'
+  ).join('') : '<div class="meta">None.</div>';
+  document.querySelectorAll('[data-unack]').forEach(b => b.onclick = async () => {
+    try { await api('/control/proactive/unack', {method:'POST', body: JSON.stringify({fingerprint:b.dataset.unack})}); await loadProactive(); }
+    catch(e){ alert(e.message); }
+  });
+}
+const _refreshBtn = document.querySelector('#refresh');
+if (_refreshBtn) _refreshBtn.addEventListener('click', () => loadProactive().catch(()=>{}));
+loadProactive().catch(()=>{});
+"""
+
+
 def _control_html(token: str) -> str:
     safe_token = escape(token, quote=True)
     return f"""<!doctype html>
@@ -1297,6 +1371,7 @@ def _control_html(token: str) -> str:
       </form>
       <pre id="statusOut"></pre>
     </div>
+    {_PROACTIVE_PANEL}
     <div id="detail" class="grid"></div>
   </section>
 </main>
@@ -1337,6 +1412,7 @@ document.querySelector('#refresh').onclick = () => loadCases().catch(e => alert(
 document.querySelector('#investigate').onsubmit = async e => {{ e.preventDefault(); const fd = new FormData(e.target); await api('/control/cases/investigate', {{method:'POST', body:JSON.stringify(Object.fromEntries(fd))}}); e.target.prompt.value=''; await loadCases(); }};
 document.querySelector('#fastStatus').onsubmit = async e => {{ e.preventDefault(); const fd = new FormData(e.target); const data = await api('/control/status', {{method:'POST', body:JSON.stringify({{target:fd.get('target'), qualifiers:{{}}}})}}); statusOut.textContent = JSON.stringify(data.overview, null, 2); }};
 loadCases().catch(e => {{ casesEl.innerHTML = '<div class="case">Authorization required or API unavailable.</div>'; }});
+{_PROACTIVE_JS}
 </script>
 </body>
 </html>"""
