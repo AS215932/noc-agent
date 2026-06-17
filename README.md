@@ -142,6 +142,11 @@ curl -XPOST -H "x-noc-control-token: $TOK" http://127.0.0.1:8000/control/proacti
   -d '{"fingerprint":"<ack id>","reason":"tracked in network-operations#268","ttl_hours":168}'
 ```
 
+From the Discord bot (the friendlier path — the ack id is right there in the
+digest): `/noc_ack ack_id:<id> [reason:…] [hours:…]`, `/noc_unack ack_id:<id>`,
+`/noc_acks`. The ack id is matched as a prefix (git short-SHA style), so the
+short id shown in the digest works.
+
 An acked hotspot drops from the digest **and** from autonomous investigation
 until it resolves — when it stops firing the suppression auto-prunes, so a
 recurrence re-alerts. `GET /control/proactive/suppressions` lists active acks;

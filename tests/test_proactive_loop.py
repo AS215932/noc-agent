@@ -192,6 +192,27 @@ async def test_acked_hotspot_is_suppressed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ack_by_short_prefix_suppresses(tmp_path):
+    # The digest shows a 12-char ack id; acking by that prefix must suppress the
+    # full-fingerprint hotspot (git short-SHA style).
+    from app.proactive.suppressions import SuppressionStore
+
+    store = SuppressionStore(tmp_path / "supp.json")
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        suppressions=store,
+    )
+    r1 = await lp.run_once(deep=True)
+    target = r1.hotspots[0]
+    store.add(fingerprint=target.fingerprint()[:12], key=target.key)  # short id, as shown
+    r2 = await lp.run_once(deep=True)
+    assert target.fingerprint() not in {h.fingerprint() for h in r2.hotspots}
+
+
+@pytest.mark.asyncio
 async def test_suppression_pruned_when_resolved(tmp_path):
     from app.proactive.suppressions import SuppressionStore
 

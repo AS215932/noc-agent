@@ -458,3 +458,19 @@ async def test_decision_mention_records_operator_decision(monkeypatch):
     assert calls[0][1]["decision"] == "approved"
     assert calls[0][1]["comment"] == "looks safe"
     assert "Recorded `approved`" in message.messages[0][0]
+
+
+def test_bot_ack_unack_list(monkeypatch, tmp_path):
+    monkeypatch.setenv("NOC_PROACTIVE_STATE_DIR", str(tmp_path))
+    from app.proactive.suppressions import SuppressionStore
+
+    bot = NOCDiscordBot()
+    msg = bot.ack_hotspot("abc123def456", reason="tracked in #268", operator="42", hours=24)
+    assert "Muted" in msg and "abc123def456" in msg
+    store = SuppressionStore(tmp_path / "suppressions.json")
+    assert "abc123def456" in store.active()
+    assert "abc123def456" in bot.list_acks()
+    assert "Un-muted" in bot.unack_hotspot("abc123def456")
+    assert store.active() == {}
+    assert bot.list_acks() == "No active mutes."
+    assert "Provide" in bot.ack_hotspot("  ")  # empty id rejected

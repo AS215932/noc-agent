@@ -236,12 +236,18 @@ class ProactiveLoop:
         if self.suppressions is None:
             return raw
         try:
-            firing = {h.fingerprint() for h in raw}
-            self.suppressions.prune_resolved(firing)
             active = self.suppressions.active()
             if not active:
                 return raw
-            kept = [h for h in raw if h.fingerprint() not in active]
+            # An ack id is a *prefix* of the full hotspot fingerprint (the digest
+            # shows a short id), matched like a git short-SHA. Prune acks whose
+            # hotspot no longer fires so a recurrence re-alerts.
+            firing = [h.fingerprint() for h in raw]
+            for ack_id in list(active):
+                if not any(fp.startswith(ack_id) for fp in firing):
+                    self.suppressions.remove(ack_id)
+            active_ids = list(self.suppressions.active())
+            kept = [h for h in raw if not any(h.fingerprint().startswith(a) for a in active_ids)]
             if len(kept) != len(raw):
                 log.info("proactive_hotspots_suppressed", suppressed=len(raw) - len(kept))
             return kept

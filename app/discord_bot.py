@@ -203,11 +203,73 @@ class NOCDiscordBot:
                 ephemeral=True,
             )
 
+        @self.tree.command(name="noc_ack", description="Mute a proactive hotspot by its ack id (shown in the digest).")
+        async def noc_ack(interaction, ack_id: str, reason: str = "", hours: int = 0):
+            if not await self._authorized(interaction):
+                await interaction.response.send_message("Not authorized.", ephemeral=True)
+                return
+            operator = str(getattr(interaction.user, "id", "discord"))
+            await interaction.response.send_message(
+                self.ack_hotspot(ack_id, reason=reason, operator=operator, hours=hours), ephemeral=True
+            )
+
+        @self.tree.command(name="noc_unack", description="Un-mute a proactive hotspot.")
+        async def noc_unack(interaction, ack_id: str):
+            if not await self._authorized(interaction):
+                await interaction.response.send_message("Not authorized.", ephemeral=True)
+                return
+            await interaction.response.send_message(self.unack_hotspot(ack_id), ephemeral=True)
+
+        @self.tree.command(name="noc_acks", description="List muted (acked) proactive hotspots.")
+        async def noc_acks(interaction):
+            if not await self._authorized(interaction):
+                await interaction.response.send_message("Not authorized.", ephemeral=True)
+                return
+            await interaction.response.send_message(self.list_acks(), ephemeral=True)
+
         @self.client.event
         async def on_message(message):
             if message.author.bot or self.client.user is None or self.client.user not in message.mentions:
                 return
             await self.handle_operator_message(message)
+
+    # --- proactive ack/snooze (shared file-backed store with the loop) -----
+
+    def _suppression_store(self):
+        from pathlib import Path
+
+        from app.config import load_proactive_settings
+        from app.proactive.suppressions import SuppressionStore
+
+        return SuppressionStore(Path(load_proactive_settings().state_dir) / "suppressions.json")
+
+    def ack_hotspot(self, ack_id: str, *, reason: str = "", operator: str = "discord", hours: int = 0) -> str:
+        ack_id = (ack_id or "").strip()
+        if not ack_id:
+            return "Provide the hotspot `ack id` shown in the digest."
+        self._suppression_store().add(
+            fingerprint=ack_id,
+            reason=reason,
+            operator=operator,
+            ttl_seconds=(hours * 3600) if hours and hours > 0 else None,
+        )
+        window = f" for {hours}h" if hours and hours > 0 else " until it resolves"
+        return f"🔕 Muted hotspot `{ack_id}`{window}." + (f" — {reason}" if reason else "")
+
+    def unack_hotspot(self, ack_id: str) -> str:
+        ack_id = (ack_id or "").strip()
+        removed = self._suppression_store().remove(ack_id)
+        return f"🔔 Un-muted `{ack_id}`." if removed else f"No active mute for `{ack_id}`."
+
+    def list_acks(self) -> str:
+        active = self._suppression_store().active()
+        if not active:
+            return "No active mutes."
+        lines = [
+            f"`{fp}` {entry.get('key') or ''} — {entry.get('reason') or 'no reason'}"
+            for fp, entry in list(active.items())[:15]
+        ]
+        return "\n".join(lines)
 
     async def handle_investigation_interaction(self, interaction, prompt: str) -> None:
         if not await self._authorized(interaction):
