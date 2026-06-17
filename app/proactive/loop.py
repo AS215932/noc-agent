@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable
 from app import log
 from app.config import ProactiveLoopSettings, load_proactive_settings
 from app.discord import Verbosity, send_discord_notification
+from app.icinga_ack import acknowledge_icinga
 from app.proactive.governance import GateDecision, build_decision_context, evaluate_gate
 from app.proactive.ledger import acquire_lock, load_ledger, release_lock, update_ledger
 from app.proactive.models import (
@@ -175,6 +176,7 @@ class ProactiveLoop:
             do_deep = self._should_deep_scan() if deep is None else deep
             ctx = ScanContext(self.mcp_runtime, self.settings, lessons=self._active_lessons())
             raw_hotspots = await scan(ctx, deep=do_deep)
+            report.auto_snoozed = await self._auto_snooze(raw_hotspots)
             report.hotspots = self._apply_suppressions(raw_hotspots)
 
             decision = build_decision_context(
@@ -322,6 +324,123 @@ class ProactiveLoop:
             log_exception("proactive_suppressions_failed", exc, category=safe.category)
             return raw
 
+    @staticmethod
+    def _is_auto_snoozable(h: Hotspot) -> bool:
+        """Non-urgent = LOW severity and not a config-change candidate. MEDIUM/HIGH
+        and anything warranting a change always stay surfaced for an operator."""
+        return h.severity == "LOW" and not h.warrants_change
+
+    async def _auto_snooze(self, raw: list[Hotspot]) -> list[str]:
+        """Autonomously mute non-urgent hotspots: add a TTL suppression
+        (operator='agent', audited) so they drop from the digest + investigation
+        for auto_snooze_ttl_s, and best-effort ack the matching Icinga WARNING
+        problem with an expiry. Bounded per cycle; already-snoozed ones are
+        skipped so we don't re-ack every cycle. Returns the keys snoozed now."""
+        if not self.settings.auto_snooze_enabled or self.suppressions is None:
+            return []
+        try:
+            active_ids = list(self.suppressions.active())
+        except Exception:  # never break a cycle on suppression I/O
+            active_ids = []
+        ttl = self.settings.auto_snooze_ttl_s
+        snoozed: list[str] = []
+        for h in raw:
+            if len(snoozed) >= max(1, self.settings.auto_snooze_max_per_cycle):
+                break
+            if not self._is_auto_snoozable(h):
+                continue
+            fp = h.fingerprint()
+            if any(fp.startswith(a) or a.startswith(fp) for a in active_ids):
+                continue  # already acked/snoozed — don't re-act every cycle
+            try:
+                self.suppressions.add(
+                    fingerprint=fp,
+                    key=h.key,
+                    reason=f"auto-snoozed (non-urgent {h.severity}): {h.title}",
+                    operator="agent",
+                    ttl_seconds=ttl,
+                )
+            except Exception as exc:
+                safe = classify_exception(exc)
+                log_exception("proactive_auto_snooze_failed", exc, category=safe.category, hotspot=h.key)
+                continue
+            snoozed.append(h.key)
+            active_ids.append(fp)
+            if self.settings.auto_snooze_icinga_ack:
+                await self._auto_snooze_icinga_ack(h, ttl)
+        if snoozed:
+            log.info("proactive_auto_snoozed", count=len(snoozed), keys=snoozed)
+            try:
+                await self._report_auto_snooze(snoozed, raw)
+            except Exception as exc:  # audit post is advisory
+                safe = classify_exception(exc)
+                log_exception("proactive_auto_snooze_report_failed", exc, category=safe.category)
+        return snoozed
+
+    async def _auto_snooze_icinga_ack(self, h: Hotspot, ttl: int) -> None:
+        target = await self._icinga_target_for(h)
+        if target is None:
+            return
+        host, service = target
+        await acknowledge_icinga(
+            self.mcp_runtime,
+            host_name=host,
+            service_name=service,
+            comment=f"NOC agent auto-snoozed non-urgent {h.severity}: {h.title}; ack auto-expires.",
+            ack_ttl_seconds=ttl,
+            notify=False,
+        )
+
+    async def _icinga_target_for(self, h: Hotspot) -> tuple[str, str | None] | None:
+        """Best-effort: the single Icinga WARNING problem matching this hotspot,
+        so the ack hits a real object (never a fabricated name). None if there's
+        no confident unique match — the internal snooze still applies."""
+        host = (h.resource or "").strip()
+        if host == "" or self.mcp_runtime is None:
+            return None
+        try:
+            res = await self.mcp_runtime.call_tool(
+                "hyrule", "icinga_list_problems", {"object_type": "service", "limit": 100}
+            )
+        except Exception:
+            return None
+        if not isinstance(res, dict):
+            return None
+        cat = (h.category or "").lower()
+        matches: list[tuple[str, str | None]] = []
+        for p in res.get("problems") or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                state = int(float(p.get("state")))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if state != 1:  # WARNING only — never auto-ack a CRITICAL (2)
+                continue
+            if str(p.get("host") or "").strip() != host:
+                continue
+            name = str(p.get("name") or "")
+            svc = name.split("!", 1)[1] if "!" in name else name
+            if cat and cat not in svc.lower() and cat not in name.lower():
+                continue
+            matches.append((host, svc or None))
+        return matches[0] if len(matches) == 1 else None
+
+    async def _report_auto_snooze(self, snoozed_keys: list[str], raw: list[Hotspot]) -> None:
+        by_key = {h.key: h for h in raw}
+        ttl_label = _format_ttl(self.settings.auto_snooze_ttl_s)
+        lines = [
+            f"• {by_key[k].title} ({by_key[k].severity})"
+            for k in snoozed_keys
+            if k in by_key
+        ]
+        await send_discord_notification(
+            title=f"🔕 Auto-snoozed {len(snoozed_keys)} non-urgent finding(s) for {ttl_label}",
+            description="\n".join(lines) or "non-urgent findings muted",
+            color=0x95A5A6,
+            level=Verbosity.INFO,
+        )
+
     def _should_deep_scan(self) -> bool:
         return (time.time() - self._last_deep_scan) >= max(self.settings.interval_s, self.settings.deep_scan_s)
 
@@ -465,6 +584,16 @@ class ProactiveLoop:
 
 def _sev_rank(severity: str) -> int:
     return {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(str(severity).upper(), 0)
+
+
+def _format_ttl(seconds: int) -> str:
+    if seconds >= 86400:
+        days = seconds / 86400
+        return f"{int(days)}d" if days == int(days) else f"{days:.1f}d"
+    if seconds >= 3600:
+        hours = seconds / 3600
+        return f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+    return f"{max(1, seconds // 60)}m"
 
 
 def _hotspot_field(

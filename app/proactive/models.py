@@ -206,6 +206,7 @@ class ProactiveCycleReport(BaseModel):
     detail: str = ""
     hotspots: list[Hotspot] = Field(default_factory=list)
     investigated: list[str] = Field(default_factory=list)
+    auto_snoozed: list[str] = Field(default_factory=list)
     handoffs: list[str] = Field(default_factory=list)
     cost_usd: float = 0.0
     decision_id: str | None = None
