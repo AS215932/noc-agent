@@ -205,6 +205,24 @@ The manifest is the machine-readable intended-state anchor. Live MCP telemetry
 is compared against it during investigation so proposals can call out drift
 instead of inventing a configuration story.
 
+## Knowledge shadow fixtures
+
+This repo includes read-only AS215932 knowledge context-pack fixtures under
+`evals/knowledge_shadow/`. They validate the future `AS215932/knowledge`
+integration in **shadow mode only**: fixture shape, citations, policy result,
+required NOC sections, and null vector-score placeholders. The production NOC
+runtime does not consume these fixtures and this tranche adds no live knowledge
+service calls.
+
+Run the fixture evals with:
+
+```bash
+uv run pytest tests/test_knowledge_shadow.py
+```
+
+Fixtures must never contain MCP responses, Prometheus/Icinga raw output, logs,
+packet data, commands, credentials, authorization headers, or secrets.
+
 ## Key configuration
 
 - `NOC_REDIS_URL`
