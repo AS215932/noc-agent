@@ -70,6 +70,11 @@ class ProactiveLoopSettings:
     # digest is otherwise posted only when the hotspot set changes, so a stable
     # set doesn't spam Discord every scan cycle.
     report_reassert_s: int = 3600
+    # Don't re-investigate the same hotspot (by fingerprint) more often than
+    # this (seconds). A persistent condition is diagnosed once; later cycles
+    # report it via the de-dup gate instead of burning the daily investigation
+    # budget — and the forced "investigated" digest post — on the same finding.
+    investigation_cooldown_s: int = 21600
     auto_heavy_probes: bool = False
     handoff_enabled: bool = False
     handoff_repo: str = "AS215932/network-operations"
@@ -159,6 +164,9 @@ def load_proactive_settings() -> ProactiveLoopSettings:
             "NOC_PROACTIVE_COST_USD_PER_INVESTIGATION", base.cost_usd_per_investigation
         ),
         report_reassert_s=_env_int("NOC_PROACTIVE_REPORT_REASSERT_S", base.report_reassert_s),
+        investigation_cooldown_s=_env_int(
+            "NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S", base.investigation_cooldown_s
+        ),
         auto_heavy_probes=_env_bool("NOC_PROACTIVE_AUTO_HEAVY_PROBES", base.auto_heavy_probes),
         handoff_enabled=_env_bool("NOC_PROACTIVE_HANDOFF_ENABLED", base.handoff_enabled),
         handoff_repo=_env_str("NOC_PROACTIVE_HANDOFF_REPO", base.handoff_repo),
@@ -192,6 +200,9 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
             table, "cost_usd_per_investigation", defaults.cost_usd_per_investigation, errors
         ),
         report_reassert_s=_int_value(table, "report_reassert_s", defaults.report_reassert_s, errors),
+        investigation_cooldown_s=_int_value(
+            table, "investigation_cooldown_s", defaults.investigation_cooldown_s, errors
+        ),
         auto_heavy_probes=_bool_value(table, "auto_heavy_probes", defaults.auto_heavy_probes, errors),
         handoff_enabled=_bool_value(table, "handoff_enabled", defaults.handoff_enabled, errors),
         handoff_repo=_str_value(table, "handoff_repo", defaults.handoff_repo, errors),

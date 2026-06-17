@@ -14,6 +14,7 @@ before any autonomous LLM spend.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,9 @@ class ProactiveLoop:
             from app.proactive.suppressions import SuppressionStore
 
             self.suppressions = SuppressionStore(self._state_dir / "suppressions.json")
+        # Per-fingerprint last-investigated timestamps, so a persistent hotspot
+        # isn't re-diagnosed (and re-posted) every cycle (investigation_cooldown_s).
+        self._investigations_path = self._state_dir / "investigations.json"
         self.running = False
         self.paused = False
         self.last_report: ProactiveCycleReport | None = None
@@ -214,8 +218,14 @@ class ProactiveLoop:
     ) -> int:
         if self._investigator is None or gate.max_investigations <= 0:
             return 0
+        # Skip hotspots diagnosed within the cooldown — a persistent condition is
+        # investigated once, then surfaced via the digest de-dup gate, not re-run
+        # (and re-posted) every cycle until the daily budget is gone.
+        recent = self._recent_investigation_fps()
+        fresh = [h for h in gate.eligible if h.fingerprint() not in recent]
         investigated = 0
-        for hotspot in gate.eligible[: gate.max_investigations]:
+        done: list[str] = []
+        for hotspot in fresh[: gate.max_investigations]:
             try:
                 outcome = await self._investigator(hotspot, decision)
             except Exception as exc:  # one bad investigation isn't fatal
@@ -226,15 +236,68 @@ class ProactiveLoop:
             if outcome is None:
                 continue
             investigated += 1
+            done.append(hotspot.fingerprint())
             report.investigated.append(hotspot.key)
             report.cost_usd = round(report.cost_usd + outcome.cost_usd, 6)
             if outcome.handoff_url:
                 report.handoffs.append(outcome.handoff_url)
+        self._record_investigations(done)
         return investigated
+
+    def _recent_investigation_fps(self, now: float | None = None) -> set[str]:
+        """Fingerprints investigated within ``investigation_cooldown_s``."""
+        cooldown = self.settings.investigation_cooldown_s
+        if cooldown <= 0:
+            return set()
+        now = now if now is not None else time.time()
+        try:
+            data = json.loads(self._investigations_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+        if not isinstance(data, dict):
+            return set()
+        return {
+            fp for fp, ts in data.items() if isinstance(ts, (int, float)) and (now - ts) < cooldown
+        }
+
+    def _record_investigations(self, fingerprints: list[str], now: float | None = None) -> None:
+        """Stamp fingerprints as just-investigated; prune entries past the
+        cooldown so the file stays small. Best-effort — never breaks a cycle."""
+        if self.settings.investigation_cooldown_s <= 0 or not fingerprints:
+            return
+        now = now if now is not None else time.time()
+        cooldown = self.settings.investigation_cooldown_s
+        try:
+            try:
+                data = json.loads(self._investigations_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            except (OSError, json.JSONDecodeError):
+                data = {}
+            for fp in fingerprints:
+                data[fp] = now
+            data = {
+                fp: ts
+                for fp, ts in data.items()
+                if isinstance(ts, (int, float)) and (now - ts) < cooldown
+            }
+            self._investigations_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._investigations_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(self._investigations_path)
+        except OSError as exc:
+            safe = classify_exception(exc)
+            log_exception("proactive_investigation_log_failed", exc, category=safe.category)
 
     def _apply_suppressions(self, raw: list[Hotspot]) -> list[Hotspot]:
         """Drop operator-acked hotspots from the digest + investigation, and
-        prune suppressions whose hotspot has resolved (so it re-alerts later)."""
+        prune *resolved* suppressions so a recurrence re-alerts.
+
+        A timed snooze (``expires_at`` set) is kept until it expires even while
+        its hotspot flaps clear — otherwise a signal hovering at its threshold
+        (e.g. a disk oscillating around its fill mark) sheds its ack on every
+        brief all-clear and re-alerts. An untimed ack ("until resolved") is
+        still pruned the moment its hotspot stops firing."""
         if self.suppressions is None:
             return raw
         try:
@@ -242,10 +305,11 @@ class ProactiveLoop:
             if not active:
                 return raw
             # An ack id is a *prefix* of the full hotspot fingerprint (the digest
-            # shows a short id), matched like a git short-SHA. Prune acks whose
-            # hotspot no longer fires so a recurrence re-alerts.
+            # shows a short id), matched like a git short-SHA.
             firing = [h.fingerprint() for h in raw]
-            for ack_id in list(active):
+            for ack_id, entry in list(active.items()):
+                if entry.get("expires_at") is not None:
+                    continue  # timed snooze: survives flapping until it expires
                 if not any(fp.startswith(ack_id) for fp in firing):
                     self.suppressions.remove(ack_id)
             active_ids = list(self.suppressions.active())

@@ -280,6 +280,61 @@ async def test_report_failure_is_retried_next_cycle(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_investigation_cooldown_skips_reinvestigation(tmp_path):
+    # A persistent hotspot is diagnosed once; the next cycle it's on cooldown, so
+    # the loop spends its budget on the *other* hotspot instead of re-running the
+    # same one (which would force a duplicate digest post every cycle).
+    seen = []
+
+    async def investigator(hotspot, decision):
+        seen.append(hotspot.fingerprint())
+        return InvestigationOutcome(incident_id="inc")
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(
+            tmp_path, shadow=False, max_investigations_per_cycle=1, investigation_cooldown_s=3600
+        ),
+        reporter=_Capture(),
+        investigator=investigator,
+        model_chain=lambda: ["m"],
+    )
+    await lp.run_once(deep=True)  # investigates the top (disk HIGH)
+    await lp.run_once(deep=True)  # disk on cooldown → investigates the other (bgp)
+    r3 = await lp.run_once(deep=True)  # both on cooldown → nothing
+    assert len(seen) == 2 and len(set(seen)) == 2  # each fingerprint investigated once
+    assert r3.outcome == "scanned" and not r3.investigated
+
+
+@pytest.mark.asyncio
+async def test_timed_snooze_survives_flap_untimed_pruned(tmp_path):
+    # A flapping hotspot (disk hovering at its threshold) sheds an untimed ack on
+    # every brief all-clear and re-alerts; a *timed* snooze must persist instead.
+    from app.proactive.suppressions import SuppressionStore
+
+    store = SuppressionStore(tmp_path / "supp.json")
+    runtime = _runtime()
+    lp = ProactiveLoop(
+        runtime,
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        suppressions=store,
+    )
+    r1 = await lp.run_once(deep=True)
+    timed = r1.hotspots[0]
+    store.add(fingerprint=timed.fingerprint(), key=timed.key, ttl_seconds=3600)  # snooze
+    store.add(fingerprint="deadbeef", key="untimed")  # untimed ack, never firing
+    # everything resolves (the flap to all-clear)
+    for needle in ('state!="Established"', "node_filesystem_size_bytes", "predict_linear"):
+        runtime.by_query[needle] = {"ok": True, "result": []}
+    await lp.run_once(deep=True)
+    active = store.active()
+    assert timed.fingerprint() in active  # timed snooze survives the all-clear
+    assert "deadbeef" not in active  # untimed ack pruned once it stops firing
+
+
+@pytest.mark.asyncio
 async def test_deep_cycle_records_observations_and_journal(tmp_path):
     from app.proactive.memory import ProactiveMemory
 
