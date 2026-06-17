@@ -207,12 +207,12 @@ instead of inventing a configuration story.
 
 ## Knowledge shadow fixtures
 
-This repo includes read-only AS215932 knowledge context-pack fixtures under
-`evals/knowledge_shadow/`. They validate the future `AS215932/knowledge`
-integration in **shadow mode only**: fixture shape, citations, policy result,
-required NOC sections, and null vector-score placeholders. The production NOC
-runtime does not consume these fixtures and this tranche adds no live knowledge
-service calls.
+This repo includes read-only AS215932 knowledge context-pack and learning-event
+fixtures under `evals/knowledge_shadow/`. They validate the future
+`AS215932/knowledge` integration in **shadow mode only**: fixture shape,
+citations, policy result, required NOC sections, null vector-score placeholders,
+and sanitized `learning_ledger_v1` summaries. The production NOC runtime does
+not consume these fixtures and this tranche adds no live knowledge service calls.
 
 Run the fixture evals with:
 
@@ -221,7 +221,8 @@ uv run pytest tests/test_knowledge_shadow.py
 ```
 
 Fixtures must never contain MCP responses, Prometheus/Icinga raw output, logs,
-packet data, commands, credentials, authorization headers, or secrets.
+packet data, commands, credentials, authorization headers, or secrets. Learning
+events remain A4 fixtures/proposals until human review promotes them elsewhere.
 
 ## Key configuration
 
