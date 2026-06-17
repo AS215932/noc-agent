@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, suppress
 from app import log
 from app.agent import noc_triage_agent
 from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
+from app.icinga_ack import acknowledge_icinga
 from app.discord import install_bot_notifier, install_case_notifier
 from app.discord_bot import build_bot
 from app.mail import check_mailbox_connection, process_mailbox_once
@@ -567,6 +568,36 @@ async def _handle_case_update(result: CaseIntakeResult) -> None:
     )
 
 
+async def _take_ownership_ack(alert_payload: dict, case: dict | None, runtime) -> None:
+    """When an Icinga-sourced alert starts an investigation, acknowledge the
+    problem so Icinga stops re-paging humans while the agent works it. The ack
+    auto-expires (NOC_AUTO_ACK_TTL_S) so an unresolved investigation re-surfaces.
+    Off unless NOC_AUTO_ACK_ON_INVESTIGATION=1; best-effort (never blocks triage)."""
+    if os.getenv("NOC_AUTO_ACK_ON_INVESTIGATION", "0") != "1":
+        return
+    if str(alert_payload.get("source")) != "icinga2":
+        return  # only Icinga-sourced alerts have an Icinga object to ack
+    labels = {**(alert_payload.get("commonLabels") or {}), **(alert_payload.get("groupLabels") or {})}
+    host = str(labels.get("host") or labels.get("hostname") or "").strip()
+    service = (str(labels.get("service") or "").strip() or None)
+    if not host:
+        return
+    case_no = (case or {}).get("case_number") or (case or {}).get("incident_id") or ""
+    try:
+        ttl = max(60, int(os.getenv("NOC_AUTO_ACK_TTL_S", "7200")))
+    except ValueError:
+        ttl = 7200
+    await acknowledge_icinga(
+        runtime,
+        host_name=host,
+        service_name=service,
+        comment=f"NOC agent investigating ({case_no}); ack auto-expires.".strip(),
+        case_id=str((case or {}).get("incident_id") or ""),
+        ack_ttl_seconds=ttl,
+        notify=False,
+    )
+
+
 async def investigate_alert(alert_payload: dict, model=None, case: dict | None = None, *, mcp_runtime=None):
     runtime = mcp_runtime if mcp_runtime is not None else globals()["mcp_runtime"]
     event = (case or {}).get("latest_event") or case_event_from_alert(alert_payload)
@@ -594,6 +625,8 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
         color=0xf39c12,
         level=Verbosity.INFO,
     )
+
+    await _take_ownership_ack(alert_payload, case, runtime)
 
     run_started = start_run("triage")
     try:

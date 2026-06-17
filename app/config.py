@@ -75,6 +75,13 @@ class ProactiveLoopSettings:
     # report it via the de-dup gate instead of burning the daily investigation
     # budget — and the forced "investigated" digest post — on the same finding.
     investigation_cooldown_s: int = 21600
+    # Autonomously snooze non-urgent (LOW, not warrants_change) hotspots: mute
+    # them from the digest for auto_snooze_ttl_s and best-effort ack the matching
+    # Icinga WARNING problem (with an expiry so it auto-clears). Bounded per cycle.
+    auto_snooze_enabled: bool = False
+    auto_snooze_ttl_s: int = 86400
+    auto_snooze_max_per_cycle: int = 3
+    auto_snooze_icinga_ack: bool = True
     auto_heavy_probes: bool = False
     handoff_enabled: bool = False
     handoff_repo: str = "AS215932/network-operations"
@@ -167,6 +174,12 @@ def load_proactive_settings() -> ProactiveLoopSettings:
         investigation_cooldown_s=_env_int(
             "NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S", base.investigation_cooldown_s
         ),
+        auto_snooze_enabled=_env_bool("NOC_PROACTIVE_AUTO_SNOOZE_ENABLED", base.auto_snooze_enabled),
+        auto_snooze_ttl_s=_env_int("NOC_PROACTIVE_AUTO_SNOOZE_TTL_S", base.auto_snooze_ttl_s),
+        auto_snooze_max_per_cycle=_env_int(
+            "NOC_PROACTIVE_AUTO_SNOOZE_MAX_PER_CYCLE", base.auto_snooze_max_per_cycle
+        ),
+        auto_snooze_icinga_ack=_env_bool("NOC_PROACTIVE_AUTO_SNOOZE_ICINGA_ACK", base.auto_snooze_icinga_ack),
         auto_heavy_probes=_env_bool("NOC_PROACTIVE_AUTO_HEAVY_PROBES", base.auto_heavy_probes),
         handoff_enabled=_env_bool("NOC_PROACTIVE_HANDOFF_ENABLED", base.handoff_enabled),
         handoff_repo=_env_str("NOC_PROACTIVE_HANDOFF_REPO", base.handoff_repo),
@@ -202,6 +215,14 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
         report_reassert_s=_int_value(table, "report_reassert_s", defaults.report_reassert_s, errors),
         investigation_cooldown_s=_int_value(
             table, "investigation_cooldown_s", defaults.investigation_cooldown_s, errors
+        ),
+        auto_snooze_enabled=_bool_value(table, "auto_snooze_enabled", defaults.auto_snooze_enabled, errors),
+        auto_snooze_ttl_s=_int_value(table, "auto_snooze_ttl_s", defaults.auto_snooze_ttl_s, errors),
+        auto_snooze_max_per_cycle=_int_value(
+            table, "auto_snooze_max_per_cycle", defaults.auto_snooze_max_per_cycle, errors
+        ),
+        auto_snooze_icinga_ack=_bool_value(
+            table, "auto_snooze_icinga_ack", defaults.auto_snooze_icinga_ack, errors
         ),
         auto_heavy_probes=_bool_value(table, "auto_heavy_probes", defaults.auto_heavy_probes, errors),
         handoff_enabled=_bool_value(table, "handoff_enabled", defaults.handoff_enabled, errors),
