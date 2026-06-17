@@ -1,0 +1,44 @@
+{
+  "authority_tier": "A4",
+  "citations": [
+    {
+      "concept_id": "generated/deployments/noc-agent-on-noc",
+      "source_uri": "repo://AS215932/network-operations/ansible/inventory/host_vars/noc.yml@fixture"
+    }
+  ],
+  "context_pack_ids": [
+    "ctx_fixture_noc-agent"
+  ],
+  "data_classes": [
+    "sanitized_trace_summary",
+    "source_ref",
+    "okf_concept"
+  ],
+  "event_time": "2026-06-17T00:00:00Z",
+  "event_type": "noc_shadow_eval_summary",
+  "id": "learn_fixture_noc_shadow_summary",
+  "ledger_version": "learning_ledger_v1",
+  "lessons": [
+    "NOC shadow fixtures can validate intended context shape but must not include live telemetry payloads."
+  ],
+  "metadata": {
+    "fixture": true,
+    "runtime_integration": false
+  },
+  "metrics": {
+    "live_calls": 0,
+    "shadow_only": true,
+    "vector_scores_null": true
+  },
+  "policy_decision_ids": [
+    "pol_fixture_noc-agent"
+  ],
+  "producer": "noc_shadow",
+  "promotion": {
+    "review_required": true,
+    "target": "AS215932/knowledge:ledger/fixtures"
+  },
+  "status": "fixture",
+  "subject": "noc_shadow:noc-agent-fixture",
+  "summary": "Sanitized NOC shadow learning fixture proving no live runtime calls are required for knowledge context shape validation."
+}
