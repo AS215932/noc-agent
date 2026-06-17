@@ -113,6 +113,9 @@ class ScanContext:
     # Active lessons injected into scanner reasoning (Phase 3). Hook kept here
     # so rules can consult tuned thresholds without a signature change.
     lessons: list[str] = field(default_factory=list)
+    # Set when a query failed this cycle, so the loop can tell a *degraded* scan
+    # from a genuinely empty one and not resolve hotspots it couldn't observe.
+    degraded: bool = False
 
     async def prom(self, query: str) -> list[Sample]:
         try:
@@ -120,6 +123,7 @@ class ScanContext:
         except Exception as exc:  # one rule failure must not kill the cycle
             safe = classify_exception(exc)
             log_exception("proactive_prom_query_failed", exc, category=safe.category, query=query[:120])
+            self.degraded = True
             return []
         return parse_prom_vector(resp)
 
@@ -462,6 +466,11 @@ DEEP_RULES: tuple[ScanRule, ...] = (
     rule_disk_fill,
     rule_tls_expiry,
 )
+
+# rule_id values produced by DEEP_RULES — kept in sync by hand (rule_id is set
+# inside each Hotspot). The loop uses this to carry deep-rule hotspots forward on
+# cheap-only cycles instead of treating "not scanned" as "resolved".
+DEEP_RULE_IDS: frozenset[str] = frozenset({"disk_fill", "tls_expiry"})
 
 
 async def scan(ctx: ScanContext, *, deep: bool = False) -> list[Hotspot]:

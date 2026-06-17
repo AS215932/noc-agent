@@ -335,6 +335,49 @@ async def test_timed_snooze_survives_flap_untimed_pruned(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cheap_cycle_does_not_resolve_deep_hotspot(tmp_path):
+    # The disk rule is deep-only; a cheap cycle that doesn't scan it must NOT
+    # post a false all-clear — the deep hotspot is carried forward.
+    cap = _Capture()
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=cap,
+        model_chain=lambda: ["m"],
+    )
+    r1 = await lp.run_once(deep=True)  # deep: disk + bgp fire → post
+    assert any(h.rule_id == "disk_fill" for h in r1.hotspots)
+    r2 = await lp.run_once(deep=False)  # cheap-only: disk not scanned
+    assert any(h.rule_id == "disk_fill" for h in r2.hotspots)  # carried, not resolved
+    assert len(cap.calls) == 1  # unchanged set → no re-post, no all-clear
+
+
+@pytest.mark.asyncio
+async def test_degraded_scan_does_not_resolve(tmp_path):
+    # A query failure (degraded) must not resolve anything → no false all-clear.
+    cap = _Capture()
+    runtime = _runtime()
+    lp = ProactiveLoop(
+        runtime,
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=cap,
+        model_chain=lambda: ["m"],
+    )
+    r1 = await lp.run_once(deep=True)
+    n1 = len(r1.hotspots)
+    assert n1 >= 1
+
+    class _Boom:
+        async def call_tool(self, *a, **k):
+            raise RuntimeError("prometheus down")
+
+    lp.mcp_runtime = _Boom()
+    r2 = await lp.run_once(deep=True)  # every query fails → degraded
+    assert {h.fingerprint() for h in r2.hotspots} >= {h.fingerprint() for h in r1.hotspots}
+    assert len(cap.calls) == 1  # nothing resolved → no all-clear posted
+
+
+@pytest.mark.asyncio
 async def test_deep_cycle_records_observations_and_journal(tmp_path):
     from app.proactive.memory import ProactiveMemory
 
