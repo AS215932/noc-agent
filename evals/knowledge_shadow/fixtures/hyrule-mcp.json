@@ -1,0 +1,99 @@
+{
+  "excluded_refs": [],
+  "generated_at": "2026-06-17T00:00:00Z",
+  "id": "ctx_fixture_hyrule-mcp",
+  "included_refs": [
+    {
+      "authority_tier": "A0",
+      "concept_id": "generated/deployments/hyrule-mcp-on-noc",
+      "reason": "fixture",
+      "retrieval_scores": {
+        "exact": 1.0,
+        "fts": null,
+        "graph": null,
+        "vector": null
+      },
+      "source_refs": [
+        {
+          "commit": "fixture",
+          "lines": null,
+          "path": "configs/hyrule-mcp.env.j2",
+          "repo": "AS215932/network-operations",
+          "url": null
+        }
+      ],
+      "title": "Hyrule MCP on noc",
+      "type": "Deployment"
+    }
+  ],
+  "knowledge_snapshot": "fixture-snapshot",
+  "max_chars": 24000,
+  "policy_decision": {
+    "action": "knowledge.context_pack.generate",
+    "actor": "noc_shadow",
+    "constraints": {
+      "no_live_tools": true,
+      "readonly": true,
+      "shadow_only": true
+    },
+    "data_classes": [
+      "source_ref",
+      "okf_concept"
+    ],
+    "environment": "fixture",
+    "id": "pol_fixture_hyrule-mcp",
+    "input": {},
+    "policy_version": "knowledge_policy_v1",
+    "reasons": [
+      "noc_shadow may read fixture context only"
+    ],
+    "requested_at": "2026-06-17T00:00:00Z",
+    "result": "allow",
+    "risk_level": "low",
+    "target": "knowledge:context-pack",
+    "tool_tier": 0
+  },
+  "policy_version": "knowledge_policy_v1",
+  "retrieval_version": "retrieval_v1",
+  "risk_level": "low",
+  "role": "noc_shadow",
+  "sections": [
+    {
+      "body": "Hyrule MCP on noc intended state is sourced from reviewed OKF/source facts.",
+      "name": "intended_state",
+      "refs": [
+        "generated/deployments/hyrule-mcp-on-noc"
+      ]
+    },
+    {
+      "body": "No live telemetry is committed; this fixture represents an empty/not-collected observed-state window.",
+      "name": "observed_state_fixture",
+      "refs": [
+        "generated/deployments/hyrule-mcp-on-noc"
+      ]
+    },
+    {
+      "body": "Unknown until a human runs local safe-health observation.",
+      "name": "drift_or_unknowns",
+      "refs": []
+    },
+    {
+      "body": "Shadow evals are read-only. Do not call live tools, run broad scans, or mutate production.",
+      "name": "safe_diagnostic_boundaries",
+      "refs": []
+    },
+    {
+      "body": "Production mutation, heavy probes, and sensitive data access require human approval outside this fixture.",
+      "name": "forbidden_actions",
+      "refs": []
+    }
+  ],
+  "task": {
+    "summary": "NOC shadow read-only evaluation for Hyrule MCP on noc"
+  },
+  "task_id": "noc-shadow-hyrule-mcp",
+  "token_budget": 6000,
+  "unresolved_questions": [
+    "Observed state was not collected in this committed fixture."
+  ]
+}
