@@ -163,6 +163,20 @@ class IncidentMemory:
                 return identifier
             return self._local.case_number_index.get(identifier.upper())
 
+    async def case_for_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
+        """Resolve the case an alert fingerprint is attached to (used to link a
+        proactive hotspot's digest line to its investigation case)."""
+        fingerprint = str(fingerprint or "").strip()
+        if not fingerprint:
+            return None
+        if self._redis is not None:
+            mapped = await self._redis.get(f"noc:case:fingerprint:{fingerprint}")
+            incident_id = _redis_text(mapped) if mapped else None
+        else:
+            async with self._local.lock:
+                incident_id = self._local.fingerprint_index.get(fingerprint)
+        return await self.get_case(incident_id) if incident_id else None
+
     async def get_case(self, incident_id: str) -> dict[str, Any] | None:
         incident_id = await self.resolve_case_identifier(incident_id) or str(incident_id or "").strip()
         if self._redis is not None:

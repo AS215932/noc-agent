@@ -46,6 +46,8 @@ New control-plane interfaces:
 - `POST /control/proactive/pause`
 - `POST /control/proactive/resume`
 - `POST /control/proactive/run-once`
+- `GET /control/proactive/suppressions`
+- `POST /control/proactive/ack` / `POST /control/proactive/unack`
 
 The `/control/...` endpoints require `X-NOC-Control-Token`. The signed resume
 endpoint requires an HMAC signature using `NOC_APPROVAL_SIGNING_SECRET`.
@@ -129,6 +131,21 @@ To canary cheaply, set `NOC_PROACTIVE_SHADOW=1` (scan-and-report only, no
 autonomous investigation) and flip it back to `0` once the scanners look right.
 To pause production at any time, set `NOC_PROACTIVE_ENABLED=0` and re-apply, or
 hit `POST /control/proactive/pause`.
+
+**Closing the loop — case links + ack/snooze:** each digest hotspot carries an
+**ack id** (short fingerprint) and, once investigated, a link to its **NOC case**
+(set `NOC_CONTROL_PUBLIC_URL` for a clickable link; else the case number shows).
+Mute a known issue you've decided to handle:
+
+```bash
+curl -XPOST -H "x-noc-control-token: $TOK" http://127.0.0.1:8000/control/proactive/ack \
+  -d '{"fingerprint":"<ack id>","reason":"tracked in network-operations#268","ttl_hours":168}'
+```
+
+An acked hotspot drops from the digest **and** from autonomous investigation
+until it resolves — when it stops firing the suppression auto-prunes, so a
+recurrence re-alerts. `GET /control/proactive/suppressions` lists active acks;
+`POST /control/proactive/unack` clears one.
 
 Proactive config (in-code defaults are conservative; the deployment env enables it):
 

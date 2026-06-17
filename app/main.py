@@ -989,6 +989,66 @@ async def control_proactive_run_once(
     return {"status": "ok", "report": report.model_dump(mode="json")}
 
 
+class ProactiveAckRequest(BaseModel):
+    fingerprint: str
+    reason: str = ""
+    issue: str = ""
+    operator: str = "web"
+    ttl_hours: float | None = None
+
+
+class ProactiveUnackRequest(BaseModel):
+    fingerprint: str
+
+
+def _suppression_store():
+    from pathlib import Path as _Path
+
+    from app.proactive.suppressions import SuppressionStore
+
+    return SuppressionStore(_Path(load_proactive_settings().state_dir) / "suppressions.json")
+
+
+@app.get("/control/proactive/suppressions")
+async def control_proactive_suppressions(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    return {"status": "ok", "suppressions": _suppression_store().active()}
+
+
+@app.post("/control/proactive/ack")
+async def control_proactive_ack(
+    request_body: ProactiveAckRequest,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    entry = _suppression_store().add(
+        fingerprint=request_body.fingerprint.strip(),
+        reason=request_body.reason,
+        issue=request_body.issue,
+        operator=request_body.operator,
+        ttl_seconds=(request_body.ttl_hours * 3600) if request_body.ttl_hours else None,
+    )
+    return {"status": "ok", "suppressed": entry}
+
+
+@app.post("/control/proactive/unack")
+async def control_proactive_unack(
+    request_body: ProactiveUnackRequest,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    removed = _suppression_store().remove(request_body.fingerprint.strip())
+    return {"status": "ok", "removed": removed}
+
+
 @app.post("/control/incidents/{incident_id}/decision")
 async def decide_incident(
     incident_id: str,
