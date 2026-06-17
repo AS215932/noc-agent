@@ -171,6 +171,54 @@ async def test_changed_hotspots_repost(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_acked_hotspot_is_suppressed(tmp_path):
+    from app.proactive.suppressions import SuppressionStore
+
+    store = SuppressionStore(tmp_path / "supp.json")
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        suppressions=store,
+    )
+    r1 = await lp.run_once(deep=True)
+    assert len(r1.hotspots) >= 1
+    target = r1.hotspots[0]
+    store.add(fingerprint=target.fingerprint(), key=target.key, operator="svag")
+    r2 = await lp.run_once(deep=True)
+    assert target.fingerprint() not in {h.fingerprint() for h in r2.hotspots}
+    assert len(r2.hotspots) == len(r1.hotspots) - 1
+
+
+@pytest.mark.asyncio
+async def test_suppression_pruned_when_resolved(tmp_path):
+    from app.proactive.suppressions import SuppressionStore
+
+    store = SuppressionStore(tmp_path / "supp.json")
+    store.add(fingerprint="deadbeef", key="not-firing")  # never appears in scan
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        suppressions=store,
+    )
+    await lp.run_once(deep=True)
+    assert "deadbeef" not in store.active()  # resolved → pruned so it can re-alert later
+
+
+def test_hotspot_field_shows_ack_id_and_case_link():
+    from app.proactive.loop import _hotspot_field
+    from app.proactive.models import Hotspot
+
+    h = Hotspot(rule_id="disk_fill", key="rtr:/", severity="MEDIUM", title="Disk / low", summary="15% free", resource="rtr")
+    field = _hotspot_field(h, case={"case_number": "NOC-20260617-007"}, public_url="https://noc.servify.network")
+    assert f"ack id: `{h.fingerprint()[:12]}`" in field["value"]
+    assert "[NOC-20260617-007](https://noc.servify.network/control/cases/NOC-20260617-007)" in field["value"]
+
+
+@pytest.mark.asyncio
 async def test_all_clear_posts_once(tmp_path):
     cap = _Capture()
     runtime = _runtime()

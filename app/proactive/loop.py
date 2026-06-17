@@ -30,6 +30,7 @@ from app.proactive.models import (
     Hotspot,
     Observation,
     ProactiveCycleReport,
+    hotspot_to_alert_payload,
     utc_now,
 )
 from app.proactive.scanner import ScanContext, scan
@@ -74,6 +75,7 @@ class ProactiveLoop:
         active_lessons: Callable[[], list[str]] | None = None,
         incident_memory: Any | None = None,
         memory: Any | None = None,
+        suppressions: Any | None = None,
     ):
         self.mcp_runtime = mcp_runtime
         self.settings = settings or load_proactive_settings()
@@ -88,11 +90,17 @@ class ProactiveLoop:
             self._active_lessons = memory.active_lessons
         else:
             self._active_lessons = lambda: []
+        self._state_dir = Path(self.settings.state_dir)
+        if suppressions is not None:
+            self.suppressions = suppressions
+        else:
+            from app.proactive.suppressions import SuppressionStore
+
+            self.suppressions = SuppressionStore(self._state_dir / "suppressions.json")
         self.running = False
         self.paused = False
         self._task: asyncio.Task[None] | None = None
         self._last_deep_scan = 0.0
-        self._state_dir = Path(self.settings.state_dir)
         # Digest de-dup: remember the last reported hotspot set + when, so an
         # unchanged set doesn't re-post every scan cycle (it re-asserts at most
         # every report_reassert_s).
@@ -161,7 +169,8 @@ class ProactiveLoop:
             ledger = load_ledger(self._state_dir)
             do_deep = self._should_deep_scan() if deep is None else deep
             ctx = ScanContext(self.mcp_runtime, self.settings, lessons=self._active_lessons())
-            report.hotspots = await scan(ctx, deep=do_deep)
+            raw_hotspots = await scan(ctx, deep=do_deep)
+            report.hotspots = self._apply_suppressions(raw_hotspots)
 
             decision = build_decision_context(
                 self.settings,
@@ -220,6 +229,26 @@ class ProactiveLoop:
             if outcome.handoff_url:
                 report.handoffs.append(outcome.handoff_url)
         return investigated
+
+    def _apply_suppressions(self, raw: list[Hotspot]) -> list[Hotspot]:
+        """Drop operator-acked hotspots from the digest + investigation, and
+        prune suppressions whose hotspot has resolved (so it re-alerts later)."""
+        if self.suppressions is None:
+            return raw
+        try:
+            firing = {h.fingerprint() for h in raw}
+            self.suppressions.prune_resolved(firing)
+            active = self.suppressions.active()
+            if not active:
+                return raw
+            kept = [h for h in raw if h.fingerprint() not in active]
+            if len(kept) != len(raw):
+                log.info("proactive_hotspots_suppressed", suppressed=len(raw) - len(kept))
+            return kept
+        except Exception as exc:  # suppression failure must not break the cycle
+            safe = classify_exception(exc)
+            log_exception("proactive_suppressions_failed", exc, category=safe.category)
+            return raw
 
     def _should_deep_scan(self) -> bool:
         return (time.time() - self._last_deep_scan) >= max(self.settings.interval_s, self.settings.deep_scan_s)
@@ -335,20 +364,40 @@ class ProactiveLoop:
             lines.append(f"Investigated: {', '.join(report.investigated)}")
         if report.handoffs:
             lines.append(f"Handoffs: {', '.join(report.handoffs)}")
+        lines.append("_Mute a known one:_ `POST /control/proactive/ack {\"fingerprint\": \"<ack id>\"}`")
+        fields = []
+        for hotspot in top:
+            case = await self._case_for_hotspot(hotspot)
+            fields.append(_hotspot_field(hotspot, case=case, public_url=self.settings.control_public_url))
         await send_discord_notification(
             title=f"{prefix}: {len(report.hotspots)} hotspot(s)",
             description="\n".join(lines),
             color=color,
-            fields=[_hotspot_field(h) for h in top],
+            fields=fields,
             level=Verbosity.INFO,
         )
+
+    async def _case_for_hotspot(self, hotspot: Hotspot) -> dict[str, Any] | None:
+        """The NOC case this hotspot's investigation is attached to (for linking
+        the digest line to the diagnosis). Best-effort."""
+        if self.incident_memory is None:
+            return None
+        try:
+            from app.incident_memory import fingerprint_alert
+
+            fp = fingerprint_alert(hotspot_to_alert_payload(hotspot))
+            return await self.incident_memory.case_for_fingerprint(fp)
+        except Exception:  # linking is advisory; never break the digest
+            return None
 
 
 def _sev_rank(severity: str) -> int:
     return {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(str(severity).upper(), 0)
 
 
-def _hotspot_field(hotspot: Hotspot) -> dict[str, Any]:
+def _hotspot_field(
+    hotspot: Hotspot, *, case: dict[str, Any] | None = None, public_url: str = ""
+) -> dict[str, Any]:
     emoji = _SEVERITY_EMOJI.get(hotspot.severity, "•")
     checks = "; ".join(hotspot.recommended_checks[:2])
     value = hotspot.summary
@@ -356,6 +405,15 @@ def _hotspot_field(hotspot: Hotspot) -> dict[str, Any]:
         value += f"\nNext: {checks}"
     if hotspot.warrants_change:
         value += "\n⚙️ candidate for config change (handoff)"
+    meta = [f"ack id: `{hotspot.fingerprint()[:12]}`"]
+    if case:
+        number = case.get("case_number") or case.get("incident_id") or ""
+        if number:
+            if public_url:
+                meta.append(f"case: [{number}]({public_url.rstrip('/')}/control/cases/{number})")
+            else:
+                meta.append(f"case: {number}")
+    value += "\n" + " · ".join(meta)
     return {"name": f"{emoji} {hotspot.title}"[:256], "value": value[:1024] or "—"}
 
 
