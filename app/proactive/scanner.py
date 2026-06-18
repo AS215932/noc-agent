@@ -78,6 +78,19 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _prom_response_ok(resp: Any) -> bool:
+    """True only for a recognizable *successful* result shape (``ok`` not False
+    and a ``result`` / ``data.result`` present, even if empty). A valid empty
+    vector (``{"ok": true, "result": []}``) is a genuine no-data result, not a
+    failure; a missing-result or ``ok=false`` payload is treated as a failure."""
+    if not isinstance(resp, dict) or resp.get("ok") is False:
+        return False
+    if "result" in resp:
+        return True
+    data = resp.get("data")
+    return isinstance(data, dict) and "result" in data
+
+
 def parse_prom_vector(resp: Any) -> list[Sample]:
     """Extract ``[(labels, value)]`` from a ``prometheus_query`` MCP result.
 
@@ -123,6 +136,13 @@ class ScanContext:
         except Exception as exc:  # one rule failure must not kill the cycle
             safe = classify_exception(exc)
             log_exception("proactive_prom_query_failed", exc, category=safe.category, query=query[:120])
+            self.degraded = True
+            return []
+        if not _prom_response_ok(resp):
+            # A structured failure ({"ok": false, ...}) or malformed payload reads
+            # as an empty vector — mark it degraded so the loop doesn't mistake a
+            # failed query for "no problem" and resolve a hotspot it couldn't see.
+            log.warning("proactive_prom_query_degraded", query=query[:120])
             self.degraded = True
             return []
         return parse_prom_vector(resp)

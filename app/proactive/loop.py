@@ -463,7 +463,12 @@ class ProactiveLoop:
         """
         if degraded:
             seen = {h.fingerprint() for h in raw}
-            return raw + [h for h in self._last_effective if h.fingerprint() not in seen]
+            merged = raw + [h for h in self._last_effective if h.fingerprint() not in seen]
+            # Persist the merged view so a *following* degraded cycle still has
+            # everything to carry forward (don't let a streak of failed scans
+            # erode the set into a false all-clear).
+            self._last_effective = list(merged)
+            return merged
         if do_deep:
             self._last_deep_hotspots = [h for h in raw if h.rule_id in DEEP_RULE_IDS]
             self._last_effective = list(raw)

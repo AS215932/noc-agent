@@ -373,8 +373,11 @@ async def test_degraded_scan_does_not_resolve(tmp_path):
 
     lp.mcp_runtime = _Boom()
     r2 = await lp.run_once(deep=True)  # every query fails → degraded
-    assert {h.fingerprint() for h in r2.hotspots} >= {h.fingerprint() for h in r1.hotspots}
-    assert len(cap.calls) == 1  # nothing resolved → no all-clear posted
+    fps = {h.fingerprint() for h in r1.hotspots}
+    assert {h.fingerprint() for h in r2.hotspots} >= fps
+    r3 = await lp.run_once(deep=True)  # still degraded → merged set persisted, nothing erodes
+    assert {h.fingerprint() for h in r3.hotspots} >= fps
+    assert len(cap.calls) == 1  # nothing resolved across the streak → no all-clear
 
 
 @pytest.mark.asyncio
