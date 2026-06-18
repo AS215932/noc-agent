@@ -78,6 +78,19 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _prom_response_ok(resp: Any) -> bool:
+    """True only for a recognizable *successful* result shape (``ok`` not False
+    and a ``result`` / ``data.result`` present, even if empty). A valid empty
+    vector (``{"ok": true, "result": []}``) is a genuine no-data result, not a
+    failure; a missing-result or ``ok=false`` payload is treated as a failure."""
+    if not isinstance(resp, dict) or resp.get("ok") is False:
+        return False
+    if "result" in resp:
+        return True
+    data = resp.get("data")
+    return isinstance(data, dict) and "result" in data
+
+
 def parse_prom_vector(resp: Any) -> list[Sample]:
     """Extract ``[(labels, value)]`` from a ``prometheus_query`` MCP result.
 
@@ -113,6 +126,9 @@ class ScanContext:
     # Active lessons injected into scanner reasoning (Phase 3). Hook kept here
     # so rules can consult tuned thresholds without a signature change.
     lessons: list[str] = field(default_factory=list)
+    # Set when a query failed this cycle, so the loop can tell a *degraded* scan
+    # from a genuinely empty one and not resolve hotspots it couldn't observe.
+    degraded: bool = False
 
     async def prom(self, query: str) -> list[Sample]:
         try:
@@ -120,6 +136,14 @@ class ScanContext:
         except Exception as exc:  # one rule failure must not kill the cycle
             safe = classify_exception(exc)
             log_exception("proactive_prom_query_failed", exc, category=safe.category, query=query[:120])
+            self.degraded = True
+            return []
+        if not _prom_response_ok(resp):
+            # A structured failure ({"ok": false, ...}) or malformed payload reads
+            # as an empty vector — mark it degraded so the loop doesn't mistake a
+            # failed query for "no problem" and resolve a hotspot it couldn't see.
+            log.warning("proactive_prom_query_degraded", query=query[:120])
+            self.degraded = True
             return []
         return parse_prom_vector(resp)
 
@@ -462,6 +486,11 @@ DEEP_RULES: tuple[ScanRule, ...] = (
     rule_disk_fill,
     rule_tls_expiry,
 )
+
+# rule_id values produced by DEEP_RULES — kept in sync by hand (rule_id is set
+# inside each Hotspot). The loop uses this to carry deep-rule hotspots forward on
+# cheap-only cycles instead of treating "not scanned" as "resolved".
+DEEP_RULE_IDS: frozenset[str] = frozenset({"disk_fill", "tls_expiry"})
 
 
 async def scan(ctx: ScanContext, *, deep: bool = False) -> list[Hotspot]:

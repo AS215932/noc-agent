@@ -185,3 +185,27 @@ async def test_scan_dedup_and_orders_by_score_and_isolates_failures():
     hotspots = await scanner.scan(_ctx(runtime), deep=True)
     assert [h.rule_id for h in hotspots[:2]] == ["disk_fill", "bgp_risk"]  # ordered by score
     assert all(isinstance(h.score, float) for h in hotspots)
+
+
+class _RespRuntime:
+    def __init__(self, resp):
+        self.resp = resp
+
+    async def call_tool(self, source, name, arguments):
+        return self.resp
+
+
+@pytest.mark.asyncio
+async def test_prom_marks_structured_failure_degraded():
+    # A structured tool failure must flag the scan degraded (not look like empty).
+    ctx = ScanContext(_RespRuntime({"ok": False, "error_type": "transport_error"}), ProactiveLoopSettings())
+    assert await ctx.prom("up") == []
+    assert ctx.degraded is True
+
+
+@pytest.mark.asyncio
+async def test_prom_valid_empty_is_not_degraded():
+    # A genuine empty vector (ok=true, result=[]) is real no-data, not a failure.
+    ctx = ScanContext(_RespRuntime({"ok": True, "result": []}), ProactiveLoopSettings())
+    assert await ctx.prom("up") == []
+    assert ctx.degraded is False

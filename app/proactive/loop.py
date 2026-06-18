@@ -35,7 +35,7 @@ from app.proactive.models import (
     hotspot_to_alert_payload,
     utc_now,
 )
-from app.proactive.scanner import ScanContext, scan
+from app.proactive.scanner import DEEP_RULE_IDS, ScanContext, scan
 from app.safe_errors import classify_exception, log_exception
 
 
@@ -112,6 +112,12 @@ class ProactiveLoop:
         # every report_reassert_s).
         self._last_report_signature: frozenset[tuple[str, str]] | None = None
         self._last_report_ts = 0.0
+        # Deep rules (disk, TLS) only run on deep cycles. Remember their last
+        # *clean* result so cheap-only / degraded cycles don't read "not scanned"
+        # as "resolved" and post a false all-clear. _last_effective is the last
+        # trustworthy reported set, carried through a degraded (query-failed) scan.
+        self._last_deep_hotspots: list[Hotspot] = []
+        self._last_effective: list[Hotspot] = []
 
     # --- lifecycle --------------------------------------------------------
 
@@ -176,8 +182,9 @@ class ProactiveLoop:
             do_deep = self._should_deep_scan() if deep is None else deep
             ctx = ScanContext(self.mcp_runtime, self.settings, lessons=self._active_lessons())
             raw_hotspots = await scan(ctx, deep=do_deep)
-            report.auto_snoozed = await self._auto_snooze(raw_hotspots)
-            report.hotspots = self._apply_suppressions(raw_hotspots)
+            effective = self._merge_with_carried(raw_hotspots, do_deep=do_deep, degraded=ctx.degraded)
+            report.auto_snoozed = await self._auto_snooze(effective)
+            report.hotspots = self._apply_suppressions(effective)
 
             decision = build_decision_context(
                 self.settings,
@@ -440,6 +447,35 @@ class ProactiveLoop:
             color=0x95A5A6,
             level=Verbosity.INFO,
         )
+
+    def _merge_with_carried(
+        self, raw: list[Hotspot], *, do_deep: bool, degraded: bool
+    ) -> list[Hotspot]:
+        """Don't read "didn't scan" / "scan failed" as "resolved".
+
+        - **Degraded** (a query failed): the scan is untrustworthy → keep fresh
+          findings but re-add anything we last reported, so nothing resolves on a
+          partial scan (the error-aware hardening).
+        - **Clean cheap cycle**: deep rules (disk, TLS) didn't run → carry their
+          last clean result forward; cheap-rule hotspots are fresh and resolve
+          normally.
+        - **Clean deep cycle**: authoritative — refresh the carried sets.
+        """
+        if degraded:
+            seen = {h.fingerprint() for h in raw}
+            merged = raw + [h for h in self._last_effective if h.fingerprint() not in seen]
+            # Persist the merged view so a *following* degraded cycle still has
+            # everything to carry forward (don't let a streak of failed scans
+            # erode the set into a false all-clear).
+            self._last_effective = list(merged)
+            return merged
+        if do_deep:
+            self._last_deep_hotspots = [h for h in raw if h.rule_id in DEEP_RULE_IDS]
+            self._last_effective = list(raw)
+            return raw
+        effective = [h for h in raw if h.rule_id not in DEEP_RULE_IDS] + list(self._last_deep_hotspots)
+        self._last_effective = list(effective)
+        return effective
 
     def _should_deep_scan(self) -> bool:
         return (time.time() - self._last_deep_scan) >= max(self.settings.interval_s, self.settings.deep_scan_s)
