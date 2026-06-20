@@ -1,7 +1,35 @@
 import pytest
 
-from app.cases import CaseService, InMemoryCaseStore, ObservationRecord, OutboxProcessor
-from app.cases.handlers import build_default_outbox_handlers, build_report_handler
+from app.cases import CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor
+from app.cases.handlers import build_default_outbox_handlers, build_handoff_handler, build_report_handler
+from app.proactive.handoff import GitHubHandoff
+
+
+class FakeGitHub:
+    def __init__(self):
+        self.created = []
+        self.comments = []
+        self.search_returns_existing = False
+
+    async def request(self, method, path, *, params=None, json=None):
+        if method == "GET" and path == "/search/issues":
+            if self.search_returns_existing:
+                return 200, {"items": [self.created[0]]}
+            return 200, {"items": []}
+        if method == "POST" and path.endswith("/issues"):
+            issue = {
+                "number": 202,
+                "html_url": "https://github.com/AS215932/network-operations/issues/202",
+                "body": json["body"],
+                "title": json["title"],
+            }
+            self.created.append(issue)
+            self.search_returns_existing = True
+            return 201, issue
+        if method == "POST" and path.endswith("/comments"):
+            self.comments.append((path, json["body"]))
+            return 201, {}
+        raise AssertionError(f"unexpected request {method} {path}")
 
 
 @pytest.mark.asyncio
@@ -47,7 +75,77 @@ async def test_report_handler_sends_notification_and_marks_case_reported():
 
 
 @pytest.mark.asyncio
-async def test_default_handlers_include_knowledge_candidate_only_when_configured(tmp_path):
+async def test_handoff_handler_creates_issue_and_records_case_result():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(
+            source="proactive",
+            rule_id="bgp_risk",
+            resource="rtr1:peer1",
+            status="firing",
+            severity="HIGH",
+            annotations={"summary": "peer flapping"},
+            signal_snapshot={"summary": "peer flapping"},
+        )
+    )
+    assert created.case is not None
+    await service.record_investigation_result(
+        created.case.case_id,
+        diagnosis={"summary": "BGP peer flap likely needs policy/timer coordination"},
+        recommendations=["check peer timer config"],
+    )
+    intent = await service.handoff_intent(created.case.case_id, payload={"body": "Please review peer policy."})
+    assert intent is not None
+    fake = FakeGitHub()
+    handoff = GitHubHandoff(repo="AS215932/network-operations", token="t", requester=fake.request)
+
+    report = await OutboxProcessor(
+        store,
+        {"handoff": build_handoff_handler(service, handoff_client=handoff, control_public_url="https://noc.example")},
+    ).process_pending()
+
+    assert report.processed == 1
+    assert report.succeeded == 1
+    assert len(fake.created) == 1
+    assert f"noc-case-id:{created.case.case_id}" in fake.created[0]["body"]
+    assert "Please review peer policy." in fake.created[0]["body"]
+    stored_case = await store.get_case(created.case.case_id)
+    assert stored_case is not None
+    assert getattr(stored_case, "issue_url") == "https://github.com/AS215932/network-operations/issues/202"
+    assert getattr(stored_case, "issue_id") == "202"
+    events = [event.event_type for event in await store.case_events(created.case.case_id)]
+    assert "handoff_created_issue" in events
+
+
+@pytest.mark.asyncio
+async def test_handoff_handler_reuses_existing_case_issue():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing"))
+    assert created.case is not None
+    await service.record_handoff_result(created.case.case_id, issue_url="https://github.com/o/r/issues/1", issue_id="1")
+    # Simulates an old queued handoff intent racing with the already-stamped case.
+    intent = await store.enqueue_outbox(
+        OutboxIntent(
+            case_id=created.case.case_id,
+            intent_type="handoff",
+            idempotency_key="handoff:already-stamped",
+        )
+    )
+    fake = FakeGitHub()
+    handoff = GitHubHandoff(repo="o/r", token="t", requester=fake.request)
+
+    report = await OutboxProcessor(store, {"handoff": build_handoff_handler(service, handoff_client=handoff)}).process_pending()
+
+    assert report.succeeded == 1
+    assert fake.created == []
+    stored_intent = next(row for row in await store.list_outbox() if row.outbox_id == intent.outbox_id)
+    assert stored_intent.external_url == "https://github.com/o/r/issues/1"
+
+
+@pytest.mark.asyncio
+async def test_default_handlers_include_knowledge_candidate_and_handoff_only_when_configured(tmp_path):
     store = InMemoryCaseStore()
     service = CaseService(store)
 
@@ -55,4 +153,10 @@ async def test_default_handlers_include_knowledge_candidate_only_when_configured
     assert set(build_default_outbox_handlers(service, knowledge_candidate_dir=tmp_path)) == {
         "report",
         "knowledge_candidate",
+    }
+    handoff = GitHubHandoff(repo="o/r", token="t", requester=FakeGitHub().request)
+    assert set(build_default_outbox_handlers(service, knowledge_candidate_dir=tmp_path, handoff_client=handoff)) == {
+        "report",
+        "knowledge_candidate",
+        "handoff",
     }

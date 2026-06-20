@@ -95,24 +95,39 @@ class GitHubHandoff:
     ) -> str | None:
         """Open (or refresh) the ``loop:candidate`` issue for this hotspot.
         Returns the issue URL, or ``None`` when disabled / on error."""
+        marker = _marker(hotspot)
+        return await self.ensure_candidate_issue_from_body(
+            marker=marker,
+            title=f"[proactive] {hotspot.title}"[:240],
+            body=build_issue_body(hotspot, incident_id=incident_id, manifest_hash=manifest_hash),
+            refresh_comment=f"Still firing as of {utc_now()} (NOC case `{incident_id or 'n/a'}`).",
+            log_prefix="proactive_handoff",
+        )
+
+    async def ensure_candidate_issue_from_body(
+        self,
+        *,
+        marker: str,
+        title: str,
+        body: str,
+        refresh_comment: str,
+        log_prefix: str = "handoff",
+    ) -> str | None:
+        """Open or refresh a loop:candidate issue from a pre-rendered body."""
         if not self._authed or not self.repo:
             return None
-        marker = _marker(hotspot)
         try:
             existing = await self._find_open_issue(marker)
             if existing is not None:
-                await self._comment(
-                    int(existing["number"]),
-                    f"Still firing as of {utc_now()} (NOC case `{incident_id or 'n/a'}`).",
-                )
-                log.info("proactive_handoff_refreshed", repo=self.repo, number=existing.get("number"))
+                await self._comment(int(existing["number"]), refresh_comment)
+                log.info(f"{log_prefix}_refreshed", repo=self.repo, number=existing.get("number"))
                 return existing.get("html_url")
-            url = await self._create_issue(hotspot, incident_id=incident_id, manifest_hash=manifest_hash)
-            log.info("proactive_handoff_created", repo=self.repo, url=url)
+            url = await self._create_issue_from_body(title=title, body=body)
+            log.info(f"{log_prefix}_created", repo=self.repo, url=url)
             return url
         except Exception as exc:  # handoff failure must not break a cycle
             safe = classify_exception(exc)
-            log_exception("proactive_handoff_failed", exc, category=safe.category, repo=self.repo)
+            log_exception(f"{log_prefix}_failed", exc, category=safe.category, repo=self.repo)
             return None
 
     async def _find_open_issue(self, marker: str) -> dict[str, Any] | None:
@@ -125,15 +140,11 @@ class GitHubHandoff:
                 return item
         return None
 
-    async def _create_issue(self, hotspot: Hotspot, *, incident_id: str | None, manifest_hash: str | None) -> str | None:
-        payload = {
-            "title": f"[proactive] {hotspot.title}"[:240],
-            "body": build_issue_body(hotspot, incident_id=incident_id, manifest_hash=manifest_hash),
-            "labels": CANDIDATE_LABELS,
-        }
+    async def _create_issue_from_body(self, *, title: str, body: str) -> str | None:
+        payload = {"title": title[:240], "body": body, "labels": CANDIDATE_LABELS}
         status, body = await self._request("POST", f"/repos/{self.repo}/issues", json=payload)
         if status not in (200, 201) or not isinstance(body, dict):
-            log.warn("proactive_handoff_create_rejected", repo=self.repo, status=status)
+            log.warn("handoff_create_rejected", repo=self.repo, status=status)
             return None
         return body.get("html_url")
 

@@ -225,8 +225,10 @@ NOC_CASE_OUTBOX_ENABLED=1
 The worker processes pending and retry-due failed intents. The default handlers
 send `report` intents to Discord and stamp the case as reported. If
 `NOC_KNOWLEDGE_CANDIDATE_DIR` is set, `knowledge_candidate` intents write
-review-gated learning events there. Handoff intents remain queued until a
-future handler owns the issue-body contract.
+review-gated learning events there. If `NOC_CASE_HANDOFF_REPO` (or
+`NOC_PROACTIVE_HANDOFF_REPO`) plus GitHub auth are configured, `handoff` intents
+open or refresh idempotent `loop:candidate` issues and stamp `issue_url` on the
+case.
 
 Offline replay is available for sanitized fixtures:
 
@@ -301,6 +303,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`
 - `NOC_KNOWLEDGE_CANDIDATE_DIR` (optional output dir for review-gated learning events)
+- `NOC_CASE_HANDOFF_REPO` (optional handoff repo; falls back to `NOC_PROACTIVE_HANDOFF_REPO`)
 - `NOC_DATABASE_URL` / `DATABASE_URL` (optional Postgres case/checkpoint backend DSN)
 - `NOC_REQUIRE_POSTGRES` (default `0`; fail loud if Postgres is required but unavailable)
 - `NOC_DATABASE_POOL_MIN_SIZE` / `NOC_DATABASE_POOL_MAX_SIZE`
