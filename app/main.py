@@ -766,10 +766,10 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
     return plan
 
 
-async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
+async def _shadow_observe_alert_payload(alert_payload: dict) -> list[object]:
     """Best-effort case-service shadow write for reactive webhook payloads."""
     if case_service_runtime is None:
-        return
+        return []
     try:
         from app.cases.notifications import observation_from_icinga_alert_payload, observations_from_alertmanager
 
@@ -777,20 +777,108 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
             observations = [observation_from_icinga_alert_payload(alert_payload)]
         else:
             observations = observations_from_alertmanager(alert_payload)
-        for observation in observations:
-            result = await case_service_runtime.service.observe(observation)
-            record_case_service_shadow_observation(
-                path="reactive",
-                source=observation.source,
-                status=observation.status,
-                action=str(getattr(result, "action", "unknown")),
-            )
-        if observations:
-            log.info("case_service_shadow_reactive_observed", count=len(observations), source=alert_payload.get("source"))
     except Exception as e:
         safe = classify_exception(e)
-        record_case_service_shadow_failure(path="reactive", category=safe.category)
-        log_exception("case_service_shadow_reactive_observe_failed", e, category=safe.category)
+        record_case_service_shadow_failure(path="reactive_normalize", category=safe.category)
+        log_exception("case_service_shadow_reactive_normalize_failed", e, category=safe.category)
+        return []
+
+    results: list[object] = []
+    for observation in observations:
+        try:
+            result = await case_service_runtime.service.observe(observation)
+            results.append(result)
+            record_case_service_shadow_observation(
+                path="reactive",
+                source=getattr(observation, "source", ""),
+                status=getattr(observation, "status", ""),
+                action=str(getattr(result, "action", "unknown")),
+            )
+            await _maybe_request_reactive_case_report(observation, result)
+        except Exception as e:
+            safe = classify_exception(e)
+            record_case_service_shadow_failure(path="reactive", category=safe.category)
+            log_exception("case_service_shadow_reactive_observe_failed", e, category=safe.category)
+    if results:
+        log.info("case_service_shadow_reactive_observed", count=len(results), source=alert_payload.get("source"))
+    return results
+
+
+async def _maybe_request_reactive_case_report(observation, observe_result: object) -> None:
+    """Optionally let CaseService own reactive report enqueue decisions."""
+    if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
+        return
+    if getattr(observation, "status", "") != "firing":
+        return
+    case = getattr(observe_result, "case", None)
+    if case is None:
+        return
+    service = case_service_runtime.service
+    if not service.should_report(case):
+        return
+    state_signature = service.report_state_signature(case)
+    intent = await service.request_report(
+        case,
+        state_signature=state_signature,
+        payload=_reactive_report_payload(case, observation),
+    )
+    log.info(
+        "case_service_reactive_report_requested",
+        case_id=case.case_id,
+        outbox_id=intent.outbox_id,
+        state_signature=state_signature,
+    )
+
+
+def _reactive_report_payload(case, observation) -> dict[str, object]:
+    """Bounded, known-safe schema for untrusted monitor text entering outbox."""
+
+    return {
+        "schema": "reactive_case_report_v1",
+        "untrusted_monitor_text": True,
+        "model_consumption_allowed": False,
+        "source": _safe_monitor_token(getattr(observation, "source", ""), limit=64),
+        "observation_id": _safe_monitor_token(getattr(observation, "observation_id", ""), limit=80),
+        "detector": _safe_monitor_text(getattr(observation, "detector", ""), limit=120),
+        "resource": _safe_monitor_text(getattr(observation, "resource", ""), limit=180),
+        "title": _safe_monitor_text(
+            f"NOC case {getattr(case, 'case_number', '') or getattr(case, 'case_id', '')}: {getattr(case, 'title', '')}",
+            limit=180,
+        ),
+        "description": _safe_monitor_text(
+            getattr(case, "summary", "") or _observation_summary(observation) or "Case observed firing.",
+            limit=700,
+        ),
+    }
+
+
+def _observation_summary(observation) -> str:
+    annotations = getattr(observation, "annotations", {}) or {}
+    if isinstance(annotations, dict):
+        return str(annotations.get("summary") or annotations.get("description") or "")
+    return ""
+
+
+def _safe_monitor_token(value: object, *, limit: int) -> str:
+    text = str(value or "")
+    kept = [ch for ch in text if ch.isalnum() or ch in {"_", "-", ":", ".", "/"}]
+    return ("".join(kept) or "unknown")[:limit]
+
+
+def _safe_monitor_text(value: object, *, limit: int) -> str:
+    text = str(value or "")
+    # The source is untrusted monitoring text. Keep only plain, single-line text
+    # and strip markdown/control delimiters so future consumers don't inherit a
+    # prompt-like or rich-text channel from webhook payloads.
+    cleaned = []
+    blocked = set("`<>[]{}")
+    for ch in text:
+        if ch in blocked or ord(ch) < 32:
+            cleaned.append(" ")
+        else:
+            cleaned.append(ch)
+    rendered = " ".join("".join(cleaned).split())
+    return (rendered or "—")[:limit]
 
 
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
