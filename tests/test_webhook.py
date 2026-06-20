@@ -8,6 +8,7 @@ from app.main import (
     AlertManagerPayload,
     IcingaNotification,
     _embedded_discord_bot_enabled,
+    _record_reactive_case_investigation,
     _release_mail_poller_lock,
     _shadow_observe_alert_payload,
     _try_acquire_mail_poller_lock,
@@ -25,8 +26,21 @@ from app.agent import DiagnosticSynthesis
 from app.cases import CaseService, InMemoryCaseStore
 from app.incident_memory import IncidentMemory
 import app.graph_runtime as graph_runtime
+import app.main as main_module
 from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
+
+
+@pytest.fixture(autouse=True)
+def restore_runtime_globals():
+    """Keep module-level runtime singletons isolated across webhook tests."""
+
+    original_case_service_runtime = main_module.case_service_runtime
+    original_incident_memory = graph_runtime.INCIDENT_MEMORY
+    yield
+    main_module.case_service_runtime = original_case_service_runtime
+    graph_runtime.INCIDENT_MEMORY = original_incident_memory
+
 
 @pytest.fixture
 def mock_alert_payload():
@@ -512,6 +526,81 @@ async def test_shadow_observe_alert_payload_preserves_partial_results(monkeypatc
 
     assert len(results) == 1
     assert service.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reactive_case_service_control_skips_recently_investigated_duplicate(
+    monkeypatch, mock_alert_payload, mocker
+):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+
+    import app.main as main_module
+
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
+    payload = deepcopy(mock_alert_payload)
+    payload["source"] = "alertmanager"
+    first_results = await _shadow_observe_alert_payload(payload)
+    assert first_results and getattr(first_results[0], "case") is not None
+    await service.record_investigation_result(getattr(first_results[0], "case").case_id, diagnosis={"summary": "done"})
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+
+    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
+    assert response["status"] == "accepted"
+    assert "investigate_alert" not in scheduled
+    assert "_handle_case_update" in scheduled
+
+
+@pytest.mark.asyncio
+async def test_record_reactive_case_investigation_stamps_case(monkeypatch, mock_alert_payload):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    payload = deepcopy(mock_alert_payload)
+    payload["source"] = "alertmanager"
+    results = await _shadow_observe_alert_payload(payload)
+    assert results and getattr(results[0], "case") is not None
+    case_id = getattr(results[0], "case").case_id
+    plan = DiagnosticSynthesis(
+        read_only=True,
+        incident_summary="node exporter down on rtr1",
+        confidence_basis="Alertmanager firing and telemetry confirms scrape failure.",
+        confidence_score=0.72,
+        severity="HIGH",
+        recommended_next_checks=["check node_exporter service"],
+        requires_human=True,
+        human_escalation_reason="operator review required",
+        executed_actions=[],
+    )
+
+    await _record_reactive_case_investigation(payload, plan, {"incident_id": "legacy-inc"})
+
+    stored = await store.get_case(case_id)
+    assert stored is not None
+    assert getattr(stored, "last_investigated_at")
+    assert getattr(stored, "diagnosis_signature") == getattr(stored, "signal_signature")
+    assert getattr(stored, "last_diagnosis")["source"] == "reactive_graph"
+    assert getattr(stored, "last_diagnosis")["incident_id"] == "legacy-inc"
+    assert "check node_exporter service" in getattr(stored, "recommendations")
 
 
 @pytest.mark.asyncio

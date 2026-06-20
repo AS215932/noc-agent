@@ -749,6 +749,7 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
         incident_id=graph_state.get("incident_id"),
         active_specialist=graph_state.get("active_specialist"),
     )
+    await _record_reactive_case_investigation(alert_payload, plan, graph_state)
 
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
@@ -771,12 +772,7 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> list[object]:
     if case_service_runtime is None:
         return []
     try:
-        from app.cases.notifications import observation_from_icinga_alert_payload, observations_from_alertmanager
-
-        if str(alert_payload.get("source") or "") == "icinga2":
-            observations = [observation_from_icinga_alert_payload(alert_payload)]
-        else:
-            observations = observations_from_alertmanager(alert_payload)
+        observations = _reactive_observations_from_alert_payload(alert_payload)
     except Exception as e:
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="reactive_normalize", category=safe.category)
@@ -828,6 +824,87 @@ async def _maybe_request_reactive_case_report(observation, observe_result: objec
         outbox_id=intent.outbox_id,
         state_signature=state_signature,
     )
+
+
+def _case_service_reactive_allows_investigation(shadow_results: list[object]) -> bool:
+    """Optionally let CaseService own reactive investigation cooldown gating."""
+    if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False):
+        return True
+    service = case_service_runtime.service
+    firing_case_ids: list[str] = []
+    try:
+        for result in shadow_results:
+            observation = getattr(result, "observation", None)
+            if getattr(observation, "status", "") != "firing":
+                continue
+            case = getattr(result, "case", None)
+            if case is None:
+                continue
+            firing_case_ids.append(str(getattr(case, "case_id", "")))
+            if service.should_investigate(case):
+                return True
+    except Exception as e:
+        safe = classify_exception(e)
+        record_case_service_shadow_failure(path="reactive_control", category=safe.category)
+        log_exception("case_service_reactive_investigation_gate_failed", e, category=safe.category)
+        log.warn("case_service_reactive_investigation_gate_fail_open", category=safe.category)
+        return True
+    if not firing_case_ids:
+        return True
+    log.info("case_service_reactive_investigation_suppressed", case_ids=firing_case_ids)
+    return False
+
+
+async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_state: dict) -> None:
+    """Best-effort stamp of successful reactive graph investigation onto cases."""
+    if case_service_runtime is None:
+        return
+    try:
+        observations = _reactive_observations_from_alert_payload(alert_payload)
+        service = case_service_runtime.service
+        recommendations = list(getattr(plan, "recommended_next_checks", []) or [])
+        proposal = getattr(plan, "remediation_proposal", None)
+        if proposal is not None:
+            recommendations.extend(list(getattr(proposal, "proposed_actions", []) or []))
+        recorded_case_ids: list[str] = []
+        for observation in observations:
+            if getattr(observation, "status", "") != "firing":
+                continue
+            case = await service.case_for_alias("source_fp", getattr(observation, "source_fingerprint", ""))
+            if case is None:
+                continue
+            await service.record_investigation_result(
+                case.case_id,
+                diagnosis={
+                    "source": "reactive_graph",
+                    "incident_id": str(graph_state.get("incident_id") or ""),
+                    "summary": _safe_monitor_text(getattr(plan, "incident_summary", ""), limit=700),
+                    "severity": str(getattr(plan, "severity", "")),
+                    "confidence_score": float(getattr(plan, "confidence_score", 0.0) or 0.0),
+                    "requires_human": bool(getattr(plan, "requires_human", False)),
+                },
+                recommendations=[_safe_monitor_text(item, limit=240) for item in recommendations[:20]],
+                status="complete",
+            )
+            recorded_case_ids.append(case.case_id)
+        if recorded_case_ids:
+            log.info(
+                "case_service_reactive_investigation_recorded",
+                case_ids=recorded_case_ids,
+                incident_id=str(graph_state.get("incident_id") or ""),
+            )
+    except Exception as e:
+        safe = classify_exception(e)
+        record_case_service_shadow_failure(path="reactive_control", category=safe.category)
+        log_exception("case_service_reactive_investigation_record_failed", e, category=safe.category)
+
+
+def _reactive_observations_from_alert_payload(alert_payload: dict):
+    from app.cases.notifications import observation_from_icinga_alert_payload, observations_from_alertmanager
+
+    if str(alert_payload.get("source") or "") == "icinga2":
+        return [observation_from_icinga_alert_payload(alert_payload)]
+    return observations_from_alertmanager(alert_payload)
 
 
 def _reactive_report_payload(case, observation) -> dict[str, object]:
@@ -921,9 +998,13 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
     """Receives alerts from Prometheus Alertmanager and triggers the NOC agent."""
     alert_payload = payload.model_dump()
     alert_payload["source"] = "alertmanager"
-    await _shadow_observe_alert_payload(alert_payload)
+    shadow_results = await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
-    if result.should_investigate and result.case is not None:
+    if (
+        result.should_investigate
+        and result.case is not None
+        and _case_service_reactive_allows_investigation(shadow_results)
+    ):
         background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
     elif result.case is not None or result.parent_case is not None:
         background_tasks.add_task(_handle_case_update, result)
@@ -940,9 +1021,13 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
 async def icinga_webhook(payload: IcingaNotification, background_tasks: BackgroundTasks):
     """Receives Icinga2 NotificationCommand POSTs and triggers the NOC agent."""
     alert_payload = _icinga_to_alert_payload(payload)
-    await _shadow_observe_alert_payload(alert_payload)
+    shadow_results = await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
-    if result.should_investigate and result.case is not None:
+    if (
+        result.should_investigate
+        and result.case is not None
+        and _case_service_reactive_allows_investigation(shadow_results)
+    ):
         background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
     elif result.case is not None or result.parent_case is not None:
         background_tasks.add_task(_handle_case_update, result)
