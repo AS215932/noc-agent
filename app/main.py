@@ -1159,6 +1159,73 @@ async def control_case_detail(case_id: str, request: Request, token: str | None 
     return {"status": "ok", **detail}
 
 
+@app.get("/control/case-service/cases")
+async def control_case_service_cases(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+    kind: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    safe_kind = _validated_case_service_kind(kind)
+    if case_service_runtime is None:
+        return {"status": "disabled", "enabled": False, "cases": []}
+    store = case_service_runtime.store
+    cases = await store.list_cases(kind=safe_kind, limit=limit)
+    return {
+        "status": "ok",
+        "enabled": True,
+        "backend": type(store).__name__,
+        "cases": [_case_service_case_summary(case) for case in cases],
+    }
+
+
+@app.get("/control/case-service/cases/{case_id}")
+async def control_case_service_case_detail(
+    case_id: str,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    safe_case_id = _validated_case_service_id(case_id)
+    runtime = _require_case_service_runtime()
+    store = runtime.store
+    case = await store.get_case(safe_case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case-service case not found")
+    events = await store.case_events(safe_case_id)
+    traces = await store.list_traces(case_id=safe_case_id)
+    feedback = await store.list_feedback(case_id=safe_case_id)
+    return {
+        "status": "ok",
+        "backend": type(store).__name__,
+        "case": case.model_dump(mode="json"),
+        "events": [event.model_dump(mode="json") for event in events],
+        "traces": [trace.model_dump(mode="json") for trace in traces],
+        "feedback": [item.model_dump(mode="json") for item in feedback],
+    }
+
+
+@app.get("/control/case-service/outbox")
+async def control_case_service_outbox(
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+    outbox_status: str | None = Query(default=None, alias="status"),
+):
+    _require_control_request(request, token, x_noc_control_token)
+    safe_status = _validated_case_service_outbox_status(outbox_status)
+    runtime = _require_case_service_runtime()
+    rows = await runtime.store.list_outbox(status=safe_status)
+    return {
+        "status": "ok",
+        "backend": type(runtime.store).__name__,
+        "outbox": [row.model_dump(mode="json") for row in rows],
+    }
+
+
 @app.get("/control/cases/{case_id}/events")
 async def control_case_events(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
@@ -1289,6 +1356,56 @@ def _proactive_hotspots_view() -> list[dict]:
         }
         for h in proactive_loop.last_report.top(20)
     ]
+
+
+def _require_case_service_runtime():
+    if case_service_runtime is None:
+        raise HTTPException(status_code=409, detail="Case service runtime is not enabled")
+    return case_service_runtime
+
+
+def _validated_case_service_kind(value: str | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    rendered = str(value).strip()
+    if rendered not in {"atomic", "meta"}:
+        raise HTTPException(status_code=422, detail="kind must be one of: atomic, meta")
+    return rendered
+
+
+def _validated_case_service_outbox_status(value: str | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    rendered = str(value).strip()
+    allowed = {"pending", "in_progress", "succeeded", "failed", "abandoned"}
+    if rendered not in allowed:
+        raise HTTPException(status_code=422, detail="status must be a valid outbox status")
+    return rendered
+
+
+def _validated_case_service_id(value: str) -> str:
+    rendered = str(value or "").strip()
+    allowed_chars = {"_", "-", ":", "."}
+    if not (1 <= len(rendered) <= 128) or any(not (ch.isalnum() or ch in allowed_chars) for ch in rendered):
+        raise HTTPException(status_code=422, detail="case_id contains invalid characters")
+    return rendered
+
+
+def _case_service_case_summary(case) -> dict:
+    return {
+        "case_id": getattr(case, "case_id", ""),
+        "case_number": getattr(case, "case_number", "") or "",
+        "kind": getattr(case, "kind", ""),
+        "status": getattr(case, "status", ""),
+        "severity": getattr(case, "severity", "") or "",
+        "title": getattr(case, "title", "") or "",
+        "summary": getattr(case, "summary", "") or "",
+        "resource_id": getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
+        "updated_at": getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "",
+        "issue_url": getattr(case, "issue_url", "") or "",
+        "suppressed_until": getattr(case, "suppressed_until", "") or "",
+        "child_case_count": getattr(case, "child_case_count", 0) or 0,
+    }
 
 
 @app.post("/control/proactive/pause")

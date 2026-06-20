@@ -49,6 +49,9 @@ New control-plane interfaces:
 - `POST /control/proactive/run-once`
 - `GET /control/proactive/suppressions`
 - `POST /control/proactive/ack` / `POST /control/proactive/unack`
+- `GET /control/case-service/cases`
+- `GET /control/case-service/cases/{case_id}`
+- `GET /control/case-service/outbox`
 
 The `/control/...` endpoints require `X-NOC-Control-Token`. The signed resume
 endpoint requires an HMAC signature using `NOC_APPROVAL_SIGNING_SECRET`.
@@ -267,7 +270,10 @@ network access or production credentials.
 
 `GET /health/cases` reports whether the optional runtime is disabled, healthy,
 or degraded, including backend name and pending/failed outbox counts when the
-runtime is enabled. Prometheus exports `noc_agent_case_service_runtime_enabled`,
+runtime is enabled. The control plane also exposes read-only case-service canary
+views under `/control/case-service/...` for comparing projections, events,
+traces, feedback, and outbox rows against the legacy `/control/cases` surface.
+Prometheus exports `noc_agent_case_service_runtime_enabled`,
 `noc_agent_case_service_shadow_observations_total`,
 `noc_agent_case_service_shadow_failures_total`, and
 `noc_agent_case_service_outbox_processed_total` so canaries can watch shadow
