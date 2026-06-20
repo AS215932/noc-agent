@@ -273,6 +273,10 @@ or degraded, including backend name and pending/failed outbox counts when the
 runtime is enabled. The control plane also exposes read-only case-service canary
 views under `/control/case-service/...` for comparing projections, events,
 traces, feedback, and outbox rows against the legacy `/control/cases` surface.
+Reactive webhook intake records best-effort aliases from legacy incident IDs /
+case numbers to CaseService cases when exactly one shadow case matches, and
+operator comments/decisions are mirrored as CaseService operator feedback when
+such an alias exists.
 Prometheus exports `noc_agent_case_service_runtime_enabled`,
 `noc_agent_case_service_shadow_observations_total`,
 `noc_agent_case_service_shadow_failures_total`, and

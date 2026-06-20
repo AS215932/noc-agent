@@ -529,6 +529,33 @@ async def test_shadow_observe_alert_payload_preserves_partial_results(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_alertmanager_webhook_links_case_service_to_legacy_case(monkeypatch, mock_alert_payload, mocker):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+
+    assert response["status"] == "accepted"
+    by_number = await store.resolve_alias("legacy_case_number", response["case_number"])
+    by_incident = await store.resolve_alias("legacy_incident_id", response["incident_id"])
+    assert by_number is not None
+    assert by_number == by_incident
+
+
+@pytest.mark.asyncio
 async def test_reactive_case_service_control_skips_recently_investigated_duplicate(
     monkeypatch, mock_alert_payload, mocker
 ):

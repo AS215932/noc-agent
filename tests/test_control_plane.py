@@ -5,7 +5,7 @@ import json
 import pytest
 from fastapi import HTTPException
 
-from app.cases import CaseService, InMemoryCaseStore, ObservationRecord
+from app.cases import CaseIdentityAlias, CaseService, InMemoryCaseStore, ObservationRecord
 import app.graph_runtime as graph_runtime
 from app.incident_memory import IncidentMemory
 import app.main as main_module
@@ -176,6 +176,55 @@ async def test_case_service_control_validates_filters_and_ids(monkeypatch):
     assert bad_kind.value.status_code == 422
     assert bad_case_id.value.status_code == 422
     assert bad_status.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_case_service_feedback_mirrors_legacy_operator_comment(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    memory = IncidentMemory(redis_url="")
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    legacy = await memory.intake_alert(
+        {
+            "source": "alertmanager",
+            "status": "firing",
+            "groupLabels": {"alertname": "InstanceDown"},
+            "alerts": [{"labels": {"alertname": "InstanceDown", "instance": "rtr1:9100"}}],
+        }
+    )
+    assert legacy.case is not None
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="InstanceDown", resource="rtr1:9100", status="firing")
+    )
+    assert created.case is not None
+    await store.record_alias(
+        CaseIdentityAlias(
+            case_id=created.case.case_id,
+            alias_type="legacy_case_number",
+            alias_value=legacy.case["case_number"],
+        )
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    await control_case_comment(
+        legacy.case["case_number"],
+        CommentRequest(operator="svag", comment="checking"),
+        _request(),
+    )
+
+    feedback = await store.list_feedback(case_id=created.case.case_id)
+    assert len(feedback) == 1
+    assert feedback[0].feedback_type == "operator_note"
+    assert feedback[0].actor_id == "svag"
+    assert feedback[0].payload["comment"] == "checking"
 
 
 @pytest.mark.asyncio
