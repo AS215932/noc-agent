@@ -28,15 +28,6 @@ from app.main import (
 )
 
 
-@pytest.fixture(autouse=True)
-def restore_control_runtime_globals():
-    original_case_service_runtime = main_module.case_service_runtime
-    original_incident_memory = graph_runtime.INCIDENT_MEMORY
-    yield
-    main_module.case_service_runtime = original_case_service_runtime
-    graph_runtime.INCIDENT_MEMORY = original_incident_memory
-
-
 def _request(token: str = "secret"):
     return type("Request", (), {"headers": {"x-noc-control-token": token}})()
 
@@ -158,6 +149,33 @@ async def test_case_service_control_disabled_and_missing(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await control_case_service_case_detail("case_missing", request)
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_case_service_control_validates_filters_and_ids(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    with pytest.raises(HTTPException) as bad_kind:
+        await control_case_service_cases(request, kind="atomic;drop", limit=100)
+    with pytest.raises(HTTPException) as bad_case_id:
+        await control_case_service_case_detail("case_1/../../secret", request)
+    with pytest.raises(HTTPException) as bad_status:
+        await control_case_service_outbox(request, outbox_status="pending;drop")
+
+    assert bad_kind.value.status_code == 422
+    assert bad_case_id.value.status_code == 422
+    assert bad_status.value.status_code == 422
 
 
 @pytest.mark.asyncio
