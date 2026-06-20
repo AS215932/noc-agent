@@ -32,11 +32,23 @@ def _request(token: str = "secret"):
     return type("Request", (), {"headers": {"x-noc-control-token": token}})()
 
 
-@pytest.mark.asyncio
-async def test_local_control_plane_lists_and_decides(monkeypatch):
-    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+@pytest.fixture
+def isolated_incident_memory():
+    """Install a fresh IncidentMemory and restore the process global after the test."""
+
+    original = graph_runtime.INCIDENT_MEMORY
     memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    graph_runtime.INCIDENT_MEMORY = memory
+    try:
+        yield memory
+    finally:
+        graph_runtime.INCIDENT_MEMORY = original
+
+
+@pytest.mark.asyncio
+async def test_local_control_plane_lists_and_decides(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    memory = isolated_incident_memory
     await memory.put_summary("incident-1", {"incident_id": "incident-1", "status": "waiting_approval", "title": "packet loss"})
 
     pending = await pending_incidents("secret")
@@ -53,10 +65,9 @@ async def test_local_control_plane_lists_and_decides(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_signed_resume_uses_hmac(monkeypatch):
+async def test_signed_resume_uses_hmac(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_APPROVAL_SIGNING_SECRET", "sign-me")
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    memory = isolated_incident_memory
     await memory.put_summary("incident-2", {"incident_id": "incident-2", "status": "waiting_approval", "title": "bgp"})
     request = SignedApprovalRequest(
         incident_id="incident-2",
@@ -73,10 +84,9 @@ async def test_signed_resume_uses_hmac(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_control_cases_use_case_number_and_comments(monkeypatch):
+async def test_control_cases_use_case_number_and_comments(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    memory = isolated_incident_memory
     result = await memory.intake_alert(
         {
             "source": "icinga2",
@@ -179,10 +189,9 @@ async def test_case_service_control_validates_filters_and_ids(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_case_service_feedback_mirrors_legacy_operator_comment(monkeypatch):
+async def test_case_service_feedback_mirrors_legacy_operator_comment(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    memory = isolated_incident_memory
     legacy = await memory.intake_alert(
         {
             "source": "alertmanager",
@@ -228,10 +237,53 @@ async def test_case_service_feedback_mirrors_legacy_operator_comment(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_manual_control_investigation_creates_case(monkeypatch):
+async def test_case_service_feedback_records_acknowledgement_as_note(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    memory = isolated_incident_memory
+    legacy = await memory.intake_alert(
+        {
+            "source": "alertmanager",
+            "status": "firing",
+            "groupLabels": {"alertname": "PacketLoss"},
+            "alerts": [{"labels": {"alertname": "PacketLoss", "instance": "edge1"}}],
+        }
+    )
+    assert legacy.case is not None
+    incident_id = legacy.case["incident_id"]
+    await memory.put_summary(incident_id, {"incident_id": incident_id, "status": "waiting_approval", "title": "packet loss"})
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await store.record_alias(
+        CaseIdentityAlias(case_id=created.case.case_id, alias_type="legacy_incident_id", alias_value=incident_id)
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    await decide_incident(
+        incident_id,
+        LocalDecisionRequest(decision="acknowledged", operator="svag", comment="seen"),
+        "secret",
+    )
+
+    feedback = await store.list_feedback(case_id=created.case.case_id)
+    assert len(feedback) == 1
+    assert feedback[0].feedback_type == "operator_note"
+    assert feedback[0].payload["decision"] == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_manual_control_investigation_creates_case(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
 
     class Background:
         def __init__(self):

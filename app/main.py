@@ -940,13 +940,13 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
 async def _case_service_case_for_identifier(identifier: str):
     if case_service_runtime is None:
         return None
-    safe_id = _validated_case_service_id(identifier)
     store = case_service_runtime.store
-    case = await store.get_case(safe_id)
+    lookup_identifier = _validated_case_service_lookup_identifier(identifier)
+    case = await store.get_case(lookup_identifier)
     if case is not None:
         return case
     for alias_type in ("legacy_incident_id", "legacy_case_number"):
-        case_id = await store.resolve_alias(alias_type, safe_id)
+        case_id = await store.resolve_alias(alias_type, lookup_identifier)
         if case_id:
             return await store.get_case(case_id)
     return None
@@ -966,7 +966,14 @@ async def _record_case_service_operator_feedback(
         from app.cases.models import OperatorFeedback
 
         case = await _case_service_case_for_identifier(identifier)
-        if case is None or getattr(case, "kind", "") != "atomic":
+        if case is None:
+            return
+        if getattr(case, "kind", "") != "atomic":
+            log.info(
+                "case_service_operator_feedback_skipped_non_atomic",
+                case_id=getattr(case, "case_id", ""),
+                kind=getattr(case, "kind", ""),
+            )
             return
         rendered_comment = _safe_monitor_text(comment, limit=1000)
         await case_service_runtime.service.record_operator_feedback(
@@ -990,9 +997,11 @@ async def _record_case_service_operator_feedback(
 
 
 def _feedback_type_for_decision(decision: str) -> str:
+    if decision == "approved":
+        return "operator_confirmed_diagnosis"
     if decision == "rejected":
         return "operator_rejected_diagnosis"
-    return "operator_confirmed_diagnosis"
+    return "operator_note"
 
 
 def _reactive_observations_from_alert_payload(alert_payload: dict):
@@ -1495,11 +1504,11 @@ def _validated_case_service_outbox_status(value: str | None) -> str | None:
     return rendered
 
 
-def _validated_case_service_id(value: str) -> str:
+def _validated_case_service_lookup_identifier(value: str) -> str:
     rendered = str(value or "").strip()
     allowed_chars = {"_", "-", ":", "."}
     if not (1 <= len(rendered) <= 128) or any(not (ch.isalnum() or ch in allowed_chars) for ch in rendered):
-        raise HTTPException(status_code=422, detail="case_id contains invalid characters")
+        raise HTTPException(status_code=422, detail="case identifier contains invalid characters")
     return rendered
 
 
