@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app import log
+from app.cases.models import SourceHealth
 from app.config import ProactiveLoopSettings, load_proactive_settings
 from app.discord import Verbosity, send_discord_notification
 from app.icinga_ack import acknowledge_icinga
@@ -35,6 +37,7 @@ from app.proactive.models import (
     hotspot_to_alert_payload,
     utc_now,
 )
+from app.model_metrics import record_case_service_shadow_failure, record_case_service_shadow_observation
 from app.proactive.scanner import DEEP_RULE_IDS, ScanContext, scan
 from app.safe_errors import classify_exception, log_exception
 
@@ -78,6 +81,7 @@ class ProactiveLoop:
         incident_memory: Any | None = None,
         memory: Any | None = None,
         suppressions: Any | None = None,
+        case_service: Any | None = None,
     ):
         self.mcp_runtime = mcp_runtime
         self.settings = settings or load_proactive_settings()
@@ -86,6 +90,13 @@ class ProactiveLoop:
         self._model_chain = model_chain or _default_model_chain
         self.incident_memory = incident_memory
         self.memory = memory
+        self.case_service = case_service
+        self.case_service_control = os.getenv("NOC_CASESERVICE_CONTROL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         if active_lessons is not None:
             self._active_lessons = active_lessons
         elif memory is not None:
@@ -182,6 +193,11 @@ class ProactiveLoop:
             do_deep = self._should_deep_scan() if deep is None else deep
             ctx = ScanContext(self.mcp_runtime, self.settings, lessons=self._active_lessons())
             raw_hotspots = await scan(ctx, deep=do_deep)
+            await self._shadow_observe_hotspots(
+                raw_hotspots,
+                cycle_id=report.cycle_id,
+                source_health="degraded" if ctx.degraded else "healthy",
+            )
             effective = self._merge_with_carried(raw_hotspots, do_deep=do_deep, degraded=ctx.degraded)
             report.auto_snoozed = await self._auto_snooze(effective)
             report.hotspots = self._apply_suppressions(effective)
@@ -229,9 +245,15 @@ class ProactiveLoop:
             return 0
         # Skip hotspots diagnosed within the cooldown — a persistent condition is
         # investigated once, then surfaced via the digest de-dup gate, not re-run
-        # (and re-posted) every cycle until the daily budget is gone.
-        recent = self._recent_investigation_fps()
-        fresh = [h for h in gate.eligible if h.fingerprint() not in recent]
+        # (and re-posted) every cycle until the daily budget is gone. In guarded
+        # case-service control mode, the case owns this decision instead of
+        # investigations.json.
+        use_case_service = self.case_service_control and self.case_service is not None
+        if use_case_service:
+            fresh = [h for h in gate.eligible if await self._case_service_should_investigate(h)]
+        else:
+            recent = self._recent_investigation_fps()
+            fresh = [h for h in gate.eligible if h.fingerprint() not in recent]
         investigated = 0
         done: list[str] = []
         for hotspot in fresh[: gate.max_investigations]:
@@ -250,8 +272,43 @@ class ProactiveLoop:
             report.cost_usd = round(report.cost_usd + outcome.cost_usd, 6)
             if outcome.handoff_url:
                 report.handoffs.append(outcome.handoff_url)
-        self._record_investigations(done)
+            if use_case_service:
+                await self._case_service_record_investigation(hotspot, outcome)
+        if not use_case_service:
+            self._record_investigations(done)
         return investigated
+
+    async def _case_service_should_investigate(self, hotspot: Hotspot) -> bool:
+        case_service = self.case_service
+        if case_service is None:
+            return True
+        try:
+            case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
+            return True if case is None else bool(case_service.should_investigate(case))
+        except Exception as exc:
+            safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive_control", category=safe.category)
+            log_exception("proactive_case_service_investigation_gate_failed", exc, category=safe.category)
+            return True
+
+    async def _case_service_record_investigation(self, hotspot: Hotspot, outcome: InvestigationOutcome) -> None:
+        case_service = self.case_service
+        if case_service is None:
+            return
+        try:
+            case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
+            if case is None:
+                return
+            await case_service.record_investigation_result(
+                case.case_id,
+                diagnosis={"incident_id": outcome.incident_id, "source": "proactive_loop"},
+                recommendations=[],
+                status="complete",
+            )
+        except Exception as exc:
+            safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive_control", category=safe.category)
+            log_exception("proactive_case_service_investigation_record_failed", exc, category=safe.category)
 
     def _recent_investigation_fps(self, now: float | None = None) -> set[str]:
         """Fingerprints investigated within ``investigation_cooldown_s``."""
@@ -448,6 +505,40 @@ class ProactiveLoop:
             level=Verbosity.INFO,
         )
 
+    async def _shadow_observe_hotspots(
+        self, raw: list[Hotspot], *, cycle_id: str, source_health: SourceHealth
+    ) -> None:
+        """Best-effort shadow write of freshly scanned hotspots to CaseService.
+
+        This intentionally observes only `raw` scanner output, not the effective
+        carried-forward set. A deep-rule hotspot carried through a cheap or
+        degraded cycle is operationally still active, but it was not freshly
+        evaluated and therefore must not become a fresh observation.
+        """
+        if self.case_service is None or not raw:
+            return
+        try:
+            from app.cases.proactive import observation_from_hotspot
+
+            for hotspot in raw:
+                observation = observation_from_hotspot(
+                    hotspot,
+                    cycle_id=cycle_id,
+                    source_health=source_health,
+                )
+                result = await self.case_service.observe(observation)
+                record_case_service_shadow_observation(
+                    path="proactive",
+                    source=observation.source,
+                    status=observation.status,
+                    action=str(getattr(result, "action", "unknown")),
+                )
+            log.info("proactive_case_shadow_observed", count=len(raw), source_health=source_health)
+        except Exception as exc:
+            safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive", category=safe.category)
+            log_exception("proactive_case_shadow_observe_failed", exc, category=safe.category)
+
     def _merge_with_carried(
         self, raw: list[Hotspot], *, do_deep: bool, degraded: bool
     ) -> list[Hotspot]:
@@ -563,11 +654,28 @@ class ProactiveLoop:
                 # Commit de-dup state only after a successful send, so a transient
                 # webhook failure doesn't suppress the next retry.
                 self._last_report_signature, self._last_report_ts = signature, now
+                await self._case_service_mark_reported_hotspots(report)
         try:
             await _heartbeat(report)
         except Exception as exc:
             safe = classify_exception(exc)
             log_exception("proactive_heartbeat_failed", exc, category=safe.category)
+
+    async def _case_service_mark_reported_hotspots(self, report: ProactiveCycleReport) -> None:
+        if not (self.case_service_control and self.case_service is not None):
+            return
+        case_service = self.case_service
+        for hotspot in report.hotspots:
+            try:
+                case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
+                if case is None:
+                    continue
+                state_signature = case_service.report_state_signature(case)
+                await case_service.mark_reported(case.case_id, state_signature=state_signature)
+            except Exception as exc:
+                safe = classify_exception(exc)
+                record_case_service_shadow_failure(path="proactive_control", category=safe.category)
+                log_exception("proactive_case_service_mark_reported_failed", exc, category=safe.category)
 
     async def _default_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:
         if not report.hotspots and not report.investigated:

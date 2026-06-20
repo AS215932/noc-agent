@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import hmac
 import json
@@ -48,6 +49,9 @@ def main() -> None:
     decide.add_argument("--operator", required=True)
     decide.add_argument("--comment", default="")
 
+    replay = sub.add_parser("replay", help="Replay a sanitized observation fixture (offline).")
+    replay.add_argument("fixture")
+
     approvals = sub.add_parser("approvals", help="Operator signing helpers (offline).")
     approvals_sub = approvals.add_subparsers(dest="approvals_command", required=True)
     sign = approvals_sub.add_parser("sign", help="Emit a signed action authorization (no HTTP, no token).")
@@ -67,6 +71,9 @@ def main() -> None:
         )
         print(json.dumps(authorization, indent=2, sort_keys=True))
         return
+    if args.command == "replay":
+        print(json.dumps(asyncio.run(_run_replay(args.fixture)), indent=2, sort_keys=True))
+        return
 
     if not args.token:
         parser.error("NOC_CONTROL_TOKEN or --token is required")
@@ -85,6 +92,15 @@ def main() -> None:
             body=body,
         )
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+async def _run_replay(fixture: str) -> dict:
+    from app.cases.replay import load_observation_fixture, replay_observations
+
+    observations = load_observation_fixture(fixture)
+    result = await replay_observations(observations)
+    metrics = await result.metrics()
+    return {"fixture": fixture, "metrics": metrics}
 
 
 def _request(base_url: str, path: str, token: str, *, method: str = "GET", body: dict | None = None):

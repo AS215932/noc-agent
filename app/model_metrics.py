@@ -67,8 +67,29 @@ MODEL_USAGE = Counter(
     "PydanticAI usage counters by agent and selected model.",
     ["agent", "model", "kind"],
 )
+CASE_SERVICE_RUNTIME_ENABLED = Gauge(
+    "noc_agent_case_service_runtime_enabled",
+    "Whether the optional case-service runtime is enabled, labeled by backend.",
+    ["backend"],
+)
+CASE_SERVICE_SHADOW_OBSERVATIONS = Counter(
+    "noc_agent_case_service_shadow_observations_total",
+    "Case-service shadow observations accepted by source path, observation source/status, and service action.",
+    ["path", "source", "status", "action"],
+)
+CASE_SERVICE_SHADOW_FAILURES = Counter(
+    "noc_agent_case_service_shadow_failures_total",
+    "Case-service shadow/control failures by source path and safe error category.",
+    ["path", "category"],
+)
+CASE_SERVICE_OUTBOX_PROCESSED = Counter(
+    "noc_agent_case_service_outbox_processed_total",
+    "Case-service side-effect outbox processing outcomes.",
+    ["intent_type", "outcome"],
+)
 
 _fallback_failures: ContextVar[list[str]] = ContextVar("fallback_failures", default=[])
+_case_service_runtime_backend: str | None = None
 RECENT_RUNTIME_FAILURE_WINDOW_SECONDS = 600.0
 
 
@@ -179,6 +200,33 @@ def record_sanitized_discord_failure(category: str) -> None:
     DISCORD_SANITIZED_FAILURES.labels(category=category or "unknown_infrastructure").inc()
 
 
+def set_case_service_runtime_enabled(enabled: bool, *, backend: str = "none") -> None:
+    global _case_service_runtime_backend
+    normalized = _metric_label(backend or "none")
+    previous = _case_service_runtime_backend
+    if previous and previous != normalized:
+        CASE_SERVICE_RUNTIME_ENABLED.labels(backend=previous).set(0)
+    CASE_SERVICE_RUNTIME_ENABLED.labels(backend=normalized).set(1 if enabled else 0)
+    _case_service_runtime_backend = normalized if enabled else None
+
+
+def record_case_service_shadow_observation(*, path: str, source: str, status: str, action: str) -> None:
+    CASE_SERVICE_SHADOW_OBSERVATIONS.labels(
+        path=_metric_label(path),
+        source=_metric_label(source),
+        status=_metric_label(status),
+        action=_metric_label(action),
+    ).inc()
+
+
+def record_case_service_shadow_failure(*, path: str, category: str) -> None:
+    CASE_SERVICE_SHADOW_FAILURES.labels(path=_metric_label(path), category=_metric_label(category)).inc()
+
+
+def record_case_service_outbox_processed(*, intent_type: str, outcome: str) -> None:
+    CASE_SERVICE_OUTBOX_PROCESSED.labels(intent_type=_metric_label(intent_type), outcome=_metric_label(outcome)).inc()
+
+
 def selected_model_name(result: Any) -> str:
     try:
         for message in reversed(result.new_messages()):
@@ -192,6 +240,11 @@ def selected_model_name(result: Any) -> str:
 
 def metrics_response() -> tuple[bytes, str]:
     return generate_latest(), CONTENT_TYPE_LATEST
+
+
+def _metric_label(value: str) -> str:
+    label = str(value or "unknown").strip()
+    return label if label else "unknown"
 
 
 def _record_usage(agent: str, model: str, result: Any) -> None:

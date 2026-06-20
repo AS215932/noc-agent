@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from app.cases import CaseService, InMemoryCaseStore
 from app.config import ProactiveLoopSettings
 from app.proactive import loop as loop_module
 from app.proactive.loop import InvestigationOutcome, ProactiveLoop
@@ -381,6 +382,57 @@ async def test_degraded_scan_does_not_resolve(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_case_service_shadow_observes_raw_not_carried_hotspots(tmp_path):
+    store = InMemoryCaseStore()
+    case_service = CaseService(store)
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        case_service=case_service,
+    )
+
+    deep_report = await lp.run_once(deep=True)
+    disk = next(h for h in deep_report.hotspots if h.rule_id == "disk_fill")
+    disk_case_id = await store.resolve_alias("source_fp", disk.fingerprint())
+    assert disk_case_id is not None
+    assert [event.event_type for event in await store.case_events(disk_case_id)] == [
+        "case_created",
+        "case_observed_unhealthy",
+    ]
+
+    cheap_report = await lp.run_once(deep=False)
+    assert any(h.fingerprint() == disk.fingerprint() for h in cheap_report.hotspots)  # carried operationally
+    # But the carried disk hotspot was not scanned in the cheap cycle, so it is
+    # not recorded as a fresh unhealthy observation in the case-service shadow.
+    assert [event.event_type for event in await store.case_events(disk_case_id)] == [
+        "case_created",
+        "case_observed_unhealthy",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_case_service_shadow_failure_is_nonfatal(tmp_path):
+    class _BrokenCaseService:
+        async def observe(self, observation):
+            raise RuntimeError("shadow store unavailable")
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        case_service=_BrokenCaseService(),
+    )
+
+    report = await lp.run_once(deep=True)
+
+    assert report.outcome == "scanned"
+    assert report.hotspots
+
+
+@pytest.mark.asyncio
 async def test_deep_cycle_records_observations_and_journal(tmp_path):
     from app.proactive.memory import ProactiveMemory
 
@@ -404,3 +456,61 @@ async def test_deep_cycle_records_observations_and_journal(tmp_path):
     # one observation per hotspot, and a journal entry for the cycle
     assert len(mem.load_observations()) == len(report.hotspots)
     assert (mem.journal_dir / f"{report.cycle_id}.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_case_service_control_replaces_investigations_json_for_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL", "1")
+    store = InMemoryCaseStore()
+    case_service = CaseService(store)
+    seen = []
+
+    async def investigator(hotspot, decision):
+        seen.append(hotspot.fingerprint())
+        return InvestigationOutcome(incident_id="inc1")
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=False, max_investigations_per_cycle=2, investigation_cooldown_s=3600),
+        reporter=_Capture(),
+        investigator=investigator,
+        model_chain=lambda: ["m"],
+        case_service=case_service,
+    )
+
+    await lp.run_once(deep=True)  # both current hotspots investigated and stamped on their cases
+    await lp.run_once(deep=True)  # unchanged signatures are skipped by case state
+
+    assert len(seen) == 2
+    assert not (tmp_path / "investigations.json").exists()
+    for fingerprint in seen:
+        case_id = await store.resolve_alias("source_fp", fingerprint)
+        assert case_id is not None
+        case = await store.get_case(case_id)
+        assert case is not None
+        assert getattr(case, "last_investigated_at")
+
+
+@pytest.mark.asyncio
+async def test_case_service_control_marks_cases_reported_after_successful_digest(tmp_path, monkeypatch):
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL", "1")
+    store = InMemoryCaseStore()
+    case_service = CaseService(store)
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True, report_reassert_s=99999),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        case_service=case_service,
+    )
+
+    report = await lp.run_once(deep=True)
+
+    assert report.hotspots
+    for hotspot in report.hotspots:
+        case_id = await store.resolve_alias("source_fp", hotspot.fingerprint())
+        assert case_id is not None
+        case = await store.get_case(case_id)
+        assert case is not None
+        assert getattr(case, "last_reported_at")
+        assert getattr(case, "last_reported_signature")

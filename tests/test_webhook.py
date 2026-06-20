@@ -7,9 +7,11 @@ from app.main import (
     IcingaNotification,
     _embedded_discord_bot_enabled,
     _release_mail_poller_lock,
+    _shadow_observe_alert_payload,
     _try_acquire_mail_poller_lock,
     _triage_fields,
     alertmanager_webhook,
+    health_cases,
     health_config,
     health_check,
     health_mail,
@@ -211,6 +213,44 @@ async def test_health_mail_reports_failures(mocker):
     assert "bad imap" not in response["error"]
     assert http_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
 
+
+@pytest.mark.asyncio
+async def test_health_cases_reports_disabled(monkeypatch):
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", None)
+    http_response = Response()
+
+    response = await health_cases(http_response)
+
+    assert response == {"status": "disabled", "enabled": False}
+    assert http_response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.asyncio
+async def test_health_cases_reports_runtime_status(monkeypatch):
+    class _Store:
+        async def list_cases(self, *, kind=None, limit=100):
+            return [object()]
+
+        async def list_outbox(self, *, status=None):
+            return [object(), object()] if status == "pending" else [object()]
+
+    class _Runtime:
+        store = _Store()
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    http_response = Response()
+
+    response = await health_cases(http_response)
+
+    assert response["status"] == "ok"
+    assert response["backend"] == "_Store"
+    assert response["sample_case_count"] == 1
+    assert response["outbox"] == {"pending": 2, "failed": 1}
+
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, monkeypatch):
     """
@@ -369,3 +409,45 @@ async def test_agent_uses_mcp_tools(mocker):
     """
     # TODO: Implement MCP Context load in main.py and mock the load function
     pass
+
+
+@pytest.mark.asyncio
+async def test_shadow_observe_alert_payload_records_alertmanager(monkeypatch, mock_alert_payload):
+    seen = []
+
+    class _Service:
+        async def observe(self, observation):
+            seen.append(observation)
+
+    class _Runtime:
+        service = _Service()
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    payload = dict(mock_alert_payload)
+    payload["source"] = "alertmanager"
+
+    await _shadow_observe_alert_payload(payload)
+
+    assert len(seen) == 1
+    assert seen[0].source == "alertmanager"
+    assert seen[0].detector == "InstanceDown"
+
+
+@pytest.mark.asyncio
+async def test_shadow_observe_alert_payload_is_nonfatal(monkeypatch, mock_alert_payload):
+    class _Service:
+        async def observe(self, observation):
+            raise RuntimeError("shadow write failed")
+
+    class _Runtime:
+        service = _Service()
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    payload = dict(mock_alert_payload)
+    payload["source"] = "alertmanager"
+
+    await _shadow_observe_alert_payload(payload)

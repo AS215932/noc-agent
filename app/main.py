@@ -20,7 +20,15 @@ from app.discord_bot import build_bot
 from app.mail import check_mailbox_connection, process_mailbox_once
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
-from app.model_metrics import metrics_response, record_failure, record_success, start_run
+from app.model_metrics import (
+    metrics_response,
+    record_case_service_shadow_failure,
+    record_case_service_shadow_observation,
+    record_failure,
+    record_success,
+    set_case_service_runtime_enabled,
+    start_run,
+)
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
@@ -38,6 +46,7 @@ discord_bot = None
 discord_bot_task = None
 proactive_loop = None
 proactive_lock_fd = None
+case_service_runtime = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 PROACTIVE_LOCK_PATH = os.getenv("PROACTIVE_LOCK_PATH", "/var/lib/noc-agent/proactive-instance.lock")
 
@@ -118,6 +127,7 @@ async def lifespan(app: FastAPI):
     global discord_bot_task
     global proactive_loop
     global proactive_lock_fd
+    global case_service_runtime
     log.info("startup_begin")
 
     mcp_runtime = MCPRuntime(owner="api")
@@ -145,6 +155,25 @@ async def lifespan(app: FastAPI):
     else:
         log.info("discord_bot_embedded_disabled")
 
+    try:
+        from app.cases.runtime import build_case_service_runtime_from_env
+
+        case_service_runtime = await build_case_service_runtime_from_env()
+        if case_service_runtime is not None:
+            backend = type(case_service_runtime.store).__name__
+            set_case_service_runtime_enabled(True, backend=backend)
+            log.info("case_service_shadow_started", backend=backend)
+        else:
+            set_case_service_runtime_enabled(False, backend="none")
+    except Exception as e:
+        safe = classify_exception(e)
+        log_exception("case_service_shadow_start_failed", e, category=safe.category)
+        record_case_service_shadow_failure(path="startup", category=safe.category)
+        set_case_service_runtime_enabled(False, backend="startup_error")
+        case_service_runtime = None
+        if os.getenv("NOC_REQUIRE_POSTGRES", "").strip().lower() in {"1", "true", "yes", "on"}:
+            raise
+
     proactive_settings = load_proactive_settings()
     if proactive_settings.enabled:
         proactive_lock_fd = _try_acquire_proactive_lock()
@@ -162,6 +191,7 @@ async def lifespan(app: FastAPI):
                     investigator=_proactive_investigator(proactive_settings),
                     incident_memory=graph_runtime.INCIDENT_MEMORY,
                     memory=proactive_memory,
+                    case_service=case_service_runtime.service if case_service_runtime is not None else None,
                 )
                 proactive_loop.start()
             except Exception as e:
@@ -181,6 +211,11 @@ async def lifespan(app: FastAPI):
     if proactive_lock_fd is not None:
         _release_proactive_lock(proactive_lock_fd)
         proactive_lock_fd = None
+    if case_service_runtime is not None:
+        backend = type(case_service_runtime.store).__name__
+        await case_service_runtime.close()
+        set_case_service_runtime_enabled(False, backend=backend)
+        case_service_runtime = None
 
     if discord_bot_task:
         discord_bot_task.cancel()
@@ -680,6 +715,33 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
     return plan
 
 
+async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
+    """Best-effort case-service shadow write for reactive webhook payloads."""
+    if case_service_runtime is None:
+        return
+    try:
+        from app.cases.notifications import observation_from_icinga_alert_payload, observations_from_alertmanager
+
+        if str(alert_payload.get("source") or "") == "icinga2":
+            observations = [observation_from_icinga_alert_payload(alert_payload)]
+        else:
+            observations = observations_from_alertmanager(alert_payload)
+        for observation in observations:
+            result = await case_service_runtime.service.observe(observation)
+            record_case_service_shadow_observation(
+                path="reactive",
+                source=observation.source,
+                status=observation.status,
+                action=str(getattr(result, "action", "unknown")),
+            )
+        if observations:
+            log.info("case_service_shadow_reactive_observed", count=len(observations), source=alert_payload.get("source"))
+    except Exception as e:
+        safe = classify_exception(e)
+        record_case_service_shadow_failure(path="reactive", category=safe.category)
+        log_exception("case_service_shadow_reactive_observe_failed", e, category=safe.category)
+
+
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
     """Reshape an Icinga notification into the dict shape investigate_alert expects."""
     name = notif.service_name or notif.check_command or "host-check"
@@ -720,6 +782,7 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
     """Receives alerts from Prometheus Alertmanager and triggers the NOC agent."""
     alert_payload = payload.model_dump()
     alert_payload["source"] = "alertmanager"
+    await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
     if result.should_investigate and result.case is not None:
         background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
@@ -738,6 +801,7 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
 async def icinga_webhook(payload: IcingaNotification, background_tasks: BackgroundTasks):
     """Receives Icinga2 NotificationCommand POSTs and triggers the NOC agent."""
     alert_payload = _icinga_to_alert_payload(payload)
+    await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
     if result.should_investigate and result.case is not None:
         background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
@@ -1204,6 +1268,35 @@ def _provider_from_model_name(model_name: str) -> str:
     if model_name.startswith(("gpt", "o1", "o3")):
         return "openai"
     return "unknown"
+
+
+@app.get("/health/cases")
+async def health_cases(response: Response):
+    if case_service_runtime is None:
+        return {"status": "disabled", "enabled": False}
+    store = case_service_runtime.store
+    try:
+        pending = await store.list_outbox(status="pending")
+        failed = await store.list_outbox(status="failed")
+        recent_cases = await store.list_cases(limit=1)
+    except Exception as e:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        safe = classify_exception(e)
+        log_exception("case_service_health_failed", e, category=safe.category)
+        record_case_service_shadow_failure(path="health", category=safe.category)
+        return {
+            "status": "degraded",
+            "enabled": True,
+            "backend": type(store).__name__,
+            "error": safe_health_error(e),
+        }
+    return {
+        "status": "ok",
+        "enabled": True,
+        "backend": type(store).__name__,
+        "sample_case_count": len(recent_cases),
+        "outbox": {"pending": len(pending), "failed": len(failed)},
+    }
 
 
 @app.get("/health/model")
