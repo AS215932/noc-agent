@@ -1042,27 +1042,32 @@ def _case_service_control_identifier(case) -> str:
     return _safe_monitor_token(getattr(case, "case_number", "") or getattr(case, "case_id", "") or "", limit=128)
 
 
-def _case_service_control_case_payload(case) -> dict[str, object]:
+def _case_service_control_case_payload(case, graph_summary: dict | None = None) -> dict[str, object]:
     case_id = _validated_case_service_lookup_identifier(getattr(case, "case_id", "") or "")
     case_number = _case_service_control_identifier(case)
     diagnosis = getattr(case, "last_diagnosis", {}) or {}
+    graph = graph_summary if isinstance(graph_summary, dict) else {}
+    status_value = graph.get("status") or getattr(case, "status", "")
     return {
         "incident_id": case_id,
         "case_id": case_id,
         "case_number": case_number,
-        "status": _safe_monitor_token(getattr(case, "status", ""), limit=64),
-        "severity": _safe_monitor_token(getattr(case, "severity", "") or "UNKNOWN", limit=32),
+        "status": _safe_monitor_token(status_value, limit=64),
+        "severity": _safe_monitor_token(graph.get("severity") or getattr(case, "severity", "") or "UNKNOWN", limit=32),
         "resource_id": _safe_monitor_text(
-            getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
+            graph.get("resource_id") or getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
             limit=240,
         ),
-        "title": _safe_monitor_text(getattr(case, "title", "") or "", limit=240),
+        "title": _safe_monitor_text(graph.get("title") or getattr(case, "title", "") or "", limit=240),
         "summary": _safe_monitor_text(getattr(case, "summary", "") or "", limit=1000),
         "event_count": len(getattr(case, "trace_ids", []) or []) + len(getattr(case, "feedback_ids", []) or []),
-        "updated_at": _safe_monitor_token(getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "", limit=80),
-        "pending_approval": getattr(case, "status", "") == "waiting_approval",
+        "updated_at": _safe_monitor_token(
+            graph.get("updated_at") or getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "",
+            limit=80,
+        ),
+        "pending_approval": status_value == "waiting_approval" or graph.get("approval_state") == "waiting_approval",
         "source": "case_service",
-        "diagnostic_summary": _safe_monitor_text(diagnosis.get("summary", ""), limit=1000),
+        "diagnostic_summary": _safe_monitor_text(graph.get("title") or diagnosis.get("summary", ""), limit=1000),
         "recommendations": [_safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])],
         "issue_url": _safe_monitor_text(getattr(case, "issue_url", "") or "", limit=300),
     }
@@ -1166,7 +1171,10 @@ def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
 async def _case_service_control_cases_response() -> dict[str, object]:
     runtime = _require_case_service_runtime()
     cases = await runtime.store.list_cases(kind="atomic", limit=500)
-    return {"status": "ok", "source": "case_service", "cases": [_case_service_control_case_payload(case) for case in cases]}
+    rows = []
+    for case in cases:
+        rows.append(_case_service_control_case_payload(case, graph_summary=await _case_service_graph_summary(case)))
+    return {"status": "ok", "source": "case_service", "cases": rows}
 
 
 async def _case_service_control_case_detail_response(case_id: str) -> dict[str, object]:
@@ -1178,7 +1186,7 @@ async def _case_service_control_case_detail_response(case_id: str) -> dict[str, 
     return {
         "status": "ok",
         "source": "case_service",
-        "case": _case_service_control_case_payload(case),
+        "case": _case_service_control_case_payload(case, graph_summary=graph_summary),
         "summary": _case_service_control_summary(case, graph_summary=graph_summary),
         "events": _case_service_control_timeline(events, feedback),
         "feedback": [_safe_case_service_output_value(item.model_dump(mode="json")) for item in feedback],
@@ -1223,6 +1231,40 @@ async def _record_case_service_primary_decision(case, request_body) -> dict | No
     if summary is None and request_body.decision == "approved":
         raise HTTPException(status_code=409, detail="No resumable investigation found for CaseService case")
     return summary
+
+
+async def _apply_case_service_primary_decision_state(case, request_body, graph_summary: dict | None):
+    if request_body.decision not in {"approved", "rejected"}:
+        return case
+    if getattr(case, "kind", "") != "atomic":
+        return case
+    from app.cases.models import CaseEvent, utc_now
+
+    now = utc_now()
+    summary_status = str((graph_summary or {}).get("status") or request_body.decision)
+    case.status = "waiting_approval" if summary_status == "waiting_approval" else "resolved"
+    if case.status == "resolved":
+        case.resolved_at = now
+        case.resolution_reason = f"operator_{request_body.decision}"
+    case.updated_at = now
+    diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
+    diagnosis["operator_decision"] = _safe_case_service_output_value(request_body.model_dump())
+    diagnosis["decision_status"] = _safe_monitor_token(summary_status, limit=64)
+    case.last_diagnosis = diagnosis
+    case = await case_service_runtime.store.upsert_case(case)
+    await case_service_runtime.store.append_event(
+        CaseEvent(
+            case_id=case.case_id,
+            event_type="operator_decision_recorded",
+            actor_type="operator",
+            actor_id=_safe_monitor_token(request_body.operator, limit=120),
+            payload={
+                "decision": _safe_monitor_token(request_body.decision, limit=32),
+                "summary_status": _safe_monitor_token(summary_status, limit=64),
+            },
+        )
+    )
+    return case
 
 
 def _reactive_observations_from_alert_payload(alert_payload: dict):
@@ -1643,6 +1685,8 @@ async def control_case_decision(
                 case.case_id,
                 operator=_safe_monitor_token(request_body.operator, limit=120),
             )
+        else:
+            case = await _apply_case_service_primary_decision_state(case, request_body, summary)
         await _write_case_service_operator_feedback(
             case,
             operator=request_body.operator,
