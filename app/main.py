@@ -855,6 +855,44 @@ def _case_service_reactive_allows_investigation(shadow_results: list[object]) ->
     return False
 
 
+async def _link_case_service_results_to_legacy_case(shadow_results: list[object], legacy_case: dict | None) -> None:
+    """Best-effort alias bridge from legacy IncidentMemory ids to CaseService ids."""
+    if case_service_runtime is None or not legacy_case:
+        return
+    cases = []
+    seen: set[str] = set()
+    for result in shadow_results:
+        case = getattr(result, "case", None)
+        case_id = str(getattr(case, "case_id", "") or "")
+        if case is not None and case_id and case_id not in seen:
+            cases.append(case)
+            seen.add(case_id)
+    if not cases:
+        return
+    if len(cases) > 1:
+        log.info("case_service_legacy_alias_skipped_multi_case", count=len(cases))
+        return
+    case = cases[0]
+    try:
+        from app.cases.models import CaseIdentityAlias
+
+        aliases = []
+        case_number = str(legacy_case.get("case_number") or "").strip()
+        incident_id = str(legacy_case.get("incident_id") or "").strip()
+        if case_number:
+            aliases.append(CaseIdentityAlias(case_id=case.case_id, alias_type="legacy_case_number", alias_value=case_number))
+        if incident_id:
+            aliases.append(CaseIdentityAlias(case_id=case.case_id, alias_type="legacy_incident_id", alias_value=incident_id))
+        for alias in aliases:
+            await case_service_runtime.store.record_alias(alias)
+        if aliases:
+            log.info("case_service_legacy_alias_recorded", case_id=case.case_id, aliases=len(aliases))
+    except Exception as e:
+        safe = classify_exception(e)
+        record_case_service_shadow_failure(path="legacy_alias", category=safe.category)
+        log_exception("case_service_legacy_alias_failed", e, category=safe.category)
+
+
 async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_state: dict) -> None:
     """Best-effort stamp of successful reactive graph investigation onto cases."""
     if case_service_runtime is None:
@@ -897,6 +935,73 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="reactive_control", category=safe.category)
         log_exception("case_service_reactive_investigation_record_failed", e, category=safe.category)
+
+
+async def _case_service_case_for_identifier(identifier: str):
+    if case_service_runtime is None:
+        return None
+    store = case_service_runtime.store
+    lookup_identifier = _validated_case_service_lookup_identifier(identifier)
+    case = await store.get_case(lookup_identifier)
+    if case is not None:
+        return case
+    for alias_type in ("legacy_incident_id", "legacy_case_number"):
+        case_id = await store.resolve_alias(alias_type, lookup_identifier)
+        if case_id:
+            return await store.get_case(case_id)
+    return None
+
+
+async def _record_case_service_operator_feedback(
+    identifier: str,
+    *,
+    operator: str,
+    feedback_type: str,
+    comment: str = "",
+    payload: dict | None = None,
+) -> None:
+    if case_service_runtime is None:
+        return
+    try:
+        from app.cases.models import OperatorFeedback
+
+        case = await _case_service_case_for_identifier(identifier)
+        if case is None:
+            return
+        if getattr(case, "kind", "") != "atomic":
+            log.info(
+                "case_service_operator_feedback_skipped_non_atomic",
+                case_id=getattr(case, "case_id", ""),
+                kind=getattr(case, "kind", ""),
+            )
+            return
+        rendered_comment = _safe_monitor_text(comment, limit=1000)
+        await case_service_runtime.service.record_operator_feedback(
+            OperatorFeedback(
+                case_id=case.case_id,
+                actor_id=_safe_monitor_token(operator or "unknown", limit=120),
+                actor_role="operator",
+                feedback_type=feedback_type,
+                payload={
+                    "comment": rendered_comment,
+                    "legacy_identifier": _safe_monitor_token(identifier, limit=128),
+                    **(payload or {}),
+                },
+            )
+        )
+        log.info("case_service_operator_feedback_recorded", case_id=case.case_id, feedback_type=feedback_type)
+    except Exception as e:
+        safe = classify_exception(e)
+        record_case_service_shadow_failure(path="operator_feedback", category=safe.category)
+        log_exception("case_service_operator_feedback_failed", e, category=safe.category)
+
+
+def _feedback_type_for_decision(decision: str) -> str:
+    if decision == "approved":
+        return "operator_confirmed_diagnosis"
+    if decision == "rejected":
+        return "operator_rejected_diagnosis"
+    return "operator_note"
 
 
 def _reactive_observations_from_alert_payload(alert_payload: dict):
@@ -1000,6 +1105,7 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
     alert_payload["source"] = "alertmanager"
     shadow_results = await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
+    await _link_case_service_results_to_legacy_case(shadow_results, result.case or result.parent_case)
     if (
         result.should_investigate
         and result.case is not None
@@ -1023,6 +1129,7 @@ async def icinga_webhook(payload: IcingaNotification, background_tasks: Backgrou
     alert_payload = _icinga_to_alert_payload(payload)
     shadow_results = await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
+    await _link_case_service_results_to_legacy_case(shadow_results, result.case or result.parent_case)
     if (
         result.should_investigate
         and result.case is not None
@@ -1189,15 +1296,15 @@ async def control_case_service_case_detail(
     x_noc_control_token: str | None = Header(default=None),
 ):
     _require_control_request(request, token, x_noc_control_token)
-    safe_case_id = _validated_case_service_id(case_id)
     runtime = _require_case_service_runtime()
     store = runtime.store
-    case = await store.get_case(safe_case_id)
+    case = await _case_service_case_for_identifier(case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="Case-service case not found")
-    events = await store.case_events(safe_case_id)
-    traces = await store.list_traces(case_id=safe_case_id)
-    feedback = await store.list_feedback(case_id=safe_case_id)
+    canonical_case_id = case.case_id
+    events = await store.case_events(canonical_case_id)
+    traces = await store.list_traces(case_id=canonical_case_id)
+    feedback = await store.list_feedback(case_id=canonical_case_id)
     return {
         "status": "ok",
         "backend": type(store).__name__,
@@ -1247,6 +1354,13 @@ async def control_case_comment(
     case = await graph_runtime.INCIDENT_MEMORY.append_operator_comment(case_id, request_body.operator, request_body.comment)
     if case is None:
         raise HTTPException(status_code=404, detail="Case not found")
+    await _record_case_service_operator_feedback(
+        case_id,
+        operator=request_body.operator,
+        feedback_type="operator_note",
+        comment=request_body.comment,
+        payload={"source": "control_case_comment"},
+    )
     return {"status": "ok", "case": case}
 
 
@@ -1270,6 +1384,13 @@ async def control_case_decision(
         resolved,
         request_body.operator,
         f"Decision {request_body.decision}: {request_body.comment}".strip(),
+    )
+    await _record_case_service_operator_feedback(
+        resolved,
+        operator=request_body.operator,
+        feedback_type=_feedback_type_for_decision(request_body.decision),
+        comment=request_body.comment,
+        payload={"source": "control_case_decision", "decision": request_body.decision},
     )
     return {"status": "ok", "incident": summary}
 
@@ -1383,11 +1504,11 @@ def _validated_case_service_outbox_status(value: str | None) -> str | None:
     return rendered
 
 
-def _validated_case_service_id(value: str) -> str:
+def _validated_case_service_lookup_identifier(value: str) -> str:
     rendered = str(value or "").strip()
     allowed_chars = {"_", "-", ":", "."}
     if not (1 <= len(rendered) <= 128) or any(not (ch.isalnum() or ch in allowed_chars) for ch in rendered):
-        raise HTTPException(status_code=422, detail="case_id contains invalid characters")
+        raise HTTPException(status_code=422, detail="case identifier contains invalid characters")
     return rendered
 
 
@@ -1518,6 +1639,13 @@ async def decide_incident(
     summary = await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
+    await _record_case_service_operator_feedback(
+        incident_id,
+        operator=request.operator,
+        feedback_type=_feedback_type_for_decision(request.decision),
+        comment=request.comment,
+        payload={"source": "control_incident_decision", "decision": request.decision},
+    )
     return {"status": "ok", "incident": summary}
 
 
@@ -1533,6 +1661,13 @@ async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | N
     summary = await record_operator_decision(request.incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
+    await _record_case_service_operator_feedback(
+        request.incident_id,
+        operator=request.operator,
+        feedback_type=_feedback_type_for_decision(request.decision),
+        comment=request.comment,
+        payload={"source": "signed_resume", "decision": request.decision},
+    )
     return {"status": "ok", "incident": summary}
 
 

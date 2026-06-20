@@ -43,6 +43,19 @@ def restore_runtime_globals():
 
 
 @pytest.fixture
+def isolated_incident_memory():
+    """Install a fresh IncidentMemory and restore the process global after the test."""
+
+    original = graph_runtime.INCIDENT_MEMORY
+    memory = IncidentMemory(redis_url="")
+    graph_runtime.INCIDENT_MEMORY = memory
+    try:
+        yield memory
+    finally:
+        graph_runtime.INCIDENT_MEMORY = original
+
+
+@pytest.fixture
 def mock_alert_payload():
     return {
         "receiver": "webhook",
@@ -270,12 +283,11 @@ async def test_health_cases_reports_runtime_status(monkeypatch):
     assert response["outbox"] == {"pending": 2, "failed": 1}
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, monkeypatch):
+async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, isolated_incident_memory):
     """
     Test that the webhook successfully parses standard AlertManager payloads
     and offloads the processing to a background task.
     """
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     mocker.patch("app.main.investigate_alert") # Mock the background execution so we don't hit the real LLM API
     response = await alertmanager_webhook(
         AlertManagerPayload.model_validate(mock_alert_payload),
@@ -284,8 +296,7 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, monkeyp
     assert response["status"] == "accepted"
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, monkeypatch):
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
+async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, isolated_incident_memory):
     background_tasks = mocker.Mock()
     mock_alert_payload["status"] = "resolved"
     mock_alert_payload["alerts"][0]["status"] = "resolved"
@@ -300,8 +311,7 @@ async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker,
 
 
 @pytest.mark.asyncio
-async def test_icinga_webhook_ignores_recovery(mocker, monkeypatch):
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
+async def test_icinga_webhook_ignores_recovery(mocker, isolated_incident_memory):
     background_tasks = mocker.Mock()
     notification = IcingaNotification(
         host_name="vault",
@@ -376,8 +386,7 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
 
 
 @pytest.mark.asyncio
-async def test_icinga_duplicate_attaches_to_existing_case_without_second_investigation(mocker, monkeypatch):
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
+async def test_icinga_duplicate_attaches_to_existing_case_without_second_investigation(mocker, isolated_incident_memory):
     background_tasks = mocker.Mock()
     notification = IcingaNotification(
         host_name="noc",
@@ -529,8 +538,36 @@ async def test_shadow_observe_alert_payload_preserves_partial_results(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_alertmanager_webhook_links_case_service_to_legacy_case(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+
+    assert response["status"] == "accepted"
+    by_number = await store.resolve_alias("legacy_case_number", response["case_number"])
+    by_incident = await store.resolve_alias("legacy_incident_id", response["incident_id"])
+    assert by_number is not None
+    assert by_number == by_incident
+
+
+@pytest.mark.asyncio
 async def test_reactive_case_service_control_skips_recently_investigated_duplicate(
-    monkeypatch, mock_alert_payload, mocker
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
 ):
     store = InMemoryCaseStore()
     service = CaseService(store)
@@ -545,7 +582,6 @@ async def test_reactive_case_service_control_skips_recently_investigated_duplica
 
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
     monkeypatch.setattr(main_module, "case_service_runtime", runtime)
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     payload = deepcopy(mock_alert_payload)
     payload["source"] = "alertmanager"
     first_results = await _shadow_observe_alert_payload(payload)
