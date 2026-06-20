@@ -216,6 +216,16 @@ state own investigation cooldown and report stamping instead of
 `investigations.json`. Shadow observation still records only freshly scanned raw
 hotspots, never carried-forward deep/degraded-cycle hotspots.
 
+Reactive report enqueueing can be canaried separately:
+
+```bash
+NOC_CASESERVICE_REACTIVE_REPORT=1
+```
+
+With this flag, reactive Alertmanager/Icinga observations still flow through the
+legacy investigation path, but CaseService owns the report idempotency decision
+and enqueues `report` outbox intents for firing cases that should be surfaced.
+
 Outbox side effects are also opt-in:
 
 ```bash
@@ -299,6 +309,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_REDIS_URL`
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
 - `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
+- `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`

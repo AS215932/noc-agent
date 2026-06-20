@@ -20,6 +20,7 @@ from app.main import (
     icinga_webhook,
 )
 from app.agent import DiagnosticSynthesis
+from app.cases import CaseService, InMemoryCaseStore
 from app.incident_memory import IncidentMemory
 import app.graph_runtime as graph_runtime
 from app.mcp_runtime import MCPRuntime
@@ -434,6 +435,59 @@ async def test_shadow_observe_alert_payload_records_alertmanager(monkeypatch, mo
     assert len(seen) == 1
     assert seen[0].source == "alertmanager"
     assert seen[0].detector == "InstanceDown"
+
+
+@pytest.mark.asyncio
+async def test_shadow_observe_alert_payload_can_enqueue_case_report(monkeypatch, mock_alert_payload):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+
+    import app.main as main_module
+
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_REPORT", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    payload = dict(mock_alert_payload)
+    payload["source"] = "alertmanager"
+
+    results = await _shadow_observe_alert_payload(payload)
+    await _shadow_observe_alert_payload(payload)
+
+    assert len(results) == 1
+    assert getattr(results[0], "case") is not None
+    outbox = await store.list_outbox(status="pending")
+    assert len(outbox) == 1  # second observation returns same idempotent report intent
+    assert outbox[0].intent_type == "report"
+    assert outbox[0].case_id == getattr(results[0], "case").case_id
+    assert outbox[0].payload["source"] == "alertmanager"
+
+
+@pytest.mark.asyncio
+async def test_shadow_observe_alert_payload_does_not_enqueue_report_by_default(monkeypatch, mock_alert_payload):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+
+    import app.main as main_module
+
+    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_REPORT", raising=False)
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    payload = dict(mock_alert_payload)
+    payload["source"] = "alertmanager"
+
+    await _shadow_observe_alert_payload(payload)
+
+    assert await store.list_outbox(status="pending") == []
 
 
 @pytest.mark.asyncio

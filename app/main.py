@@ -766,10 +766,10 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
     return plan
 
 
-async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
+async def _shadow_observe_alert_payload(alert_payload: dict) -> list[object]:
     """Best-effort case-service shadow write for reactive webhook payloads."""
     if case_service_runtime is None:
-        return
+        return []
     try:
         from app.cases.notifications import observation_from_icinga_alert_payload, observations_from_alertmanager
 
@@ -777,20 +777,58 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
             observations = [observation_from_icinga_alert_payload(alert_payload)]
         else:
             observations = observations_from_alertmanager(alert_payload)
+        results: list[object] = []
         for observation in observations:
             result = await case_service_runtime.service.observe(observation)
+            results.append(result)
             record_case_service_shadow_observation(
                 path="reactive",
                 source=observation.source,
                 status=observation.status,
                 action=str(getattr(result, "action", "unknown")),
             )
+            await _maybe_request_reactive_case_report(observation, result, alert_payload)
         if observations:
             log.info("case_service_shadow_reactive_observed", count=len(observations), source=alert_payload.get("source"))
+        return results
     except Exception as e:
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="reactive", category=safe.category)
         log_exception("case_service_shadow_reactive_observe_failed", e, category=safe.category)
+        return []
+
+
+async def _maybe_request_reactive_case_report(observation, observe_result: object, alert_payload: dict) -> None:
+    """Optionally let CaseService own reactive report enqueue decisions."""
+    if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
+        return
+    if getattr(observation, "status", "") != "firing":
+        return
+    case = getattr(observe_result, "case", None)
+    if case is None:
+        return
+    service = case_service_runtime.service
+    if not service.should_report(case):
+        return
+    state_signature = service.report_state_signature(case)
+    intent = await service.request_report(
+        case,
+        state_signature=state_signature,
+        payload={
+            "source": alert_payload.get("source") or observation.source,
+            "observation_id": observation.observation_id,
+            "detector": observation.detector,
+            "resource": observation.resource,
+            "title": f"NOC case {case.case_number or case.case_id}: {case.title}",
+            "description": case.summary or str(observation.annotations.get("summary") or "Case observed firing."),
+        },
+    )
+    log.info(
+        "case_service_reactive_report_requested",
+        case_id=case.case_id,
+        outbox_id=intent.outbox_id,
+        state_signature=state_signature,
+    )
 
 
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
