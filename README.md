@@ -178,6 +178,53 @@ Proactive config (in-code defaults are conservative; the deployment env enables 
 Settings can also be set under a `[proactive]` table in the model-config TOML;
 environment variables take precedence.
 
+## Case-grounded shadow runtime
+
+The case-grounded state machine (`app/cases/`) is available as a strangler
+foundation for both reactive webhooks and the proactive loop. It stores typed
+observations, atomic cases, meta-cases, append-only events, aliases, traces,
+operator feedback, and idempotent side-effect outbox intents.
+
+It is **off by default**. Enable best-effort shadow writes with:
+
+```bash
+NOC_CASESERVICE_SHADOW=1
+```
+
+If `NOC_DATABASE_URL` or `DATABASE_URL` is set, the runtime uses the Postgres
+case store and creates the current schema on startup. Install the optional
+Postgres support in deployments that enable this path:
+
+```bash
+uv sync --extra postgres
+```
+
+Without a DSN, shadow mode uses in-memory storage for local/dev canaries. Set
+`NOC_REQUIRE_POSTGRES=1` in production to fail loud instead of falling back to
+in-memory state; this also prevents LangGraph checkpointing from silently using
+the in-memory saver when a Postgres checkpoint backend was requested.
+
+Guarded proactive ownership is separate:
+
+```bash
+NOC_CASESERVICE_CONTROL=1
+```
+
+With both a case service and this flag present, the proactive loop lets case
+state own investigation cooldown and report stamping instead of
+`investigations.json`. Shadow observation still records only freshly scanned raw
+hotspots, never carried-forward deep/degraded-cycle hotspots.
+
+Offline replay is available for sanitized fixtures:
+
+```bash
+nocctl replay path/to/observations.json
+```
+
+Fixtures may be either a JSON list of `ObservationRecord` objects or an object
+with an `observations` list. Replay reports deterministic metrics without live
+network access or production credentials.
+
 ## Discord bot
 
 When `DISCORD_BOT_TOKEN` is present, the service starts a `discord.py` bot that
@@ -227,6 +274,13 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 ## Key configuration
 
 - `NOC_REDIS_URL`
+- `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
+- `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
+- `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
+- `NOC_DATABASE_URL` / `DATABASE_URL` (optional Postgres case/checkpoint backend DSN)
+- `NOC_REQUIRE_POSTGRES` (default `0`; fail loud if Postgres is required but unavailable)
+- `NOC_DATABASE_POOL_MIN_SIZE` / `NOC_DATABASE_POOL_MAX_SIZE`
+- `NOC_DATABASE_COMMAND_TIMEOUT_S` / `NOC_DATABASE_STATEMENT_TIMEOUT_MS` / `NOC_DATABASE_LOCK_TIMEOUT_MS`
 - `HYRULE_MCP_URL`
 - `NOC_CONTROL_TOKEN`
 - `NOC_APPROVAL_SIGNING_SECRET` (also accepts `HYRULE_MCP_ACTION_SIGNING_SECRET`)
