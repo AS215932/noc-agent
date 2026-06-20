@@ -274,7 +274,75 @@ async def test_case_service_primary_control_comments_and_acknowledges(monkeypatc
     assert commented["case"]["incident_id"] == created.case.case_id
     assert decided["incident"]["incident_id"] == created.case.case_id
     assert [item.feedback_type for item in feedback] == ["operator_note", "operator_note"]
+    assert feedback[0].payload["untrusted_operator_text"] is True
+    assert feedback[0].payload["model_consumption_allowed"] is False
     assert "case_acknowledged" in event_types
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_decision_updates_waiting_graph_summary(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await memory.put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "packet loss"},
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    response = await control_case_decision(
+        created.case.case_id,
+        LocalDecisionRequest(decision="approved", operator="svag", comment="ship it"),
+        _request(),
+    )
+
+    assert response["incident"]["status"] == "approved"
+    assert (await memory.get_summary(created.case.case_id))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_comment_surfaces_feedback_write_failure(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+
+    class FailingFeedbackStore(InMemoryCaseStore):
+        async def record_feedback(self, feedback):
+            raise RuntimeError("feedback store unavailable")
+
+    store = FailingFeedbackStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="Latency", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    with pytest.raises(RuntimeError, match="feedback store unavailable"):
+        await control_case_comment(
+            created.case.case_id,
+            CommentRequest(operator="svag", comment="checking"),
+            _request(),
+        )
 
 
 @pytest.mark.asyncio

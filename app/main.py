@@ -952,6 +952,37 @@ async def _case_service_case_for_identifier(identifier: str):
     return None
 
 
+async def _write_case_service_operator_feedback(
+    case,
+    *,
+    operator: str,
+    feedback_type: str,
+    comment: str = "",
+    payload: dict | None = None,
+    legacy_identifier: str = "",
+):
+    from app.cases.models import OperatorFeedback
+
+    rendered_comment = _safe_monitor_text(comment, limit=1000)
+    feedback = await case_service_runtime.service.record_operator_feedback(
+        OperatorFeedback(
+            case_id=case.case_id,
+            actor_id=_safe_monitor_token(operator or "unknown", limit=120),
+            actor_role="operator",
+            feedback_type=feedback_type,
+            payload={
+                **_safe_case_service_feedback_payload(payload or {}),
+                "comment": rendered_comment,
+                "legacy_identifier": _safe_monitor_token(legacy_identifier or case.case_id, limit=128),
+                "untrusted_operator_text": True,
+                "model_consumption_allowed": False,
+            },
+        )
+    )
+    log.info("case_service_operator_feedback_recorded", case_id=case.case_id, feedback_type=feedback_type)
+    return feedback
+
+
 async def _record_case_service_operator_feedback(
     identifier: str,
     *,
@@ -963,8 +994,6 @@ async def _record_case_service_operator_feedback(
     if case_service_runtime is None:
         return
     try:
-        from app.cases.models import OperatorFeedback
-
         case = await _case_service_case_for_identifier(identifier)
         if case is None:
             return
@@ -975,21 +1004,14 @@ async def _record_case_service_operator_feedback(
                 kind=getattr(case, "kind", ""),
             )
             return
-        rendered_comment = _safe_monitor_text(comment, limit=1000)
-        await case_service_runtime.service.record_operator_feedback(
-            OperatorFeedback(
-                case_id=case.case_id,
-                actor_id=_safe_monitor_token(operator or "unknown", limit=120),
-                actor_role="operator",
-                feedback_type=feedback_type,
-                payload={
-                    "comment": rendered_comment,
-                    "legacy_identifier": _safe_monitor_token(identifier, limit=128),
-                    **(payload or {}),
-                },
-            )
+        await _write_case_service_operator_feedback(
+            case,
+            operator=operator,
+            feedback_type=feedback_type,
+            comment=comment,
+            payload=payload,
+            legacy_identifier=identifier,
         )
-        log.info("case_service_operator_feedback_recorded", case_id=case.case_id, feedback_type=feedback_type)
     except Exception as e:
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="operator_feedback", category=safe.category)
@@ -1017,47 +1039,54 @@ async def _require_case_service_control_case(identifier: str):
 
 
 def _case_service_control_identifier(case) -> str:
-    return str(getattr(case, "case_number", "") or getattr(case, "case_id", "") or "")
+    return _safe_monitor_token(getattr(case, "case_number", "") or getattr(case, "case_id", "") or "", limit=128)
 
 
 def _case_service_control_case_payload(case) -> dict[str, object]:
-    case_id = str(getattr(case, "case_id", "") or "")
+    case_id = _validated_case_service_lookup_identifier(getattr(case, "case_id", "") or "")
     case_number = _case_service_control_identifier(case)
+    diagnosis = getattr(case, "last_diagnosis", {}) or {}
     return {
         "incident_id": case_id,
         "case_id": case_id,
         "case_number": case_number,
-        "status": getattr(case, "status", ""),
-        "severity": getattr(case, "severity", "") or "UNKNOWN",
-        "resource_id": getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
-        "title": getattr(case, "title", "") or "",
-        "summary": getattr(case, "summary", "") or "",
+        "status": _safe_monitor_token(getattr(case, "status", ""), limit=64),
+        "severity": _safe_monitor_token(getattr(case, "severity", "") or "UNKNOWN", limit=32),
+        "resource_id": _safe_monitor_text(
+            getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
+            limit=240,
+        ),
+        "title": _safe_monitor_text(getattr(case, "title", "") or "", limit=240),
+        "summary": _safe_monitor_text(getattr(case, "summary", "") or "", limit=1000),
         "event_count": len(getattr(case, "trace_ids", []) or []) + len(getattr(case, "feedback_ids", []) or []),
-        "updated_at": getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "",
+        "updated_at": _safe_monitor_token(getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "", limit=80),
         "pending_approval": getattr(case, "status", "") == "waiting_approval",
         "source": "case_service",
-        "diagnostic_summary": (getattr(case, "last_diagnosis", {}) or {}).get("summary", ""),
-        "recommendations": list(getattr(case, "recommendations", []) or []),
-        "issue_url": getattr(case, "issue_url", "") or "",
+        "diagnostic_summary": _safe_monitor_text(diagnosis.get("summary", ""), limit=1000),
+        "recommendations": [_safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])],
+        "issue_url": _safe_monitor_text(getattr(case, "issue_url", "") or "", limit=300),
     }
 
 
 def _case_service_control_summary(case) -> dict[str, object]:
     diagnosis = getattr(case, "last_diagnosis", {}) or {}
     return {
-        "incident_id": getattr(case, "case_id", "") or "",
+        "incident_id": _validated_case_service_lookup_identifier(getattr(case, "case_id", "") or ""),
         "case_number": _case_service_control_identifier(case),
-        "resource_id": getattr(case, "resource_id", "") or "",
-        "title": diagnosis.get("summary") or getattr(case, "summary", "") or getattr(case, "title", "") or "",
-        "status": getattr(case, "status", ""),
-        "severity": getattr(case, "severity", "") or "UNKNOWN",
+        "resource_id": _safe_monitor_text(getattr(case, "resource_id", "") or "", limit=240),
+        "title": _safe_monitor_text(
+            diagnosis.get("summary") or getattr(case, "summary", "") or getattr(case, "title", "") or "",
+            limit=1000,
+        ),
+        "status": _safe_monitor_token(getattr(case, "status", ""), limit=64),
+        "severity": _safe_monitor_token(getattr(case, "severity", "") or "UNKNOWN", limit=32),
         "confidence_score": diagnosis.get("confidence_score", 0.0),
-        "requires_human": diagnosis.get("requires_human", False),
+        "requires_human": bool(diagnosis.get("requires_human", False)),
         "proposals": [],
         "executed_actions": [],
         "verification_results": [],
-        "recommendations": list(getattr(case, "recommendations", []) or []),
-        "updated_at": getattr(case, "updated_at", "") or "",
+        "recommendations": [_safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])],
+        "updated_at": _safe_monitor_token(getattr(case, "updated_at", "") or "", limit=80),
         "source": "case_service",
     }
 
@@ -1073,29 +1102,35 @@ def _case_service_control_event_payload(event) -> dict[str, object]:
         or ""
     )
     return {
-        "received_at": payload.get("occurred_at", ""),
-        "event_type": payload.get("event_type", ""),
-        "state": event_payload.get("status", ""),
-        "summary": str(summary),
-        "operator": payload.get("actor_id", ""),
-        "source": payload.get("source", "case_service"),
-        "payload": event_payload,
+        "received_at": _safe_monitor_token(payload.get("occurred_at", ""), limit=80),
+        "event_type": _safe_monitor_token(payload.get("event_type", ""), limit=80),
+        "state": _safe_monitor_token(event_payload.get("status", ""), limit=64),
+        "summary": _safe_monitor_text(summary, limit=1000),
+        "operator": _safe_monitor_token(payload.get("actor_id", ""), limit=120),
+        "source": _safe_monitor_token(payload.get("source", "case_service"), limit=64),
+        "payload": _safe_case_service_feedback_payload(event_payload),
     }
 
 
 def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
     event = case_event_from_alert(alert_payload)
+    identity = getattr(case, "identity", {}) or {}
+    safe_identity = (
+        {_safe_monitor_token(key, limit=80): _safe_monitor_text(value, limit=240) for key, value in identity.items()}
+        if isinstance(identity, dict)
+        else {}
+    )
     return {
-        "incident_id": getattr(case, "case_id", ""),
+        "incident_id": _validated_case_service_lookup_identifier(getattr(case, "case_id", "") or ""),
         "case_number": _case_service_control_identifier(case),
-        "fingerprint": getattr(case, "fingerprint", ""),
-        "identity": dict(getattr(case, "identity", {}) or {}),
-        "resource_id": getattr(case, "resource_id", ""),
-        "title": getattr(case, "title", "") or _case_service_control_identifier(case),
-        "status": getattr(case, "status", ""),
-        "created_at": getattr(case, "opened_at", ""),
-        "updated_at": getattr(case, "updated_at", ""),
-        "last_event_at": getattr(case, "last_seen", "") or getattr(case, "updated_at", ""),
+        "fingerprint": _safe_monitor_token(getattr(case, "fingerprint", ""), limit=128),
+        "identity": safe_identity,
+        "resource_id": _safe_monitor_text(getattr(case, "resource_id", ""), limit=240),
+        "title": _safe_monitor_text(getattr(case, "title", "") or _case_service_control_identifier(case), limit=240),
+        "status": _safe_monitor_token(getattr(case, "status", ""), limit=64),
+        "created_at": _safe_monitor_token(getattr(case, "opened_at", ""), limit=80),
+        "updated_at": _safe_monitor_token(getattr(case, "updated_at", ""), limit=80),
+        "last_event_at": _safe_monitor_token(getattr(case, "last_seen", "") or getattr(case, "updated_at", ""), limit=80),
         "event_count": 1,
         "latest_event": event,
         "latest_transition": None,
@@ -1130,6 +1165,20 @@ async def _case_service_control_case_events_response(case_id: str) -> dict[str, 
     case = await _require_case_service_control_case(case_id)
     events = await runtime.store.case_events(case.case_id)
     return {"status": "ok", "source": "case_service", "events": [_case_service_control_event_payload(event) for event in events]}
+
+
+def _case_service_graph_incident_identifier(case) -> str:
+    diagnosis = getattr(case, "last_diagnosis", {}) or {}
+    return _safe_monitor_token(diagnosis.get("incident_id") or getattr(case, "case_id", "") or "", limit=128)
+
+
+async def _record_case_service_primary_decision(case, request_body) -> dict | None:
+    incident_id = _case_service_graph_incident_identifier(case)
+    decision = ApprovalDecision(incident_id=incident_id, **request_body.model_dump())
+    summary = await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
+    if summary is None and request_body.decision == "approved":
+        raise HTTPException(status_code=409, detail="No resumable investigation found for CaseService case")
+    return summary
 
 
 def _reactive_observations_from_alert_payload(alert_payload: dict):
@@ -1173,6 +1222,19 @@ def _safe_monitor_token(value: object, *, limit: int) -> str:
     text = str(value or "")
     kept = [ch for ch in text if ch.isalnum() or ch in {"_", "-", ":", ".", "/"}]
     return ("".join(kept) or "unknown")[:limit]
+
+
+def _safe_case_service_feedback_payload(payload: dict) -> dict[str, object]:
+    safe: dict[str, object] = {}
+    for key, value in payload.items():
+        safe_key = _safe_monitor_token(key, limit=64)
+        if isinstance(value, str):
+            safe[safe_key] = _safe_monitor_text(value, limit=500)
+        elif isinstance(value, bool | int | float) or value is None:
+            safe[safe_key] = value
+        else:
+            safe[safe_key] = _safe_monitor_text(value, limit=1000)
+    return safe
 
 
 def _safe_monitor_text(value: object, *, limit: int) -> str:
@@ -1487,12 +1549,13 @@ async def control_case_comment(
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_primary_enabled():
         case = await _require_case_service_control_case(case_id)
-        await _record_case_service_operator_feedback(
-            case.case_id,
+        await _write_case_service_operator_feedback(
+            case,
             operator=request_body.operator,
             feedback_type="operator_note",
             comment=request_body.comment,
             payload={"source": "control_case_comment"},
+            legacy_identifier=case.case_id,
         )
         updated = await _case_service_case_for_identifier(case.case_id) or case
         return {"status": "ok", "case": _case_service_control_case_payload(updated)}
@@ -1520,17 +1583,22 @@ async def control_case_decision(
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_primary_enabled():
         case = await _require_case_service_control_case(case_id)
+        summary = await _record_case_service_primary_decision(case, request_body)
         if request_body.decision == "acknowledged":
-            case = await case_service_runtime.service.ack(case.case_id, operator=request_body.operator)
-        await _record_case_service_operator_feedback(
-            case.case_id,
+            case = await case_service_runtime.service.ack(
+                case.case_id,
+                operator=_safe_monitor_token(request_body.operator, limit=120),
+            )
+        await _write_case_service_operator_feedback(
+            case,
             operator=request_body.operator,
             feedback_type=_feedback_type_for_decision(request_body.decision),
             comment=request_body.comment,
             payload={"source": "control_case_decision", "decision": request_body.decision},
+            legacy_identifier=case.case_id,
         )
         updated = await _case_service_case_for_identifier(case.case_id) or case
-        return {"status": "ok", "incident": _case_service_control_summary(updated)}
+        return {"status": "ok", "incident": summary or _case_service_control_summary(updated)}
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
         raise HTTPException(status_code=404, detail="Case not found")
