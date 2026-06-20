@@ -249,6 +249,7 @@ async def test_health_cases_reports_runtime_status(monkeypatch):
     assert response["status"] == "ok"
     assert response["backend"] == "_Store"
     assert response["sample_case_count"] == 1
+    assert response["outbox_worker"] == {"enabled": False, "running": False}
     assert response["outbox"] == {"pending": 2, "failed": 1}
 
 @pytest.mark.asyncio

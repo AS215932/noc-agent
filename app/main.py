@@ -47,6 +47,7 @@ discord_bot_task = None
 proactive_loop = None
 proactive_lock_fd = None
 case_service_runtime = None
+case_outbox_task = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 PROACTIVE_LOCK_PATH = os.getenv("PROACTIVE_LOCK_PATH", "/var/lib/noc-agent/proactive-instance.lock")
 
@@ -105,6 +106,23 @@ def _release_proactive_lock(lock_fd: int | None):
     os.close(lock_fd)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value.strip())
+    except ValueError:
+        return default
+
+
 async def _mail_poll_loop(lock_fd: int):
     log.info("mail_poll_loop_starting", interval_seconds=300)
     try:
@@ -118,6 +136,31 @@ async def _mail_poll_loop(lock_fd: int):
     finally:
         _release_mail_poller_lock(lock_fd)
 
+
+async def _case_outbox_loop(runtime):
+    from app.cases.runtime import process_case_outbox_once
+
+    interval_s = _env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30)
+    limit = _env_int("NOC_CASE_OUTBOX_LIMIT", 10)
+    log.info("case_outbox_loop_starting", interval_seconds=interval_s, limit=limit)
+    while True:
+        try:
+            report = await process_case_outbox_once(runtime, limit=limit)
+            if report.processed or report.failed or report.skipped:
+                log.info(
+                    "case_outbox_processed",
+                    processed=report.processed,
+                    succeeded=report.succeeded,
+                    failed=report.failed,
+                    skipped=report.skipped,
+                )
+        except Exception as e:
+            safe = classify_exception(e)
+            record_case_service_shadow_failure(path="outbox", category=safe.category)
+            log_exception("case_outbox_loop_failed", e, category=safe.category)
+        await asyncio.sleep(max(1, interval_s))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mcp_runtime
@@ -128,6 +171,7 @@ async def lifespan(app: FastAPI):
     global proactive_loop
     global proactive_lock_fd
     global case_service_runtime
+    global case_outbox_task
     log.info("startup_begin")
 
     mcp_runtime = MCPRuntime(owner="api")
@@ -163,6 +207,8 @@ async def lifespan(app: FastAPI):
             backend = type(case_service_runtime.store).__name__
             set_case_service_runtime_enabled(True, backend=backend)
             log.info("case_service_shadow_started", backend=backend)
+            if _env_bool("NOC_CASE_OUTBOX_ENABLED", False):
+                case_outbox_task = asyncio.create_task(_case_outbox_loop(case_service_runtime))
         else:
             set_case_service_runtime_enabled(False, backend="none")
     except Exception as e:
@@ -211,6 +257,11 @@ async def lifespan(app: FastAPI):
     if proactive_lock_fd is not None:
         _release_proactive_lock(proactive_lock_fd)
         proactive_lock_fd = None
+    if case_outbox_task:
+        case_outbox_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await case_outbox_task
+        case_outbox_task = None
     if case_service_runtime is not None:
         backend = type(case_service_runtime.store).__name__
         await case_service_runtime.close()
@@ -1295,6 +1346,10 @@ async def health_cases(response: Response):
         "enabled": True,
         "backend": type(store).__name__,
         "sample_case_count": len(recent_cases),
+        "outbox_worker": {
+            "enabled": _env_bool("NOC_CASE_OUTBOX_ENABLED", False),
+            "running": case_outbox_task is not None and not case_outbox_task.done(),
+        },
         "outbox": {"pending": len(pending), "failed": len(failed)},
     }
 
