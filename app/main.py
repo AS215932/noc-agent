@@ -1004,6 +1004,134 @@ def _feedback_type_for_decision(decision: str) -> str:
     return "operator_note"
 
 
+def _case_service_control_primary_enabled() -> bool:
+    return _env_bool("NOC_CASESERVICE_CONTROL_PRIMARY", False)
+
+
+async def _require_case_service_control_case(identifier: str):
+    _require_case_service_runtime()
+    case = await _case_service_case_for_identifier(identifier)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return case
+
+
+def _case_service_control_identifier(case) -> str:
+    return str(getattr(case, "case_number", "") or getattr(case, "case_id", "") or "")
+
+
+def _case_service_control_case_payload(case) -> dict[str, object]:
+    case_id = str(getattr(case, "case_id", "") or "")
+    case_number = _case_service_control_identifier(case)
+    return {
+        "incident_id": case_id,
+        "case_id": case_id,
+        "case_number": case_number,
+        "status": getattr(case, "status", ""),
+        "severity": getattr(case, "severity", "") or "UNKNOWN",
+        "resource_id": getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
+        "title": getattr(case, "title", "") or "",
+        "summary": getattr(case, "summary", "") or "",
+        "event_count": len(getattr(case, "trace_ids", []) or []) + len(getattr(case, "feedback_ids", []) or []),
+        "updated_at": getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "",
+        "pending_approval": getattr(case, "status", "") == "waiting_approval",
+        "source": "case_service",
+        "diagnostic_summary": (getattr(case, "last_diagnosis", {}) or {}).get("summary", ""),
+        "recommendations": list(getattr(case, "recommendations", []) or []),
+        "issue_url": getattr(case, "issue_url", "") or "",
+    }
+
+
+def _case_service_control_summary(case) -> dict[str, object]:
+    diagnosis = getattr(case, "last_diagnosis", {}) or {}
+    return {
+        "incident_id": getattr(case, "case_id", "") or "",
+        "case_number": _case_service_control_identifier(case),
+        "resource_id": getattr(case, "resource_id", "") or "",
+        "title": diagnosis.get("summary") or getattr(case, "summary", "") or getattr(case, "title", "") or "",
+        "status": getattr(case, "status", ""),
+        "severity": getattr(case, "severity", "") or "UNKNOWN",
+        "confidence_score": diagnosis.get("confidence_score", 0.0),
+        "requires_human": diagnosis.get("requires_human", False),
+        "proposals": [],
+        "executed_actions": [],
+        "verification_results": [],
+        "recommendations": list(getattr(case, "recommendations", []) or []),
+        "updated_at": getattr(case, "updated_at", "") or "",
+        "source": "case_service",
+    }
+
+
+def _case_service_control_event_payload(event) -> dict[str, object]:
+    payload = event.model_dump(mode="json")
+    event_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    summary = (
+        event_payload.get("summary")
+        or event_payload.get("feedback_type")
+        or event_payload.get("observation_id")
+        or event_payload.get("status")
+        or ""
+    )
+    return {
+        "received_at": payload.get("occurred_at", ""),
+        "event_type": payload.get("event_type", ""),
+        "state": event_payload.get("status", ""),
+        "summary": str(summary),
+        "operator": payload.get("actor_id", ""),
+        "source": payload.get("source", "case_service"),
+        "payload": event_payload,
+    }
+
+
+def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
+    event = case_event_from_alert(alert_payload)
+    return {
+        "incident_id": getattr(case, "case_id", ""),
+        "case_number": _case_service_control_identifier(case),
+        "fingerprint": getattr(case, "fingerprint", ""),
+        "identity": dict(getattr(case, "identity", {}) or {}),
+        "resource_id": getattr(case, "resource_id", ""),
+        "title": getattr(case, "title", "") or _case_service_control_identifier(case),
+        "status": getattr(case, "status", ""),
+        "created_at": getattr(case, "opened_at", ""),
+        "updated_at": getattr(case, "updated_at", ""),
+        "last_event_at": getattr(case, "last_seen", "") or getattr(case, "updated_at", ""),
+        "event_count": 1,
+        "latest_event": event,
+        "latest_transition": None,
+        "thread_id": None,
+        "downstream_victims": [],
+        "parents_checked": [],
+        "needs_reassessment": False,
+    }
+
+
+async def _case_service_control_cases_response() -> dict[str, object]:
+    runtime = _require_case_service_runtime()
+    cases = await runtime.store.list_cases(kind="atomic", limit=500)
+    return {"status": "ok", "source": "case_service", "cases": [_case_service_control_case_payload(case) for case in cases]}
+
+
+async def _case_service_control_case_detail_response(case_id: str) -> dict[str, object]:
+    runtime = _require_case_service_runtime()
+    case = await _require_case_service_control_case(case_id)
+    events = await runtime.store.case_events(case.case_id)
+    return {
+        "status": "ok",
+        "source": "case_service",
+        "case": _case_service_control_case_payload(case),
+        "summary": _case_service_control_summary(case),
+        "events": [_case_service_control_event_payload(event) for event in events],
+    }
+
+
+async def _case_service_control_case_events_response(case_id: str) -> dict[str, object]:
+    runtime = _require_case_service_runtime()
+    case = await _require_case_service_control_case(case_id)
+    events = await runtime.store.case_events(case.case_id)
+    return {"status": "ok", "source": "case_service", "events": [_case_service_control_event_payload(event) for event in events]}
+
+
 def _reactive_observations_from_alert_payload(alert_payload: dict):
     from app.cases.notifications import observation_from_icinga_alert_payload, observations_from_alertmanager
 
@@ -1236,6 +1364,8 @@ async def control_ui(request: Request, token: str | None = Query(default=None)):
 @app.get("/control/cases")
 async def control_cases(request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
+    if _case_service_control_primary_enabled():
+        return await _case_service_control_cases_response()
     cases = await graph_runtime.INCIDENT_MEMORY.list_cases()
     pending = {item["incident_id"] for item in await pending_summaries()}
     return {
@@ -1260,6 +1390,8 @@ async def control_cases(request: Request, token: str | None = Query(default=None
 @app.get("/control/cases/{case_id}")
 async def control_case_detail(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
+    if _case_service_control_primary_enabled():
+        return await _case_service_control_case_detail_response(case_id)
     detail = await graph_runtime.INCIDENT_MEMORY.case_detail(case_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -1336,6 +1468,8 @@ async def control_case_service_outbox(
 @app.get("/control/cases/{case_id}/events")
 async def control_case_events(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
+    if _case_service_control_primary_enabled():
+        return await _case_service_control_case_events_response(case_id)
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -1351,6 +1485,17 @@ async def control_case_comment(
     x_noc_control_token: str | None = Header(default=None),
 ):
     _require_control_request(request, token, x_noc_control_token)
+    if _case_service_control_primary_enabled():
+        case = await _require_case_service_control_case(case_id)
+        await _record_case_service_operator_feedback(
+            case.case_id,
+            operator=request_body.operator,
+            feedback_type="operator_note",
+            comment=request_body.comment,
+            payload={"source": "control_case_comment"},
+        )
+        updated = await _case_service_case_for_identifier(case.case_id) or case
+        return {"status": "ok", "case": _case_service_control_case_payload(updated)}
     case = await graph_runtime.INCIDENT_MEMORY.append_operator_comment(case_id, request_body.operator, request_body.comment)
     if case is None:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -1373,6 +1518,19 @@ async def control_case_decision(
     x_noc_control_token: str | None = Header(default=None),
 ):
     _require_control_request(request, token, x_noc_control_token)
+    if _case_service_control_primary_enabled():
+        case = await _require_case_service_control_case(case_id)
+        if request_body.decision == "acknowledged":
+            case = await case_service_runtime.service.ack(case.case_id, operator=request_body.operator)
+        await _record_case_service_operator_feedback(
+            case.case_id,
+            operator=request_body.operator,
+            feedback_type=_feedback_type_for_decision(request_body.decision),
+            comment=request_body.comment,
+            payload={"source": "control_case_decision", "decision": request_body.decision},
+        )
+        updated = await _case_service_case_for_identifier(case.case_id) or case
+        return {"status": "ok", "incident": _case_service_control_summary(updated)}
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -1405,6 +1563,20 @@ async def control_manual_investigation(
 ):
     _require_control_request(request, token, x_noc_control_token)
     alert_payload = _manual_investigation_payload(request_body.prompt, "web", request_body.operator)
+    if _case_service_control_primary_enabled():
+        _require_case_service_runtime()
+        results = await _shadow_observe_alert_payload(alert_payload)
+        case = next((getattr(result, "case", None) for result in results if getattr(result, "case", None) is not None), None)
+        if case is None:
+            raise HTTPException(status_code=409, detail="Manual investigation was not queued by CaseService")
+        background_tasks.add_task(investigate_alert, alert_payload, case=_case_service_graph_case(case, alert_payload))
+        return {
+            "status": "accepted",
+            "case": _case_service_control_case_payload(case),
+            "case_number": _case_service_control_identifier(case),
+            "incident_id": case.case_id,
+            "source": "case_service",
+        }
     result = await intake_alert(alert_payload)
     if result.case is None:
         raise HTTPException(status_code=409, detail=f"Manual investigation was not queued: {result.action}")

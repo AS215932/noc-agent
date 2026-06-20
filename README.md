@@ -244,6 +244,17 @@ investigation. Successful graph investigations are stamped back onto CaseService
 case state so repeated identical signals can be skipped until the policy
 cooldown or a signal change.
 
+The legacy control case surface can be cut over to CaseService with:
+
+```bash
+NOC_CASESERVICE_CONTROL_PRIMARY=1
+```
+
+With this flag, `/control/cases`, `/control/cases/{id}`, case events, comments,
+decisions, and manual investigations use CaseService as the primary case store.
+This path intentionally does not fall back to legacy `IncidentMemory` for old or
+unmapped cases; keep the flag off if preserving old/open legacy cases matters.
+
 Outbox side effects are also opt-in:
 
 ```bash
@@ -276,7 +287,9 @@ traces, feedback, and outbox rows against the legacy `/control/cases` surface.
 Reactive webhook intake records best-effort aliases from legacy incident IDs /
 case numbers to CaseService cases when exactly one shadow case matches, and
 operator comments/decisions are mirrored as CaseService operator feedback when
-such an alias exists.
+such an alias exists. When `NOC_CASESERVICE_CONTROL_PRIMARY=1`, the legacy
+`/control/cases` surface itself reads and writes CaseService case projections
+instead of `IncidentMemory`.
 Prometheus exports `noc_agent_case_service_runtime_enabled`,
 `noc_agent_case_service_shadow_observations_total`,
 `noc_agent_case_service_shadow_failures_total`, and
@@ -336,6 +349,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
 - `NOC_CASESERVICE_REACTIVE_CONTROL` (default `0`; gate reactive graph investigations from case state)
+- `NOC_CASESERVICE_CONTROL_PRIMARY` (default `0`; make `/control/cases` use CaseService without legacy fallback)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`

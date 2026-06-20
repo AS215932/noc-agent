@@ -15,7 +15,9 @@ from app.main import (
     ManualInvestigationRequest,
     SignedApprovalRequest,
     control_case_comment,
+    control_case_decision,
     control_case_detail,
+    control_case_events,
     control_case_service_case_detail,
     control_case_service_cases,
     control_case_service_outbox,
@@ -186,6 +188,93 @@ async def test_case_service_control_validates_filters_and_ids(monkeypatch):
     assert bad_kind.value.status_code == 422
     assert bad_case_id.value.status_code == 422
     assert bad_status.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_control_reads_cases_without_legacy_fallback(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    legacy = await memory.intake_alert(
+        {
+            "source": "alertmanager",
+            "status": "firing",
+            "groupLabels": {"alertname": "LegacyOnly"},
+            "alerts": [{"labels": {"alertname": "LegacyOnly", "instance": "old"}}],
+        }
+    )
+    assert legacy.case is not None
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="InstanceDown", resource="rtr1:9100", status="firing")
+    )
+    assert created.case is not None
+    await service.record_investigation_result(
+        created.case.case_id,
+        diagnosis={"summary": "node exporter down", "confidence_score": 0.8, "requires_human": True},
+        recommendations=["check node_exporter"],
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    listing = await control_cases(request)
+    detail = await control_case_detail(created.case.case_id, request)
+    events = await control_case_events(created.case.case_id, request)
+
+    assert listing["source"] == "case_service"
+    assert [case["incident_id"] for case in listing["cases"]] == [created.case.case_id]
+    assert legacy.case["incident_id"] not in [case["incident_id"] for case in listing["cases"]]
+    assert detail["source"] == "case_service"
+    assert detail["case"]["incident_id"] == created.case.case_id
+    assert detail["summary"]["title"] == "node exporter down"
+    assert events["events"][0]["event_type"] == "case_created"
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_control_comments_and_acknowledges(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="Latency", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    commented = await control_case_comment(
+        created.case.case_id,
+        CommentRequest(operator="svag", comment="checking"),
+        request,
+    )
+    decided = await control_case_decision(
+        created.case.case_id,
+        LocalDecisionRequest(decision="acknowledged", operator="svag", comment="seen"),
+        request,
+    )
+
+    feedback = await store.list_feedback(case_id=created.case.case_id)
+    event_types = [event.event_type for event in await store.case_events(created.case.case_id)]
+    assert commented["case"]["incident_id"] == created.case.case_id
+    assert decided["incident"]["incident_id"] == created.case.case_id
+    assert [item.feedback_type for item in feedback] == ["operator_note", "operator_note"]
+    assert "case_acknowledged" in event_types
 
 
 @pytest.mark.asyncio
