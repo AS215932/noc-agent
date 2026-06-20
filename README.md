@@ -225,6 +225,9 @@ NOC_CASESERVICE_REACTIVE_REPORT=1
 With this flag, reactive Alertmanager/Icinga observations still flow through the
 legacy investigation path, but CaseService owns the report idempotency decision
 and enqueues `report` outbox intents for firing cases that should be surfaced.
+The enqueued payload uses a bounded `reactive_case_report_v1` schema, marks
+monitor text as untrusted/not-for-model-consumption, and strips control/markdown
+delimiters from webhook-derived text.
 
 Outbox side effects are also opt-in:
 
