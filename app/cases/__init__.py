@@ -7,7 +7,7 @@ until the strangler flips land.
 """
 
 from app.cases.correlation import CorrelationService, MetaCaseResult, event_fingerprint_from_parts
-from app.cases.handlers import build_default_outbox_handlers, build_report_handler
+from app.cases.handlers import build_default_outbox_handlers, build_handoff_handler, build_report_handler
 from app.cases.models import (
     AtomicCaseProjection,
     CaseEvent,
@@ -63,6 +63,7 @@ __all__ = [
     "TraceRecord",
     "build_case_service_runtime_from_env",
     "build_default_outbox_handlers",
+    "build_handoff_handler",
     "build_report_handler",
     "event_fingerprint_from_parts",
     "load_observation_fixture",

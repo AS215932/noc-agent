@@ -32,6 +32,7 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
         runtime.service,
         knowledge_candidate_dir=_env_str("NOC_KNOWLEDGE_CANDIDATE_DIR", ""),
         control_public_url=_env_str("NOC_CONTROL_PUBLIC_URL", ""),
+        handoff_repo=_env_str("NOC_CASE_HANDOFF_REPO", _env_str("NOC_PROACTIVE_HANDOFF_REPO", "")),
     )
     processor = OutboxProcessor(
         runtime.store,
