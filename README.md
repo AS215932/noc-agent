@@ -216,6 +216,18 @@ state own investigation cooldown and report stamping instead of
 `investigations.json`. Shadow observation still records only freshly scanned raw
 hotspots, never carried-forward deep/degraded-cycle hotspots.
 
+Outbox side effects are also opt-in:
+
+```bash
+NOC_CASE_OUTBOX_ENABLED=1
+```
+
+The worker processes pending and retry-due failed intents. The default handlers
+send `report` intents to Discord and stamp the case as reported. If
+`NOC_KNOWLEDGE_CANDIDATE_DIR` is set, `knowledge_candidate` intents write
+review-gated learning events there. Handoff intents remain queued until a
+future handler owns the issue-body contract.
+
 Offline replay is available for sanitized fixtures:
 
 ```bash
@@ -286,6 +298,9 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
 - `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
+- `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
+- `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`
+- `NOC_KNOWLEDGE_CANDIDATE_DIR` (optional output dir for review-gated learning events)
 - `NOC_DATABASE_URL` / `DATABASE_URL` (optional Postgres case/checkpoint backend DSN)
 - `NOC_REQUIRE_POSTGRES` (default `0`; fail loud if Postgres is required but unavailable)
 - `NOC_DATABASE_POOL_MIN_SIZE` / `NOC_DATABASE_POOL_MAX_SIZE`

@@ -42,9 +42,9 @@ class OutboxProcessor:
         self.retry_backoff_s = retry_backoff_s
 
     async def process_pending(self, *, limit: int = 10) -> OutboxProcessReport:
-        pending = await self.store.list_outbox(status="pending")
+        candidates = await self._due_intents()
         processed = succeeded = failed = skipped = 0
-        for intent in pending[: max(0, limit)]:
+        for intent in candidates[: max(0, limit)]:
             handler = self.handlers.get(intent.intent_type)
             if handler is None:
                 skipped += 1
@@ -79,3 +79,22 @@ class OutboxProcessor:
             await self.store.update_outbox(completed)
             record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="succeeded")
         return OutboxProcessReport(processed=processed, succeeded=succeeded, failed=failed, skipped=skipped)
+
+    async def _due_intents(self) -> list[OutboxIntent]:
+        pending = await self.store.list_outbox(status="pending")
+        failed = await self.store.list_outbox(status="failed")
+        now = datetime.now(timezone.utc)
+        due_failed = [intent for intent in failed if _is_due(intent, now=now)]
+        return [*pending, *due_failed]
+
+
+def _is_due(intent: OutboxIntent, *, now: datetime) -> bool:
+    if not intent.next_attempt_at:
+        return True
+    try:
+        due_at = datetime.fromisoformat(str(intent.next_attempt_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=timezone.utc)
+    return due_at <= now

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from app.cases import InMemoryCaseStore, OutboxHandlerResult, OutboxIntent, OutboxProcessor
@@ -61,6 +63,44 @@ async def test_outbox_processor_skips_unknown_intent_types_without_claiming():
     stored = (await store.list_outbox())[0]
     assert stored.status == "pending"
     assert stored.attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_outbox_processor_retries_failed_intents_when_due():
+    store = InMemoryCaseStore()
+    intent = await store.enqueue_outbox(OutboxIntent(case_id="case_1", intent_type="report", idempotency_key="report:retry"))
+    failed = intent.model_copy(update={"status": "failed", "next_attempt_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()})
+    await store.update_outbox(failed)
+    seen = []
+
+    async def handle(row: OutboxIntent):
+        seen.append(row.attempts)
+        return None
+
+    report = await OutboxProcessor(store, {"report": handle}).process_pending()
+
+    assert report.processed == 1
+    assert report.succeeded == 1
+    assert seen == [1]
+    stored = (await store.list_outbox())[0]
+    assert stored.status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_outbox_processor_waits_for_failed_retry_backoff():
+    store = InMemoryCaseStore()
+    intent = await store.enqueue_outbox(OutboxIntent(case_id="case_1", intent_type="report", idempotency_key="report:later"))
+    failed = intent.model_copy(update={"status": "failed", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()})
+    await store.update_outbox(failed)
+
+    async def handle(row: OutboxIntent):  # pragma: no cover - must not run
+        raise AssertionError("not due")
+
+    report = await OutboxProcessor(store, {"report": handle}).process_pending()
+
+    assert report.processed == 0
+    stored = (await store.list_outbox())[0]
+    assert stored.status == "failed"
 
 
 @pytest.mark.asyncio
