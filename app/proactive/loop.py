@@ -531,7 +531,7 @@ class ProactiveLoop:
                     path="proactive",
                     source=observation.source,
                     status=observation.status,
-                    action=result.action,
+                    action=str(getattr(result, "action", "unknown")),
                 )
             log.info("proactive_case_shadow_observed", count=len(raw), source_health=source_health)
         except Exception as exc:

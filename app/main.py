@@ -732,7 +732,7 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
                 path="reactive",
                 source=observation.source,
                 status=observation.status,
-                action=result.action,
+                action=str(getattr(result, "action", "unknown")),
             )
         if observations:
             log.info("case_service_shadow_reactive_observed", count=len(observations), source=alert_payload.get("source"))
@@ -1268,6 +1268,35 @@ def _provider_from_model_name(model_name: str) -> str:
     if model_name.startswith(("gpt", "o1", "o3")):
         return "openai"
     return "unknown"
+
+
+@app.get("/health/cases")
+async def health_cases(response: Response):
+    if case_service_runtime is None:
+        return {"status": "disabled", "enabled": False}
+    store = case_service_runtime.store
+    try:
+        pending = await store.list_outbox(status="pending")
+        failed = await store.list_outbox(status="failed")
+        recent_cases = await store.list_cases(limit=1)
+    except Exception as e:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        safe = classify_exception(e)
+        log_exception("case_service_health_failed", e, category=safe.category)
+        record_case_service_shadow_failure(path="health", category=safe.category)
+        return {
+            "status": "degraded",
+            "enabled": True,
+            "backend": type(store).__name__,
+            "error": safe_health_error(e),
+        }
+    return {
+        "status": "ok",
+        "enabled": True,
+        "backend": type(store).__name__,
+        "sample_case_count": len(recent_cases),
+        "outbox": {"pending": len(pending), "failed": len(failed)},
+    }
 
 
 @app.get("/health/model")
