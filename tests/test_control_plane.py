@@ -271,12 +271,55 @@ async def test_case_service_primary_control_comments_and_acknowledges(monkeypatc
 
     feedback = await store.list_feedback(case_id=created.case.case_id)
     event_types = [event.event_type for event in await store.case_events(created.case.case_id)]
+    detail = await control_case_detail(created.case.case_id, request)
+    event_response = await control_case_events(created.case.case_id, request)
     assert commented["case"]["incident_id"] == created.case.case_id
     assert decided["incident"]["incident_id"] == created.case.case_id
     assert [item.feedback_type for item in feedback] == ["operator_note", "operator_note"]
     assert feedback[0].payload["untrusted_operator_text"] is True
     assert feedback[0].payload["model_consumption_allowed"] is False
     assert "case_acknowledged" in event_types
+    assert "checking" in [event["summary"] for event in detail["events"]]
+    assert "checking" in [event["summary"] for event in event_response["events"]]
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_detail_preserves_graph_approval_summary(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await memory.put_summary(
+        created.case.case_id,
+        {
+            "incident_id": created.case.case_id,
+            "status": "waiting_approval",
+            "title": "packet loss needs approval",
+            "proposals": [{"type": "restart_service", "inputs": {"service": "bird"}}],
+            "executed_actions": [{"ok": True}],
+            "verification_results": [{"check": "bgp", "ok": True}],
+        },
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    detail = await control_case_detail(created.case.case_id, _request())
+
+    assert detail["summary"]["title"] == "packet loss needs approval"
+    assert detail["summary"]["proposals"] == [{"type": "restart_service", "inputs": {"service": "bird"}}]
+    assert detail["summary"]["executed_actions"] == [{"ok": True}]
+    assert detail["summary"]["verification_results"] == [{"check": "bgp", "ok": True}]
 
 
 @pytest.mark.asyncio

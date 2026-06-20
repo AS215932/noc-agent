@@ -1068,25 +1068,27 @@ def _case_service_control_case_payload(case) -> dict[str, object]:
     }
 
 
-def _case_service_control_summary(case) -> dict[str, object]:
+def _case_service_control_summary(case, graph_summary: dict | None = None) -> dict[str, object]:
     diagnosis = getattr(case, "last_diagnosis", {}) or {}
+    graph = graph_summary if isinstance(graph_summary, dict) else {}
     return {
         "incident_id": _validated_case_service_lookup_identifier(getattr(case, "case_id", "") or ""),
+        "graph_incident_id": _safe_monitor_token(graph.get("incident_id") or diagnosis.get("incident_id") or "", limit=128),
         "case_number": _case_service_control_identifier(case),
-        "resource_id": _safe_monitor_text(getattr(case, "resource_id", "") or "", limit=240),
+        "resource_id": _safe_monitor_text(graph.get("resource_id") or getattr(case, "resource_id", "") or "", limit=240),
         "title": _safe_monitor_text(
-            diagnosis.get("summary") or getattr(case, "summary", "") or getattr(case, "title", "") or "",
+            graph.get("title") or diagnosis.get("summary") or getattr(case, "summary", "") or getattr(case, "title", "") or "",
             limit=1000,
         ),
-        "status": _safe_monitor_token(getattr(case, "status", ""), limit=64),
-        "severity": _safe_monitor_token(getattr(case, "severity", "") or "UNKNOWN", limit=32),
-        "confidence_score": diagnosis.get("confidence_score", 0.0),
-        "requires_human": bool(diagnosis.get("requires_human", False)),
-        "proposals": [],
-        "executed_actions": [],
-        "verification_results": [],
+        "status": _safe_monitor_token(graph.get("status") or getattr(case, "status", ""), limit=64),
+        "severity": _safe_monitor_token(graph.get("severity") or getattr(case, "severity", "") or "UNKNOWN", limit=32),
+        "confidence_score": graph.get("confidence_score", diagnosis.get("confidence_score", 0.0)),
+        "requires_human": bool(graph.get("requires_human", diagnosis.get("requires_human", False))),
+        "proposals": _safe_case_service_output_value(graph.get("proposals", [])),
+        "executed_actions": _safe_case_service_output_value(graph.get("executed_actions", [])),
+        "verification_results": _safe_case_service_output_value(graph.get("verification_results", [])),
         "recommendations": [_safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])],
-        "updated_at": _safe_monitor_token(getattr(case, "updated_at", "") or "", limit=80),
+        "updated_at": _safe_monitor_token(graph.get("updated_at") or getattr(case, "updated_at", "") or "", limit=80),
         "source": "case_service",
     }
 
@@ -1110,6 +1112,26 @@ def _case_service_control_event_payload(event) -> dict[str, object]:
         "source": _safe_monitor_token(payload.get("source", "case_service"), limit=64),
         "payload": _safe_case_service_feedback_payload(event_payload),
     }
+
+
+def _case_service_control_feedback_event_payload(feedback) -> dict[str, object]:
+    payload = feedback.model_dump(mode="json")
+    feedback_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    return {
+        "received_at": _safe_monitor_token(payload.get("created_at", ""), limit=80),
+        "event_type": _safe_monitor_token(payload.get("feedback_type", "operator_feedback"), limit=80),
+        "state": "",
+        "summary": _safe_monitor_text(feedback_payload.get("comment") or payload.get("feedback_type") or "", limit=1000),
+        "operator": _safe_monitor_token(payload.get("actor_id", ""), limit=120),
+        "source": "case_service_feedback",
+        "payload": _safe_case_service_feedback_payload(feedback_payload),
+    }
+
+
+def _case_service_control_timeline(events, feedback) -> list[dict[str, object]]:
+    rows = [_case_service_control_event_payload(event) for event in events]
+    rows.extend(_case_service_control_feedback_event_payload(item) for item in feedback)
+    return sorted(rows, key=lambda item: str(item.get("received_at") or ""))
 
 
 def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
@@ -1151,12 +1173,15 @@ async def _case_service_control_case_detail_response(case_id: str) -> dict[str, 
     runtime = _require_case_service_runtime()
     case = await _require_case_service_control_case(case_id)
     events = await runtime.store.case_events(case.case_id)
+    feedback = await runtime.store.list_feedback(case_id=case.case_id)
+    graph_summary = await _case_service_graph_summary(case)
     return {
         "status": "ok",
         "source": "case_service",
         "case": _case_service_control_case_payload(case),
-        "summary": _case_service_control_summary(case),
-        "events": [_case_service_control_event_payload(event) for event in events],
+        "summary": _case_service_control_summary(case, graph_summary=graph_summary),
+        "events": _case_service_control_timeline(events, feedback),
+        "feedback": [_safe_case_service_output_value(item.model_dump(mode="json")) for item in feedback],
     }
 
 
@@ -1164,12 +1189,31 @@ async def _case_service_control_case_events_response(case_id: str) -> dict[str, 
     runtime = _require_case_service_runtime()
     case = await _require_case_service_control_case(case_id)
     events = await runtime.store.case_events(case.case_id)
-    return {"status": "ok", "source": "case_service", "events": [_case_service_control_event_payload(event) for event in events]}
+    feedback = await runtime.store.list_feedback(case_id=case.case_id)
+    return {"status": "ok", "source": "case_service", "events": _case_service_control_timeline(events, feedback)}
 
 
 def _case_service_graph_incident_identifier(case) -> str:
     diagnosis = getattr(case, "last_diagnosis", {}) or {}
     return _safe_monitor_token(diagnosis.get("incident_id") or getattr(case, "case_id", "") or "", limit=128)
+
+
+async def _case_service_graph_summary(case) -> dict | None:
+    identifiers = []
+    for candidate in (_case_service_graph_incident_identifier(case), getattr(case, "case_id", "") or ""):
+        rendered = _safe_monitor_token(candidate, limit=128)
+        if rendered and rendered not in identifiers:
+            identifiers.append(rendered)
+    for identifier in identifiers:
+        try:
+            summary = await graph_runtime.INCIDENT_MEMORY.get_summary(identifier)
+        except Exception as e:
+            safe = classify_exception(e)
+            log_exception("case_service_graph_summary_lookup_failed", e, category=safe.category)
+            return None
+        if isinstance(summary, dict):
+            return summary
+    return None
 
 
 async def _record_case_service_primary_decision(case, request_body) -> dict | None:
@@ -1228,13 +1272,23 @@ def _safe_case_service_feedback_payload(payload: dict) -> dict[str, object]:
     safe: dict[str, object] = {}
     for key, value in payload.items():
         safe_key = _safe_monitor_token(key, limit=64)
-        if isinstance(value, str):
-            safe[safe_key] = _safe_monitor_text(value, limit=500)
-        elif isinstance(value, bool | int | float) or value is None:
-            safe[safe_key] = value
-        else:
-            safe[safe_key] = _safe_monitor_text(value, limit=1000)
+        safe[safe_key] = _safe_case_service_output_value(value, string_limit=1000)
     return safe
+
+
+def _safe_case_service_output_value(value: object, *, string_limit: int = 2000) -> object:
+    if isinstance(value, str):
+        return _safe_monitor_text(value, limit=string_limit)
+    if isinstance(value, bool | int | float) or value is None:
+        return value
+    if isinstance(value, list | tuple):
+        return [_safe_case_service_output_value(item, string_limit=string_limit) for item in list(value)[:50]]
+    if isinstance(value, dict):
+        return {
+            _safe_monitor_token(key, limit=80): _safe_case_service_output_value(child, string_limit=string_limit)
+            for key, child in list(value.items())[:100]
+        }
+    return _safe_monitor_text(value, limit=string_limit)
 
 
 def _safe_monitor_text(value: object, *, limit: int) -> str:
