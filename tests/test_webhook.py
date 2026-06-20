@@ -26,8 +26,21 @@ from app.agent import DiagnosticSynthesis
 from app.cases import CaseService, InMemoryCaseStore
 from app.incident_memory import IncidentMemory
 import app.graph_runtime as graph_runtime
+import app.main as main_module
 from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
+
+
+@pytest.fixture(autouse=True)
+def restore_runtime_globals():
+    """Keep module-level runtime singletons isolated across webhook tests."""
+
+    original_case_service_runtime = main_module.case_service_runtime
+    original_incident_memory = graph_runtime.INCIDENT_MEMORY
+    yield
+    main_module.case_service_runtime = original_case_service_runtime
+    graph_runtime.INCIDENT_MEMORY = original_incident_memory
+
 
 @pytest.fixture
 def mock_alert_payload():

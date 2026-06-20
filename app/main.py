@@ -847,6 +847,7 @@ def _case_service_reactive_allows_investigation(shadow_results: list[object]) ->
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="reactive_control", category=safe.category)
         log_exception("case_service_reactive_investigation_gate_failed", e, category=safe.category)
+        log.warn("case_service_reactive_investigation_gate_fail_open", category=safe.category)
         return True
     if not firing_case_ids:
         return True
@@ -865,6 +866,7 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
         proposal = getattr(plan, "remediation_proposal", None)
         if proposal is not None:
             recommendations.extend(list(getattr(proposal, "proposed_actions", []) or []))
+        recorded_case_ids: list[str] = []
         for observation in observations:
             if getattr(observation, "status", "") != "firing":
                 continue
@@ -883,6 +885,13 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
                 },
                 recommendations=[_safe_monitor_text(item, limit=240) for item in recommendations[:20]],
                 status="complete",
+            )
+            recorded_case_ids.append(case.case_id)
+        if recorded_case_ids:
+            log.info(
+                "case_service_reactive_investigation_recorded",
+                case_ids=recorded_case_ids,
+                incident_id=str(graph_state.get("incident_id") or ""),
             )
     except Exception as e:
         safe = classify_exception(e)
