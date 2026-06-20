@@ -229,6 +229,18 @@ The enqueued payload uses a bounded `reactive_case_report_v1` schema, marks
 monitor text as untrusted/not-for-model-consumption, and strips control/markdown
 delimiters from webhook-derived text.
 
+Reactive investigation cooldown can then be canaried with:
+
+```bash
+NOC_CASESERVICE_REACTIVE_CONTROL=1
+```
+
+With this flag, legacy intake still creates/updates operator cases, but
+CaseService decides whether a firing reactive case needs another graph
+investigation. Successful graph investigations are stamped back onto CaseService
+case state so repeated identical signals can be skipped until the policy
+cooldown or a signal change.
+
 Outbox side effects are also opt-in:
 
 ```bash
@@ -313,6 +325,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
 - `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
+- `NOC_CASESERVICE_REACTIVE_CONTROL` (default `0`; gate reactive graph investigations from case state)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`
