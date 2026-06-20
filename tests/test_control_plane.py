@@ -15,7 +15,9 @@ from app.main import (
     ManualInvestigationRequest,
     SignedApprovalRequest,
     control_case_comment,
+    control_case_decision,
     control_case_detail,
+    control_case_events,
     control_case_service_case_detail,
     control_case_service_cases,
     control_case_service_outbox,
@@ -186,6 +188,283 @@ async def test_case_service_control_validates_filters_and_ids(monkeypatch):
     assert bad_kind.value.status_code == 422
     assert bad_case_id.value.status_code == 422
     assert bad_status.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_control_reads_cases_without_legacy_fallback(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    legacy = await memory.intake_alert(
+        {
+            "source": "alertmanager",
+            "status": "firing",
+            "groupLabels": {"alertname": "LegacyOnly"},
+            "alerts": [{"labels": {"alertname": "LegacyOnly", "instance": "old"}}],
+        }
+    )
+    assert legacy.case is not None
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="InstanceDown", resource="rtr1:9100", status="firing")
+    )
+    assert created.case is not None
+    await service.record_investigation_result(
+        created.case.case_id,
+        diagnosis={"summary": "node exporter down", "confidence_score": 0.8, "requires_human": True},
+        recommendations=["check node_exporter"],
+    )
+    await memory.put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "node exporter down"},
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    listing = await control_cases(request)
+    detail = await control_case_detail(created.case.case_id, request)
+    events = await control_case_events(created.case.case_id, request)
+
+    assert listing["source"] == "case_service"
+    assert [case["incident_id"] for case in listing["cases"]] == [created.case.case_id]
+    assert legacy.case["incident_id"] not in [case["incident_id"] for case in listing["cases"]]
+    assert listing["cases"][0]["pending_approval"] is True
+    assert listing["cases"][0]["status"] == "waiting_approval"
+    assert detail["source"] == "case_service"
+    assert detail["case"]["incident_id"] == created.case.case_id
+    assert detail["summary"]["title"] == "node exporter down"
+    assert events["events"][0]["event_type"] == "case_created"
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_control_routes_listed_case_numbers(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="InterfaceDown", resource="xe-0/0/0", status="firing")
+    )
+    assert created.case is not None
+    created.case.case_number = "NOC-20260620-999"
+    await store.upsert_case(created.case)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    listing = await control_cases(request)
+    detail = await control_case_detail(listing["cases"][0]["case_number"], request)
+
+    assert listing["cases"][0]["case_number"] == "NOC-20260620-999"
+    assert detail["case"]["case_id"] == created.case.case_id
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_control_comments_and_acknowledges(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="Latency", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    commented = await control_case_comment(
+        created.case.case_id,
+        CommentRequest(operator="svag", comment="checking"),
+        request,
+    )
+    decided = await control_case_decision(
+        created.case.case_id,
+        LocalDecisionRequest(decision="acknowledged", operator="svag", comment="seen"),
+        request,
+    )
+
+    feedback = await store.list_feedback(case_id=created.case.case_id)
+    event_types = [event.event_type for event in await store.case_events(created.case.case_id)]
+    detail = await control_case_detail(created.case.case_id, request)
+    event_response = await control_case_events(created.case.case_id, request)
+    assert commented["case"]["incident_id"] == created.case.case_id
+    assert decided["incident"]["incident_id"] == created.case.case_id
+    assert [item.feedback_type for item in feedback] == ["operator_note", "operator_note"]
+    assert feedback[0].payload["untrusted_operator_text"] is True
+    assert feedback[0].payload["model_consumption_allowed"] is False
+    assert "case_acknowledged" in event_types
+    assert "checking" in [event["summary"] for event in detail["events"]]
+    assert "checking" in [event["summary"] for event in event_response["events"]]
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_detail_preserves_graph_approval_summary(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await memory.put_summary(
+        created.case.case_id,
+        {
+            "incident_id": created.case.case_id,
+            "status": "waiting_approval",
+            "title": "packet loss needs approval",
+            "proposals": [{"type": "restart_service", "inputs": {"service": "bird"}}],
+            "executed_actions": [{"ok": True}],
+            "verification_results": [{"check": "bgp", "ok": True}],
+        },
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    detail = await control_case_detail(created.case.case_id, _request())
+
+    assert detail["summary"]["title"] == "packet loss needs approval"
+    assert detail["summary"]["proposals"] == [{"type": "restart_service", "inputs": {"service": "bird"}}]
+    assert detail["summary"]["executed_actions"] == [{"ok": True}]
+    assert detail["summary"]["verification_results"] == [{"check": "bgp", "ok": True}]
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_decision_updates_waiting_graph_summary(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await memory.put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "packet loss"},
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    response = await control_case_decision(
+        created.case.case_id,
+        LocalDecisionRequest(decision="approved", operator="svag", comment="ship it"),
+        _request(),
+    )
+
+    stored = await store.get_case(created.case.case_id)
+    events = await store.case_events(created.case.case_id)
+    assert response["incident"]["status"] == "approved"
+    assert (await memory.get_summary(created.case.case_id))["status"] == "approved"
+    assert stored.status == "resolved"
+    assert stored.resolution_reason == "operator_approved"
+    assert "operator_decision_recorded" in [event.event_type for event in events]
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_rejected_decision_updates_case_projection(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    memory = isolated_incident_memory
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await memory.put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "packet loss"},
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    response = await control_case_decision(
+        created.case.case_id,
+        LocalDecisionRequest(decision="rejected", operator="svag", comment="nope"),
+        _request(),
+    )
+
+    stored = await store.get_case(created.case.case_id)
+    listing = await control_cases(_request())
+    assert response["incident"]["status"] == "rejected"
+    assert stored.status == "resolved"
+    assert stored.resolution_reason == "operator_rejected"
+    assert listing["cases"][0]["status"] == "rejected"
+    assert listing["cases"][0]["pending_approval"] is False
+
+
+@pytest.mark.asyncio
+async def test_case_service_primary_comment_surfaces_feedback_write_failure(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+
+    class FailingFeedbackStore(InMemoryCaseStore):
+        async def record_feedback(self, feedback):
+            raise RuntimeError("feedback store unavailable")
+
+    store = FailingFeedbackStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="Latency", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    with pytest.raises(RuntimeError, match="feedback store unavailable"):
+        await control_case_comment(
+            created.case.case_id,
+            CommentRequest(operator="svag", comment="checking"),
+            _request(),
+        )
 
 
 @pytest.mark.asyncio

@@ -7,10 +7,26 @@ from app.cases.store import InMemoryCaseStore
 @pytest.mark.asyncio
 async def test_case_service_runtime_disabled_by_default(monkeypatch):
     monkeypatch.delenv("NOC_CASESERVICE_SHADOW", raising=False)
+    monkeypatch.delenv("NOC_CASESERVICE_CONTROL_PRIMARY", raising=False)
     monkeypatch.delenv("NOC_DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
     assert await build_case_service_runtime_from_env() is None
+
+
+@pytest.mark.asyncio
+async def test_case_service_runtime_starts_for_control_primary_without_shadow(monkeypatch):
+    monkeypatch.delenv("NOC_CASESERVICE_SHADOW", raising=False)
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    monkeypatch.delenv("NOC_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("NOC_REQUIRE_POSTGRES", raising=False)
+
+    runtime = await build_case_service_runtime_from_env()
+
+    assert runtime is not None
+    assert isinstance(runtime.store, InMemoryCaseStore)
+    await runtime.close()
 
 
 @pytest.mark.asyncio
