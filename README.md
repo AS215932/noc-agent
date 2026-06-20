@@ -252,8 +252,10 @@ NOC_CASESERVICE_CONTROL_PRIMARY=1
 
 With this flag, `/control/cases`, `/control/cases/{id}`, case events, comments,
 decisions, and manual investigations use CaseService as the primary case store.
-This path intentionally does not fall back to legacy `IncidentMemory` for old or
-unmapped cases; keep the flag off if preserving old/open legacy cases matters.
+It also starts the CaseService runtime even if `NOC_CASESERVICE_SHADOW` is not
+set. This path intentionally does not fall back to legacy `IncidentMemory` for
+old or unmapped cases; keep the flag off if preserving old/open legacy cases
+matters.
 
 Outbox side effects are also opt-in:
 

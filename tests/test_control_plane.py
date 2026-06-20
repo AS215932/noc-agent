@@ -245,6 +245,35 @@ async def test_case_service_primary_control_reads_cases_without_legacy_fallback(
 
 
 @pytest.mark.asyncio
+async def test_case_service_primary_control_routes_listed_case_numbers(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="InterfaceDown", resource="xe-0/0/0", status="firing")
+    )
+    assert created.case is not None
+    created.case.case_number = "NOC-20260620-999"
+    await store.upsert_case(created.case)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _request()
+
+    listing = await control_cases(request)
+    detail = await control_case_detail(listing["cases"][0]["case_number"], request)
+
+    assert listing["cases"][0]["case_number"] == "NOC-20260620-999"
+    assert detail["case"]["case_id"] == created.case.case_id
+
+
+@pytest.mark.asyncio
 async def test_case_service_primary_control_comments_and_acknowledges(monkeypatch):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")

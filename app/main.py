@@ -949,6 +949,9 @@ async def _case_service_case_for_identifier(identifier: str):
         case_id = await store.resolve_alias(alias_type, lookup_identifier)
         if case_id:
             return await store.get_case(case_id)
+    for candidate in await store.list_cases(limit=500):
+        if str(getattr(candidate, "case_number", "") or "").strip() == lookup_identifier:
+            return candidate
     return None
 
 

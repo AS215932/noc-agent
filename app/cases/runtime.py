@@ -43,15 +43,17 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
 
 
 async def build_case_service_runtime_from_env() -> CaseServiceRuntime | None:
-    """Build optional shadow CaseService runtime.
+    """Build optional CaseService runtime.
 
-    `NOC_CASESERVICE_SHADOW=1` enables shadow writes. If a DB URL is configured,
-    Postgres is used. If Postgres is explicitly required, missing DB/supporting
-    packages fail loud. Otherwise shadow mode can use in-memory storage for
-    local/dev canaries.
+    `NOC_CASESERVICE_SHADOW=1` enables shadow writes, and
+    `NOC_CASESERVICE_CONTROL_PRIMARY=1` enables the control-plane cutover and
+    therefore also requires a runtime. If a DB URL is configured, Postgres is
+    used. If Postgres is explicitly required, missing DB/supporting packages
+    fail loud. Otherwise the runtime can use in-memory storage for local/dev
+    canaries.
     """
 
-    if not _env_bool("NOC_CASESERVICE_SHADOW", False):
+    if not (_env_bool("NOC_CASESERVICE_SHADOW", False) or _env_bool("NOC_CASESERVICE_CONTROL_PRIMARY", False)):
         return None
     db = load_database_settings()
     if db.require_postgres:
