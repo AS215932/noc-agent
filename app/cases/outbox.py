@@ -14,6 +14,7 @@ from typing import Any
 
 from app.cases.models import OutboxIntent, utc_now
 from app.cases.store import CaseStore
+from app.model_metrics import record_case_service_outbox_processed
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +48,7 @@ class OutboxProcessor:
             handler = self.handlers.get(intent.intent_type)
             if handler is None:
                 skipped += 1
+                record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="skipped")
                 continue
             processed += 1
             claimed = intent.model_copy(deep=True)
@@ -62,6 +64,7 @@ class OutboxProcessor:
                 errored.error = f"{type(exc).__name__}: {exc}"
                 errored.next_attempt_at = (datetime.now(timezone.utc) + timedelta(seconds=self.retry_backoff_s)).isoformat()
                 await self.store.update_outbox(errored)
+                record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="failed")
                 continue
             succeeded += 1
             completed = claimed.model_copy(deep=True)
@@ -74,4 +77,5 @@ class OutboxProcessor:
                 if result.payload_updates:
                     completed.payload.update(result.payload_updates)
             await self.store.update_outbox(completed)
+            record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="succeeded")
         return OutboxProcessReport(processed=processed, succeeded=succeeded, failed=failed, skipped=skipped)

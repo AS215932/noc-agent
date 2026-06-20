@@ -225,6 +225,12 @@ Fixtures may be either a JSON list of `ObservationRecord` objects or an object
 with an `observations` list. Replay reports deterministic metrics without live
 network access or production credentials.
 
+Prometheus exports `noc_agent_case_service_runtime_enabled`,
+`noc_agent_case_service_shadow_observations_total`,
+`noc_agent_case_service_shadow_failures_total`, and
+`noc_agent_case_service_outbox_processed_total` so canaries can watch shadow
+parity/failures before any control flag is enabled.
+
 ## Discord bot
 
 When `DISCORD_BOT_TOKEN` is present, the service starts a `discord.py` bot that

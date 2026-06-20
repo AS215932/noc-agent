@@ -37,6 +37,7 @@ from app.proactive.models import (
     hotspot_to_alert_payload,
     utc_now,
 )
+from app.model_metrics import record_case_service_shadow_failure, record_case_service_shadow_observation
 from app.proactive.scanner import DEEP_RULE_IDS, ScanContext, scan
 from app.safe_errors import classify_exception, log_exception
 
@@ -286,6 +287,7 @@ class ProactiveLoop:
             return True if case is None else bool(case_service.should_investigate(case))
         except Exception as exc:
             safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive_control", category=safe.category)
             log_exception("proactive_case_service_investigation_gate_failed", exc, category=safe.category)
             return True
 
@@ -305,6 +307,7 @@ class ProactiveLoop:
             )
         except Exception as exc:
             safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive_control", category=safe.category)
             log_exception("proactive_case_service_investigation_record_failed", exc, category=safe.category)
 
     def _recent_investigation_fps(self, now: float | None = None) -> set[str]:
@@ -523,10 +526,17 @@ class ProactiveLoop:
                     cycle_id=cycle_id,
                     source_health=source_health,
                 )
-                await self.case_service.observe(observation)
+                result = await self.case_service.observe(observation)
+                record_case_service_shadow_observation(
+                    path="proactive",
+                    source=observation.source,
+                    status=observation.status,
+                    action=result.action,
+                )
             log.info("proactive_case_shadow_observed", count=len(raw), source_health=source_health)
         except Exception as exc:
             safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive", category=safe.category)
             log_exception("proactive_case_shadow_observe_failed", exc, category=safe.category)
 
     def _merge_with_carried(
@@ -664,6 +674,7 @@ class ProactiveLoop:
                 await case_service.mark_reported(case.case_id, state_signature=state_signature)
             except Exception as exc:
                 safe = classify_exception(exc)
+                record_case_service_shadow_failure(path="proactive_control", category=safe.category)
                 log_exception("proactive_case_service_mark_reported_failed", exc, category=safe.category)
 
     async def _default_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:

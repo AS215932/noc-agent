@@ -20,7 +20,15 @@ from app.discord_bot import build_bot
 from app.mail import check_mailbox_connection, process_mailbox_once
 from app.model_config import load_model_config
 from app.model_metrics import STATE as MODEL_STATE
-from app.model_metrics import metrics_response, record_failure, record_success, start_run
+from app.model_metrics import (
+    metrics_response,
+    record_case_service_shadow_failure,
+    record_case_service_shadow_observation,
+    record_failure,
+    record_success,
+    set_case_service_runtime_enabled,
+    start_run,
+)
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
@@ -152,10 +160,16 @@ async def lifespan(app: FastAPI):
 
         case_service_runtime = await build_case_service_runtime_from_env()
         if case_service_runtime is not None:
-            log.info("case_service_shadow_started")
+            backend = type(case_service_runtime.store).__name__
+            set_case_service_runtime_enabled(True, backend=backend)
+            log.info("case_service_shadow_started", backend=backend)
+        else:
+            set_case_service_runtime_enabled(False, backend="none")
     except Exception as e:
         safe = classify_exception(e)
         log_exception("case_service_shadow_start_failed", e, category=safe.category)
+        record_case_service_shadow_failure(path="startup", category=safe.category)
+        set_case_service_runtime_enabled(False, backend="startup_error")
         case_service_runtime = None
         if os.getenv("NOC_REQUIRE_POSTGRES", "").strip().lower() in {"1", "true", "yes", "on"}:
             raise
@@ -198,7 +212,9 @@ async def lifespan(app: FastAPI):
         _release_proactive_lock(proactive_lock_fd)
         proactive_lock_fd = None
     if case_service_runtime is not None:
+        backend = type(case_service_runtime.store).__name__
         await case_service_runtime.close()
+        set_case_service_runtime_enabled(False, backend=backend)
         case_service_runtime = None
 
     if discord_bot_task:
@@ -711,11 +727,18 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> None:
         else:
             observations = observations_from_alertmanager(alert_payload)
         for observation in observations:
-            await case_service_runtime.service.observe(observation)
+            result = await case_service_runtime.service.observe(observation)
+            record_case_service_shadow_observation(
+                path="reactive",
+                source=observation.source,
+                status=observation.status,
+                action=result.action,
+            )
         if observations:
             log.info("case_service_shadow_reactive_observed", count=len(observations), source=alert_payload.get("source"))
     except Exception as e:
         safe = classify_exception(e)
+        record_case_service_shadow_failure(path="reactive", category=safe.category)
         log_exception("case_service_shadow_reactive_observe_failed", e, category=safe.category)
 
 
