@@ -1,0 +1,402 @@
+"""Optional Postgres CaseStore backend.
+
+This module is dormant until a deployment provides `asyncpg` and a Postgres DSN.
+It keeps the same CaseStore contract as the in-memory reference backend and uses
+the schema in :mod:`app.db.schema`.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, cast
+
+from app.cases.models import (
+    AtomicCaseProjection,
+    CaseEvent,
+    CaseIdentityAlias,
+    MetaCaseProjection,
+    ObservationRecord,
+    OperatorFeedback,
+    OutboxIntent,
+    TraceRecord,
+)
+from app.cases.store import CaseProjection
+from app.db.config import DatabaseSettings, load_database_settings
+from app.db.schema import SCHEMA_STATEMENTS
+
+
+class PostgresCaseStore:
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
+
+    @classmethod
+    async def connect(cls, settings: DatabaseSettings | None = None) -> "PostgresCaseStore":
+        settings = settings or load_database_settings()
+        settings.assert_ready_for_production()
+        if not settings.url:
+            raise RuntimeError("Postgres DSN is required for PostgresCaseStore")
+        asyncpg = _load_asyncpg()
+        pool = await asyncpg.create_pool(
+            dsn=settings.url,
+            min_size=settings.pool_min_size,
+            max_size=settings.pool_max_size,
+            command_timeout=settings.command_timeout_s,
+            server_settings={
+                "statement_timeout": str(settings.statement_timeout_ms),
+                "lock_timeout": str(settings.lock_timeout_ms),
+            },
+        )
+        return cls(pool)
+
+    async def close(self) -> None:
+        await self.pool.close()
+
+    async def setup(self) -> None:
+        async with self.pool.acquire() as conn:
+            for statement in SCHEMA_STATEMENTS:
+                await conn.execute(statement)
+
+    async def put_observation(self, observation: ObservationRecord) -> ObservationRecord:
+        payload = observation.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO observations (
+                    observation_id, source, detector, status, severity, dedup_key,
+                    source_event_id, source_fingerprint, observed_at, received_at,
+                    scan_cycle_id, signal_signature, source_health, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
+                ON CONFLICT (observation_id) DO UPDATE SET observation_id = observations.observation_id
+                RETURNING payload
+                """,
+                observation.observation_id,
+                observation.source,
+                observation.detector,
+                observation.status,
+                observation.severity,
+                observation.dedup_key,
+                observation.source_event_id,
+                observation.source_fingerprint,
+                observation.observed_at,
+                observation.received_at,
+                observation.scan_cycle_id,
+                observation.signal_signature,
+                observation.source_health,
+                json.dumps(payload),
+                observation.schema_version,
+            )
+        return ObservationRecord.model_validate(_row_payload(row))
+
+    async def get_observation(self, observation_id: str) -> ObservationRecord | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM observations WHERE observation_id = $1", observation_id)
+        return ObservationRecord.model_validate(_row_payload(row)) if row else None
+
+    async def upsert_case(self, case: CaseProjection) -> CaseProjection:
+        payload = case.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO cases (
+                    case_id, kind, status, fingerprint, case_number, event_fingerprint,
+                    updated_at, opened_at, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+                ON CONFLICT (case_id) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    status = EXCLUDED.status,
+                    fingerprint = EXCLUDED.fingerprint,
+                    case_number = EXCLUDED.case_number,
+                    event_fingerprint = EXCLUDED.event_fingerprint,
+                    updated_at = EXCLUDED.updated_at,
+                    payload = EXCLUDED.payload,
+                    row_version = cases.row_version + 1,
+                    schema_version = EXCLUDED.schema_version
+                RETURNING payload
+                """,
+                case.case_id,
+                case.kind,
+                case.status,
+                getattr(case, "fingerprint", ""),
+                getattr(case, "case_number", ""),
+                getattr(case, "event_fingerprint", ""),
+                getattr(case, "updated_at", ""),
+                getattr(case, "opened_at", ""),
+                json.dumps(payload),
+                case.schema_version,
+            )
+        return _case_from_payload(_row_payload(row))
+
+    async def get_case(self, case_id: str) -> CaseProjection | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1", case_id)
+        return _case_from_payload(_row_payload(row)) if row else None
+
+    async def list_cases(self, *, kind: str | None = None, limit: int = 100) -> list[CaseProjection]:
+        async with self.pool.acquire() as conn:
+            if kind:
+                rows = await conn.fetch("SELECT payload FROM cases WHERE kind = $1 ORDER BY updated_at DESC LIMIT $2", kind, limit)
+            else:
+                rows = await conn.fetch("SELECT payload FROM cases ORDER BY updated_at DESC LIMIT $1", limit)
+        return [_case_from_payload(_row_payload(row)) for row in rows]
+
+    async def append_event(self, event: CaseEvent) -> CaseEvent:
+        payload = event.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO case_events (
+                    event_id, case_id, meta_case_id, event_type, actor_type, actor_id,
+                    source, occurred_at, observed_at, correlation_id, causation_id,
+                    policy_version, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
+                ON CONFLICT (event_id) DO UPDATE SET event_id = case_events.event_id
+                RETURNING payload
+                """,
+                event.event_id,
+                event.case_id,
+                event.meta_case_id,
+                event.event_type,
+                event.actor_type,
+                event.actor_id,
+                event.source,
+                event.occurred_at,
+                event.observed_at,
+                event.correlation_id,
+                event.causation_id,
+                event.policy_version,
+                json.dumps(payload),
+                event.schema_version,
+            )
+        return CaseEvent.model_validate(_row_payload(row))
+
+    async def case_events(self, case_id: str) -> list[CaseEvent]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT payload FROM case_events
+                WHERE case_id = $1 OR meta_case_id = $1
+                ORDER BY occurred_at ASC, event_id ASC
+                """,
+                case_id,
+            )
+        return [CaseEvent.model_validate(_row_payload(row)) for row in rows]
+
+    async def record_alias(self, alias: CaseIdentityAlias) -> CaseIdentityAlias:
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                """
+                SELECT alias_id, case_id, alias_type, alias_value, source, confidence, created_at, retired_at
+                FROM case_identity_aliases
+                WHERE alias_type = $1 AND alias_value = $2 AND retired_at IS NULL
+                """,
+                alias.alias_type,
+                alias.alias_value,
+            )
+            if existing:
+                existing_alias = CaseIdentityAlias.model_validate(dict(existing))
+                if existing_alias.case_id != alias.case_id:
+                    raise ValueError(
+                        f"active alias {alias.alias_type}:{alias.alias_value} already points to {existing_alias.case_id}"
+                    )
+                return existing_alias
+            await conn.execute(
+                """
+                INSERT INTO case_identity_aliases (
+                    alias_id, case_id, alias_type, alias_value, source, confidence, created_at, retired_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                """,
+                alias.alias_id,
+                alias.case_id,
+                alias.alias_type,
+                alias.alias_value,
+                alias.source,
+                alias.confidence,
+                alias.created_at,
+                alias.retired_at,
+            )
+        return alias.model_copy(deep=True)
+
+    async def resolve_alias(self, alias_type: str, alias_value: str) -> str | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT case_id FROM case_identity_aliases
+                WHERE alias_type = $1 AND alias_value = $2 AND retired_at IS NULL
+                """,
+                alias_type,
+                alias_value,
+            )
+        return str(row["case_id"]) if row else None
+
+    async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent:
+        payload = intent.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO side_effect_outbox (
+                    outbox_id, intent_type, case_id, meta_case_id, idempotency_key,
+                    state_signature, status, attempts, next_attempt_at, created_at,
+                    completed_at, external_id, external_url, error, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16)
+                ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = side_effect_outbox.idempotency_key
+                RETURNING payload
+                """,
+                intent.outbox_id,
+                intent.intent_type,
+                intent.case_id,
+                intent.meta_case_id,
+                intent.idempotency_key,
+                intent.state_signature,
+                intent.status,
+                intent.attempts,
+                intent.next_attempt_at,
+                intent.created_at,
+                intent.completed_at,
+                intent.external_id,
+                intent.external_url,
+                intent.error,
+                json.dumps(payload),
+                intent.schema_version,
+            )
+        return OutboxIntent.model_validate(_row_payload(row))
+
+    async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent:
+        payload = intent.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE side_effect_outbox SET
+                    status = $2,
+                    attempts = $3,
+                    next_attempt_at = $4,
+                    completed_at = $5,
+                    external_id = $6,
+                    external_url = $7,
+                    error = $8,
+                    payload = $9::jsonb,
+                    schema_version = $10
+                WHERE outbox_id = $1
+                RETURNING payload
+                """,
+                intent.outbox_id,
+                intent.status,
+                intent.attempts,
+                intent.next_attempt_at,
+                intent.completed_at,
+                intent.external_id,
+                intent.external_url,
+                intent.error,
+                json.dumps(payload),
+                intent.schema_version,
+            )
+        if not row:
+            raise KeyError(f"outbox intent not found: {intent.outbox_id}")
+        return OutboxIntent.model_validate(_row_payload(row))
+
+    async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
+        async with self.pool.acquire() as conn:
+            if status:
+                rows = await conn.fetch(
+                    "SELECT payload FROM side_effect_outbox WHERE status = $1 ORDER BY created_at ASC", status
+                )
+            else:
+                rows = await conn.fetch("SELECT payload FROM side_effect_outbox ORDER BY created_at ASC")
+        return [OutboxIntent.model_validate(_row_payload(row)) for row in rows]
+
+    async def record_trace(self, trace: TraceRecord) -> TraceRecord:
+        payload = trace.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO traces (
+                    trace_id, cycle_id, case_id, meta_case_id, trace_type, policy_version,
+                    model_chain, prompt_version, knowledge_export_version, payload, created_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11)
+                ON CONFLICT (trace_id) DO UPDATE SET trace_id = traces.trace_id
+                RETURNING payload
+                """,
+                trace.trace_id,
+                trace.cycle_id,
+                trace.case_id,
+                trace.meta_case_id,
+                trace.trace_type,
+                trace.policy_version,
+                json.dumps(trace.model_chain),
+                trace.prompt_version,
+                trace.knowledge_export_version,
+                json.dumps(payload),
+                trace.created_at,
+            )
+        return TraceRecord.model_validate(_row_payload(row))
+
+    async def list_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[TraceRecord]:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM traces WHERE case_id = $1 ORDER BY created_at", case_id)
+            elif meta_case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM traces WHERE meta_case_id = $1 ORDER BY created_at", meta_case_id)
+            else:
+                rows = await conn.fetch("SELECT payload FROM traces ORDER BY created_at")
+        return [TraceRecord.model_validate(_row_payload(row)) for row in rows]
+
+    async def record_feedback(self, feedback: OperatorFeedback) -> OperatorFeedback:
+        payload = feedback.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO operator_feedback (
+                    feedback_id, case_id, meta_case_id, trace_id, actor_id, actor_role,
+                    feedback_type, payload, created_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
+                ON CONFLICT (feedback_id) DO UPDATE SET feedback_id = operator_feedback.feedback_id
+                RETURNING payload
+                """,
+                feedback.feedback_id,
+                feedback.case_id,
+                feedback.meta_case_id,
+                feedback.trace_id,
+                feedback.actor_id,
+                feedback.actor_role,
+                feedback.feedback_type,
+                json.dumps(payload),
+                feedback.created_at,
+            )
+        return OperatorFeedback.model_validate(_row_payload(row))
+
+    async def list_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[OperatorFeedback]:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM operator_feedback WHERE case_id = $1 ORDER BY created_at", case_id)
+            elif meta_case_id is not None:
+                rows = await conn.fetch(
+                    "SELECT payload FROM operator_feedback WHERE meta_case_id = $1 ORDER BY created_at", meta_case_id
+                )
+            else:
+                rows = await conn.fetch("SELECT payload FROM operator_feedback ORDER BY created_at")
+        return [OperatorFeedback.model_validate(_row_payload(row)) for row in rows]
+
+
+def _load_asyncpg() -> Any:
+    try:
+        import asyncpg  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - depends on deployment extras
+        raise RuntimeError("PostgresCaseStore requires the optional asyncpg package") from exc
+    return asyncpg
+
+
+def _row_payload(row: Any) -> dict[str, Any]:
+    raw = row["payload"]
+    if isinstance(raw, str):
+        loaded = json.loads(raw)
+        return cast(dict[str, Any], loaded)
+    if isinstance(raw, dict):
+        return raw
+    loaded = json.loads(str(raw))
+    return cast(dict[str, Any], loaded)
+
+
+def _case_from_payload(payload: dict[str, Any]) -> CaseProjection:
+    kind = str(payload.get("kind") or "atomic")
+    if kind == "meta":
+        return MetaCaseProjection.model_validate(payload)
+    return AtomicCaseProjection.model_validate(payload)

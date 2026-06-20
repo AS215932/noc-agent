@@ -7,6 +7,7 @@ from app.main import (
     IcingaNotification,
     _embedded_discord_bot_enabled,
     _release_mail_poller_lock,
+    _shadow_observe_alert_payload,
     _try_acquire_mail_poller_lock,
     _triage_fields,
     alertmanager_webhook,
@@ -369,3 +370,45 @@ async def test_agent_uses_mcp_tools(mocker):
     """
     # TODO: Implement MCP Context load in main.py and mock the load function
     pass
+
+
+@pytest.mark.asyncio
+async def test_shadow_observe_alert_payload_records_alertmanager(monkeypatch, mock_alert_payload):
+    seen = []
+
+    class _Service:
+        async def observe(self, observation):
+            seen.append(observation)
+
+    class _Runtime:
+        service = _Service()
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    payload = dict(mock_alert_payload)
+    payload["source"] = "alertmanager"
+
+    await _shadow_observe_alert_payload(payload)
+
+    assert len(seen) == 1
+    assert seen[0].source == "alertmanager"
+    assert seen[0].detector == "InstanceDown"
+
+
+@pytest.mark.asyncio
+async def test_shadow_observe_alert_payload_is_nonfatal(monkeypatch, mock_alert_payload):
+    class _Service:
+        async def observe(self, observation):
+            raise RuntimeError("shadow write failed")
+
+    class _Runtime:
+        service = _Service()
+
+    import app.main as main_module
+
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    payload = dict(mock_alert_payload)
+    payload["source"] = "alertmanager"
+
+    await _shadow_observe_alert_payload(payload)
