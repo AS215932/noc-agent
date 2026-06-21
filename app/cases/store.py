@@ -33,6 +33,14 @@ class CaseStore(Protocol):
 
     async def upsert_case(self, case: CaseProjection) -> CaseProjection: ...
 
+    async def create_atomic_case(
+        self,
+        case: AtomicCaseProjection,
+        *,
+        aliases: list[CaseIdentityAlias],
+        events: list[CaseEvent],
+    ) -> tuple[AtomicCaseProjection, list[CaseEvent], bool]: ...
+
     async def claim_investigation(
         self,
         case_id: str,
@@ -43,6 +51,7 @@ class CaseStore(Protocol):
         status: str,
         policy_version: str,
         now: str,
+        event: CaseEvent,
     ) -> AtomicCaseProjection | None: ...
 
     async def get_case(self, case_id: str) -> CaseProjection | None: ...
@@ -113,6 +122,41 @@ class InMemoryCaseStore:
             self._cases[stored.case_id] = stored
             return stored.model_copy(deep=True)
 
+    async def create_atomic_case(
+        self,
+        case: AtomicCaseProjection,
+        *,
+        aliases: list[CaseIdentityAlias],
+        events: list[CaseEvent],
+    ) -> tuple[AtomicCaseProjection, list[CaseEvent], bool]:
+        async with self._lock:
+            for alias in aliases:
+                if not alias.alias_value:
+                    raise ValueError("alias_value is required")
+                existing_id = self._alias_index.get(_alias_key(alias.alias_type, alias.alias_value))
+                if existing_id:
+                    existing_alias = self._aliases[existing_id]
+                    existing_case = self._cases.get(existing_alias.case_id)
+                    if isinstance(existing_case, AtomicCaseProjection):
+                        return existing_case.model_copy(deep=True), [], False
+                    raise ValueError(f"active alias {alias.alias_type}:{alias.alias_value} points to missing case")
+            for existing_case in self._cases.values():
+                if (
+                    isinstance(existing_case, AtomicCaseProjection)
+                    and existing_case.fingerprint
+                    and existing_case.fingerprint == case.fingerprint
+                    and existing_case.status not in {"resolved", "expired", "closed", "linked"}
+                ):
+                    return existing_case.model_copy(deep=True), [], False
+            stored_case = case.model_copy(deep=True)
+            self._cases[stored_case.case_id] = stored_case
+            for alias in aliases:
+                stored_alias = alias.model_copy(deep=True)
+                self._aliases[stored_alias.alias_id] = stored_alias
+                self._alias_index[_alias_key(stored_alias.alias_type, stored_alias.alias_value)] = stored_alias.alias_id
+            stored_events = [self._store_event_locked(event) for event in events]
+            return stored_case.model_copy(deep=True), [event.model_copy(deep=True) for event in stored_events], True
+
     async def claim_investigation(
         self,
         case_id: str,
@@ -123,6 +167,7 @@ class InMemoryCaseStore:
         status: str,
         policy_version: str,
         now: str,
+        event: CaseEvent,
     ) -> AtomicCaseProjection | None:
         async with self._lock:
             case = self._cases.get(str(case_id or ""))
@@ -142,6 +187,7 @@ class InMemoryCaseStore:
             claimed.updated_at = now
             claimed.policy_version = policy_version
             self._cases[claimed.case_id] = claimed
+            self._store_event_locked(event)
             return claimed.model_copy(deep=True)
 
     async def get_case(self, case_id: str) -> CaseProjection | None:
@@ -159,15 +205,18 @@ class InMemoryCaseStore:
 
     async def append_event(self, event: CaseEvent) -> CaseEvent:
         async with self._lock:
-            existing = self._events.get(event.event_id)
-            if existing is not None:
-                return existing.model_copy(deep=True)
-            stored = event.model_copy(deep=True)
-            self._events[stored.event_id] = stored
-            for target in (stored.case_id, stored.meta_case_id):
-                if target:
-                    self._case_events.setdefault(target, []).append(stored.event_id)
-            return stored.model_copy(deep=True)
+            return self._store_event_locked(event).model_copy(deep=True)
+
+    def _store_event_locked(self, event: CaseEvent) -> CaseEvent:
+        existing = self._events.get(event.event_id)
+        if existing is not None:
+            return existing
+        stored = event.model_copy(deep=True)
+        self._events[stored.event_id] = stored
+        for target in (stored.case_id, stored.meta_case_id):
+            if target:
+                self._case_events.setdefault(target, []).append(stored.event_id)
+        return stored
 
     async def case_events(self, case_id: str) -> list[CaseEvent]:
         async with self._lock:

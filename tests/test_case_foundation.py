@@ -437,6 +437,30 @@ async def test_case_service_investigation_claim_is_atomic_for_stale_cases():
 
 
 @pytest.mark.asyncio
+async def test_case_service_first_case_creation_is_idempotent_by_alias():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    first = ObservationRecord(
+        source="alertmanager",
+        source_fingerprint="alert-fp",
+        source_event_id="event-1",
+        dedup_key="alertmanager:event-1:firing",
+        detector="InstanceDown",
+        resource="rtr1",
+        status="firing",
+    )
+    duplicate = first.model_copy(update={"observation_id": "obs_duplicate"})
+
+    first_result, second_result = await asyncio.gather(service.observe(first), service.observe(duplicate))
+
+    assert first_result.case is not None
+    assert second_result.case is not None
+    assert first_result.case.case_id == second_result.case.case_id
+    assert len(await store.list_cases(kind="atomic")) == 1
+    assert await store.resolve_alias("source_fp", "alert-fp") == first_result.case.case_id
+
+
+@pytest.mark.asyncio
 async def test_case_service_suppression_ttl_lives_on_case():
     store = InMemoryCaseStore()
     service = CaseService(store, policy=CasePolicy(suppression_default_ttl_s=60))

@@ -195,7 +195,14 @@ class CaseService:
 
         if not self.should_investigate(case):
             return None
-        claimed = await self.store.claim_investigation(
+        event = CaseEvent(
+            case_id=case.case_id,
+            event_type="investigation_started",
+            actor_type="system",
+            policy_version=self.policy.policy_version,
+            payload={"diagnosis_signature": _investigation_signature(case), "status": status},
+        )
+        return await self.store.claim_investigation(
             case.case_id,
             expected_signal_signature=case.signal_signature,
             expected_diagnosis_signature=case.diagnosis_signature,
@@ -203,19 +210,8 @@ class CaseService:
             status=status,
             policy_version=self.policy.policy_version,
             now=utc_now(),
+            event=event,
         )
-        if claimed is None:
-            return None
-        await self.store.append_event(
-            CaseEvent(
-                case_id=claimed.case_id,
-                event_type="investigation_started",
-                actor_type="system",
-                policy_version=self.policy.policy_version,
-                payload={"diagnosis_signature": claimed.diagnosis_signature, "status": status},
-            )
-        )
-        return claimed
 
     async def record_investigation_result(
         self,
@@ -475,43 +471,39 @@ class CaseService:
             signal_signature=observation.signal_signature,
             policy_version=self.policy.policy_version,
         )
-        case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
-        await self.store.record_alias(CaseIdentityAlias(case_id=case.case_id, alias_type=alias_type, alias_value=alias_value))
-        if observation.source_fingerprint:
-            await self.store.record_alias(
-                CaseIdentityAlias(case_id=case.case_id, alias_type="source_fp", alias_value=observation.source_fingerprint)
-            )
-        if observation.source_event_id:
-            await self.store.record_alias(
+        aliases = [CaseIdentityAlias(case_id=case.case_id, alias_type=alias_type, alias_value=alias_value)]
+        if observation.source_fingerprint and (alias_type, alias_value) != ("source_fp", observation.source_fingerprint):
+            aliases.append(CaseIdentityAlias(case_id=case.case_id, alias_type="source_fp", alias_value=observation.source_fingerprint))
+        if observation.source_event_id and (alias_type, alias_value) != ("source_event_id", observation.source_event_id):
+            aliases.append(
                 CaseIdentityAlias(case_id=case.case_id, alias_type="source_event_id", alias_value=observation.source_event_id)
             )
         events = [
-            await self.store.append_event(
-                CaseEvent(
-                    case_id=case.case_id,
-                    event_type="case_created",
-                    actor_type="system",
-                    source=observation.source,
-                    observed_at=observation.observed_at,
-                    policy_version=self.policy.policy_version,
-                    payload={"observation_id": observation.observation_id, "alias_type": alias_type},
-                )
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="case_created",
+                actor_type="system",
+                source=observation.source,
+                observed_at=observation.observed_at,
+                policy_version=self.policy.policy_version,
+                payload={"observation_id": observation.observation_id, "alias_type": alias_type},
             ),
-            await self.store.append_event(
-                CaseEvent(
-                    case_id=case.case_id,
-                    event_type="case_observed_unhealthy",
-                    actor_type="monitor",
-                    source=observation.source,
-                    observed_at=observation.observed_at,
-                    policy_version=self.policy.policy_version,
-                    payload={
-                        "observation_id": observation.observation_id,
-                        "signal_signature": observation.signal_signature,
-                    },
-                )
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="case_observed_unhealthy",
+                actor_type="monitor",
+                source=observation.source,
+                observed_at=observation.observed_at,
+                policy_version=self.policy.policy_version,
+                payload={
+                    "observation_id": observation.observation_id,
+                    "signal_signature": observation.signal_signature,
+                },
             ),
         ]
+        case, events, created = await self.store.create_atomic_case(case, aliases=aliases, events=events)
+        if not created:
+            return await self._update_unhealthy(case, observation)
         return ObserveResult("created", observation, case, events)
 
     async def _update_unhealthy(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
