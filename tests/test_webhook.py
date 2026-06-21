@@ -56,6 +56,27 @@ def isolated_incident_memory():
 
 
 @pytest.fixture
+def isolated_case_service_runtime():
+    """Install a fresh CaseService runtime and restore the process global after the test."""
+
+    original = main_module.case_service_runtime
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    main_module.case_service_runtime = runtime
+    try:
+        yield runtime, service, store
+    finally:
+        main_module.case_service_runtime = original
+
+
+@pytest.fixture
 def mock_alert_payload():
     return {
         "receiver": "webhook",
@@ -297,19 +318,10 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, isolate
 
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_legacy(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory, isolated_case_service_runtime
 ):
-    store = InMemoryCaseStore()
-    service = CaseService(store)
-
-    class _Runtime:
-        pass
-
-    runtime = _Runtime()
-    runtime.service = service
-    runtime.store = store
+    _, _, store = isolated_case_service_runtime
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
-    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
     background_tasks = mocker.Mock()
 
     response = await alertmanager_webhook(
@@ -330,19 +342,10 @@ async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_l
 
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigation(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory, isolated_case_service_runtime
 ):
-    store = InMemoryCaseStore()
-    service = CaseService(store)
-
-    class _Runtime:
-        pass
-
-    runtime = _Runtime()
-    runtime.service = service
-    runtime.store = store
+    _, service, _ = isolated_case_service_runtime
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
-    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
     payload = deepcopy(mock_alert_payload)
     payload["source"] = "alertmanager"
     first_results = await _shadow_observe_alert_payload(payload)
