@@ -1655,6 +1655,7 @@ name = "noc-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "asyncpg" },
     { name = "discord-py" },
     { name = "fastapi" },
     { name = "google-cloud-monitoring" },
@@ -1678,7 +1679,6 @@ anthropic = [
     { name = "anthropic" },
 ]
 postgres = [
-    { name = "asyncpg" },
     { name = "langgraph-checkpoint-postgres" },
 ]
 
@@ -1694,7 +1694,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40" },
-    { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },
+    { name = "asyncpg", specifier = ">=0.30" },
     { name = "discord-py", specifier = ">=2.5.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "google-cloud-monitoring", specifier = ">=2.30.0" },
