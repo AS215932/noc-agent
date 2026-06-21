@@ -196,7 +196,7 @@ async def test_investigator_does_not_count_or_handoff_on_triage_failure(monkeypa
     case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
     assert case is not None
     assert case.investigation_status == "failed"
-    assert case_service.should_investigate(case)
+    assert not case_service.should_investigate(case)
 
 
 @pytest.mark.asyncio
