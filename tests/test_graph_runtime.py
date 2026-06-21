@@ -59,6 +59,30 @@ async def test_graph_resume_uses_stable_thread_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_case_service_graph_case_requires_explicit_memory(monkeypatch):
+    class FailingLegacyMemory:
+        def __getattr__(self, name):
+            raise AssertionError(f"legacy incident memory used for {name}")
+
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", FailingLegacyMemory())
+    graph_case = {
+        "incident_id": "case_123",
+        "case_number": "NOC-123",
+        "resource_id": "edge1",
+        "status": "investigating",
+        "thread_id": None,
+        "source": "case_service",
+    }
+
+    with pytest.raises(RuntimeError, match="CaseService graph runs require explicit graph memory"):
+        await graph_runtime.run_investigation_graph(
+            {"status": "firing", "alerts": [{"labels": {"alertname": "PacketLoss", "instance": "edge1"}}]},
+            model=TestModel(),
+            case=graph_case,
+        )
+
+
+@pytest.mark.asyncio
 async def test_graph_uses_case_service_memory_when_case_provided(monkeypatch):
     class FailingLegacyMemory:
         def __getattr__(self, name):

@@ -23,8 +23,14 @@ async def intake_alert(alert_payload: dict[str, Any]) -> CaseIntakeResult:
     return await INCIDENT_MEMORY.intake_alert(alert_payload)
 
 
+def _graph_memory_for_case(case: dict[str, Any] | None, incident_memory=None):
+    if case and case.get("source") == "case_service" and incident_memory is None:
+        raise RuntimeError("CaseService graph runs require explicit graph memory")
+    return incident_memory or INCIDENT_MEMORY
+
+
 async def inject_case_event(case: dict[str, Any], event: dict[str, Any], *, incident_memory=None) -> bool:
-    memory = incident_memory or INCIDENT_MEMORY
+    memory = _graph_memory_for_case(case, incident_memory)
     thread_id = case.get("thread_id")
     if not thread_id:
         return False
@@ -95,7 +101,7 @@ async def run_investigation_graph(
     *,
     incident_memory=None,
 ) -> tuple[DiagnosticSynthesis, WorkflowState]:
-    memory = incident_memory or INCIDENT_MEMORY
+    memory = _graph_memory_for_case(case, incident_memory)
     if case is None:
         intake = await memory.intake_alert(alert_payload)
         case = intake.case
