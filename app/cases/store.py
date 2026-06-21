@@ -1,9 +1,8 @@
 """CaseStore boundary and in-memory reference backend.
 
-The production plan moves this boundary to Postgres. The in-memory backend here
-is deliberately small and deterministic so service logic can be developed and
-tested without reusing the old Redis/local IncidentMemory as a second source of
-truth.
+The production backend for this boundary is Postgres. The in-memory backend
+here is deliberately small and deterministic so service logic can be developed
+and tested without a second source of truth.
 """
 
 from __future__ import annotations

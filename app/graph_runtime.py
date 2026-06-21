@@ -24,52 +24,10 @@ def _require_graph_case(case: dict[str, Any] | None) -> dict[str, Any]:
     return case
 
 
-def _require_graph_memory(incident_memory=None):
-    if incident_memory is None:
+def _require_graph_memory(graph_memory=None):
+    if graph_memory is None:
         raise RuntimeError("Investigation graph requires explicit graph memory")
-    return incident_memory
-
-
-async def inject_case_event(case: dict[str, Any], event: dict[str, Any], *, incident_memory=None) -> bool:
-    memory = _require_graph_memory(incident_memory)
-    thread_id = case.get("thread_id")
-    if not thread_id:
-        return False
-    graph = _THREAD_GRAPHS.get(thread_id) or await _graph(
-        RuntimeDeps.build(incident_memory=memory),
-        cache=False,
-    )
-    context = await memory.case_context(case["incident_id"])
-    config = {"configurable": {"thread_id": thread_id}}
-    existing_values: dict[str, Any] = {}
-    if hasattr(graph, "aget_state"):
-        snapshot = await graph.aget_state(config)
-        existing_values = dict(getattr(snapshot, "values", {}) or {})
-    related_alerts = list(existing_values.get("related_alerts") or [])
-    related_alerts.append(event)
-    update = {
-        "updated_at": utc_now(),
-        "related_alerts": related_alerts,
-        "case_event_count": case.get("event_count", 0),
-        "latest_event": event,
-        "latest_transition": case.get("latest_transition"),
-        "downstream_victims": list(case.get("downstream_victims", [])),
-        "case_status": case.get("status", ""),
-        "case_context": context,
-        "needs_reassessment": bool(case.get("needs_reassessment", False)),
-    }
-    try:
-        await graph.aupdate_state(
-            config,
-            update,
-            as_node="intake_event_injection",
-        )
-        return True
-    except Exception:
-        # Some LangGraph versions require as_node to be a compiled node. Retry
-        # without as_node so production keeps preserving case context.
-        await graph.aupdate_state(config, update)
-        return True
+    return graph_memory
 
 
 async def run_investigation_graph(
@@ -78,10 +36,10 @@ async def run_investigation_graph(
     mcp_runtime=None,
     case: dict[str, Any] | None = None,
     *,
-    incident_memory=None,
+    graph_memory=None,
 ) -> tuple[DiagnosticSynthesis, WorkflowState]:
     case = _require_graph_case(case)
-    memory = _require_graph_memory(incident_memory)
+    memory = _require_graph_memory(graph_memory)
     incident_id = case["incident_id"]
     thread_id = case.get("thread_id") or str(uuid4())
     case_context = await memory.case_context(incident_id)
@@ -126,7 +84,7 @@ async def run_investigation_graph(
     assert_json_serializable_state(state)
 
     runtime = RuntimeDeps.build(
-        incident_memory=memory,
+        graph_memory=memory,
         mcp_runtime=mcp_runtime,
         model_override=model,
     )
@@ -156,9 +114,9 @@ async def record_operator_decision(
     decision: dict[str, Any],
     mcp_runtime=None,
     *,
-    incident_memory=None,
+    graph_memory=None,
 ) -> dict[str, Any] | None:
-    memory = _require_graph_memory(incident_memory)
+    memory = _require_graph_memory(graph_memory)
     resolved = await memory.resolve_case_identifier(incident_id)
     incident_id = resolved or incident_id
     decision = {**decision, "incident_id": incident_id}
@@ -168,7 +126,7 @@ async def record_operator_decision(
     status = decision.get("decision", "acknowledged")
     final_state = None
     if status == "approved" and summary.get("thread_id"):
-        final_state = await resume_investigation(incident_id, decision, mcp_runtime=mcp_runtime, incident_memory=memory)
+        final_state = await resume_investigation(incident_id, decision, mcp_runtime=mcp_runtime, graph_memory=memory)
     summary.update(
         {
             "status": "approved" if status == "approved" else "rejected" if status == "rejected" else "finalized",
@@ -203,15 +161,15 @@ async def resume_investigation(
     decision: dict[str, Any],
     mcp_runtime=None,
     *,
-    incident_memory=None,
+    graph_memory=None,
 ) -> WorkflowState | None:
-    memory = _require_graph_memory(incident_memory)
+    memory = _require_graph_memory(graph_memory)
     resolved = await memory.resolve_case_identifier(incident_id)
     incident_id = resolved or incident_id
     summary = await memory.get_summary(incident_id)
     if not summary or not summary.get("thread_id"):
         return None
-    runtime = RuntimeDeps.build(incident_memory=memory, mcp_runtime=mcp_runtime)
+    runtime = RuntimeDeps.build(graph_memory=memory, mcp_runtime=mcp_runtime)
     graph = _THREAD_GRAPHS.get(summary["thread_id"]) or await _graph(
         runtime,
         cache=False,

@@ -69,15 +69,15 @@ class PerimeterContext(BaseModel):
 
 @dataclass(slots=True)
 class RuntimeDeps:
-    incident_memory: Any
+    graph_memory: Any
     mcp_runtime: Any | None = None
     perimeter_context: PerimeterContext | None = None
     model_override: Any | None = None
 
     @classmethod
-    def build(cls, *, incident_memory: Any, mcp_runtime: Any | None = None, model_override: Any | None = None):
+    def build(cls, *, graph_memory: Any, mcp_runtime: Any | None = None, model_override: Any | None = None):
         return cls(
-            incident_memory=incident_memory,
+            graph_memory=graph_memory,
             mcp_runtime=mcp_runtime,
             perimeter_context=PerimeterContext.from_settings_and_manifest(),
             model_override=model_override,

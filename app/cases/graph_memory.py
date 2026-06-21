@@ -1,9 +1,8 @@
 """CaseService-backed graph memory adapter.
 
-This adapter exposes the small incident-memory surface the LangGraph runtime
+This adapter exposes the small graph-memory surface the LangGraph runtime
 needs while storing graph context/summaries on CaseService projections/events.
-It is used by CaseService-primary reactive/proactive/control cases so new case
-paths no longer write graph context through legacy IncidentMemory.
+It is used by CaseService-primary reactive/proactive/control cases.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ _GRAPH_AUTHORED_CASE_STATUSES = {"investigating", "waiting_approval", "recovered
 
 
 class CaseServiceGraphMemory:
-    """IncidentMemory-compatible adapter backed by CaseService storage."""
+    """Graph-memory adapter backed by CaseService storage."""
 
     def __init__(self, store: CaseStore) -> None:
         self.store = store
@@ -34,7 +33,7 @@ class CaseServiceGraphMemory:
         direct = await self.store.get_case(text)
         if isinstance(direct, AtomicCaseProjection):
             return direct.case_id
-        for alias_type in ("source_fp", "source_event_id", "legacy_incident_id", "legacy_case_number"):
+        for alias_type in ("source_fp", "source_event_id"):
             case_id = await self.store.resolve_alias(alias_type, text)
             if case_id:
                 return case_id
