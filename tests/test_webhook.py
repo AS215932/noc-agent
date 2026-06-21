@@ -365,6 +365,36 @@ async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigati
 
 
 @pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_marks_investigation_started_before_queue(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    _, _, store = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    case = await store.get_case(response["incident_id"])
+    assert case is not None
+    assert case.investigation_status == "in_progress"
+    assert case.last_investigated_at
+    assert case.diagnosis_signature == case.signal_signature
+    background_tasks.add_task.assert_called_once()
+    background_tasks.add_task.reset_mock()
+
+    second = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    assert second["incident_id"] == response["incident_id"]
+    background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_alertmanager_webhook_reactive_primary_investigates_case_that_passed_gate(
     monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):

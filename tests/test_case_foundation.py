@@ -388,6 +388,11 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert created.case is not None
     assert service.should_investigate(created.case)
 
+    started = await service.mark_investigation_started(created.case.case_id)
+    assert not service.should_investigate(started)
+    assert started.investigation_status == "in_progress"
+    assert started.diagnosis_signature == started.signal_signature
+
     investigated = await service.record_investigation_result(
         created.case.case_id,
         diagnosis={"root_cause": "disk growth"},
@@ -396,6 +401,10 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert not service.should_investigate(investigated)
     assert investigated.last_diagnosis["root_cause"] == "disk growth"
     assert investigated.diagnosis_signature == investigated.signal_signature
+    assert [event.event_type for event in await store.case_events(created.case.case_id)][-2:] == [
+        "investigation_started",
+        "investigation_recorded",
+    ]
 
     changed = await service.observe(
         ObservationRecord(source="proactive", rule_id="disk_fill", resource="log", status="firing", signal_snapshot={"free": 2})

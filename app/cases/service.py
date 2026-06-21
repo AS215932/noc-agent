@@ -190,6 +190,29 @@ class CaseService:
         now = now or datetime.now(timezone.utc)
         return (now - last) >= timedelta(seconds=self.policy.investigation_cooldown_s)
 
+    async def mark_investigation_started(self, case_id: str, *, status: str = "in_progress") -> AtomicCaseProjection:
+        """Stamp a queued/running investigation before external graph execution."""
+
+        case = await self._require_atomic_case(case_id)
+        now = utc_now()
+        case.last_investigated_at = now
+        case.diagnosis_signature = case.signal_signature
+        case.investigation_status = status
+        case.investigation_error = ""
+        case.updated_at = now
+        case.policy_version = self.policy.policy_version
+        case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
+        await self.store.append_event(
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="investigation_started",
+                actor_type="system",
+                policy_version=self.policy.policy_version,
+                payload={"diagnosis_signature": case.diagnosis_signature, "status": status},
+            )
+        )
+        return case
+
     async def record_investigation_result(
         self,
         case_id: str,
