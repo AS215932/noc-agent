@@ -305,28 +305,29 @@ async def test_health_cases_reports_runtime_status(monkeypatch):
     assert response["outbox"] == {"pending": 2, "failed": 1}
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, isolated_incident_memory):
+async def test_alertmanager_webhook_accepted(monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime):
     """
     Test that the webhook successfully parses standard AlertManager payloads
     and offloads the processing to a background task.
     """
-    mocker.patch("app.main.investigate_alert") # Mock the background execution so we don't hit the real LLM API
+    mocker.patch("app.main.investigate_alert")  # Mock the background execution so we don't hit the real LLM API
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
     response = await alertmanager_webhook(
         AlertManagerPayload.model_validate(mock_alert_payload),
         BackgroundTasks(),
     )
     assert response["status"] == "accepted"
+    assert response["source"] == "case_service"
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_legacy_disabled_requires_reactive_primary(monkeypatch, mock_alert_payload):
-    monkeypatch.setenv("NOC_LEGACY_INCIDENT_MEMORY_ENABLED", "0")
+async def test_alertmanager_webhook_requires_reactive_primary(monkeypatch, mock_alert_payload):
     monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
 
     with pytest.raises(HTTPException) as exc:
         await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), BackgroundTasks())
 
     assert exc.value.status_code == 503
-    assert "NOC_CASESERVICE_REACTIVE_PRIMARY" in exc.value.detail
+    assert "legacy IncidentMemory intake has been removed" in exc.value.detail
 
 
 @pytest.mark.asyncio
@@ -495,7 +496,8 @@ async def test_alertmanager_webhook_reactive_primary_surfaces_store_failures(
 
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, isolated_incident_memory):
+async def test_alertmanager_webhook_ignores_recovery(monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime):
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
     background_tasks = mocker.Mock()
     mock_alert_payload["status"] = "resolved"
     mock_alert_payload["alerts"][0]["status"] = "resolved"
@@ -510,7 +512,8 @@ async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker,
 
 
 @pytest.mark.asyncio
-async def test_icinga_webhook_ignores_recovery(mocker, isolated_incident_memory):
+async def test_icinga_webhook_ignores_recovery(monkeypatch, mocker, isolated_case_service_runtime):
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
     background_tasks = mocker.Mock()
     notification = IcingaNotification(
         host_name="vault",
@@ -585,8 +588,7 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
 
 
 @pytest.mark.asyncio
-async def test_icinga_duplicate_attaches_to_existing_case_without_second_investigation(mocker, isolated_incident_memory):
-    background_tasks = mocker.Mock()
+async def test_icinga_webhook_requires_reactive_primary(mocker):
     notification = IcingaNotification(
         host_name="noc",
         service_name="noc-agent-uptime",
@@ -595,17 +597,12 @@ async def test_icinga_duplicate_attaches_to_existing_case_without_second_investi
         state_type="PROBLEM",
         output="WARNING: uptime_seconds=556 (<1800)",
     )
-    duplicate = notification.model_copy(update={"state": "CRITICAL", "output": "CRITICAL: uptime_seconds=258 (<300)"})
 
-    first = await icinga_webhook(notification, background_tasks)
-    second = await icinga_webhook(duplicate, background_tasks)
+    with pytest.raises(HTTPException) as exc:
+        await icinga_webhook(notification, mocker.Mock())
 
-    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
-    assert first["action"] == "created"
-    assert second["action"] == "escalated"
-    assert first["case_number"] == second["case_number"]
-    assert scheduled.count("investigate_alert") == 1
-    assert scheduled.count("_handle_case_update") == 1
+    assert exc.value.status_code == 503
+    assert "legacy IncidentMemory intake has been removed" in exc.value.detail
 
 def test_triage_fields_turn_internal_schema_failure_into_operator_guidance(mock_alert_payload):
     plan = DiagnosticSynthesis.model_validate({
@@ -737,87 +734,44 @@ async def test_shadow_observe_alert_payload_preserves_partial_results(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_links_case_service_to_legacy_case(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+async def test_alertmanager_webhook_does_not_create_legacy_aliases(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
-    store = InMemoryCaseStore()
-    service = CaseService(store)
-
-    class _Runtime:
-        pass
-
-    runtime = _Runtime()
-    runtime.service = service
-    runtime.store = store
-
-    import app.main as main_module
-
-    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    _, _, store = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
     background_tasks = mocker.Mock()
 
     response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
 
     assert response["status"] == "accepted"
-    by_number = await store.resolve_alias("legacy_case_number", response["case_number"])
-    by_incident = await store.resolve_alias("legacy_incident_id", response["incident_id"])
-    assert by_number is not None
-    assert by_number == by_incident
+    assert await store.resolve_alias("legacy_case_number", response["case_number"] or "") is None
+    assert await store.resolve_alias("legacy_incident_id", response["incident_id"] or "") is None
 
 
 @pytest.mark.asyncio
-async def test_reactive_case_service_control_skips_recently_investigated_duplicate(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+async def test_reactive_case_service_control_without_primary_is_removed(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
-    store = InMemoryCaseStore()
-    service = CaseService(store)
-
-    class _Runtime:
-        pass
-
-    runtime = _Runtime()
-    runtime.service = service
-
-    import app.main as main_module
-
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
-    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
-    payload = deepcopy(mock_alert_payload)
-    payload["source"] = "alertmanager"
-    first_results = await _shadow_observe_alert_payload(payload)
-    assert first_results and getattr(first_results[0], "case") is not None
-    await service.record_investigation_result(getattr(first_results[0], "case").case_id, diagnosis={"summary": "done"})
-    background_tasks = mocker.Mock()
+    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
 
-    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+    with pytest.raises(HTTPException) as exc:
+        await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), mocker.Mock())
 
-    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
-    assert response["status"] == "accepted"
-    assert "investigate_alert" not in scheduled
-    assert "_handle_case_update" in scheduled
+    assert exc.value.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_reactive_case_service_control_fails_open_when_shadow_has_no_case(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+async def test_reactive_case_service_control_no_longer_fails_open_to_legacy(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
-    class _Service:
-        async def observe(self, observation):
-            raise RuntimeError("case service unavailable")
-
-    class _Runtime:
-        service = _Service()
-
-    import app.main as main_module
-
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
-    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
-    background_tasks = mocker.Mock()
+    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
 
-    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+    with pytest.raises(HTTPException) as exc:
+        await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), mocker.Mock())
 
-    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
-    assert response["status"] == "accepted"
-    assert "investigate_alert" in scheduled
+    assert exc.value.status_code == 503
 
 
 @pytest.mark.asyncio
