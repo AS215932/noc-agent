@@ -129,7 +129,7 @@ async def test_case_service_graph_memory_counts_repeated_case_events_as_history(
     history = await graph_memory.history_for("edge1")
     correlated = await graph_memory.correlate("edge1", {})
 
-    assert len(history) >= 4
+    assert len(history) == 4
     assert correlated["chronic"] is True
 
 
@@ -141,10 +141,17 @@ async def test_case_service_graph_memory_links_child_to_parent_case():
         ObservationRecord(source="alertmanager", detector="Power", resource="rack1", status="firing")
     )
     child = await service.observe(
-        ObservationRecord(source="alertmanager", detector="BGP", resource="rtr1", status="firing")
+        ObservationRecord(
+            source="alertmanager",
+            detector="BGP",
+            resource="rtr1",
+            status="firing",
+            source_fingerprint="child-fp",
+        )
     )
     assert parent.case is not None
     assert child.case is not None
+    assert await store.resolve_alias("source_fp", "child-fp") == child.case.case_id
     graph_memory = CaseServiceGraphMemory(store)
 
     result = await graph_memory.link_to_parent_case(
@@ -159,6 +166,7 @@ async def test_case_service_graph_memory_links_child_to_parent_case():
     assert result["ok"] is True
     assert stored_child.status == "linked"
     assert stored_child.last_diagnosis["linked_parent_case"] == parent.case.case_id
+    assert await store.resolve_alias("source_fp", "child-fp") == parent.case.case_id
     assert "linked_child_case" in [event.event_type for event in parent_events]
 
 

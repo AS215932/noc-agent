@@ -112,12 +112,18 @@ class CaseServiceGraphMemory:
         child.last_diagnosis = diagnosis
         child.updated_at = utc_now()
         child = cast(AtomicCaseProjection, await self.store.upsert_case(child))
+        moved_aliases = await self.store.reassign_aliases(child.case_id, parent.case_id)
         await self.store.append_event(
             CaseEvent(
                 case_id=child.case_id,
                 event_type="case_linked_to_parent",
                 actor_type="graph",
-                payload={"parent_case_id": parent.case_id, "reason": safe_reason, "evidence_refs": refs},
+                payload={
+                    "parent_case_id": parent.case_id,
+                    "reason": safe_reason,
+                    "evidence_refs": refs,
+                    "moved_alias_count": len(moved_aliases),
+                },
             )
         )
         await self.store.append_event(
@@ -130,6 +136,7 @@ class CaseServiceGraphMemory:
                     "resource_key": _safe_string(child.resource_id, limit=240),
                     "summary": safe_reason,
                     "evidence_refs": refs,
+                    "moved_alias_count": len(moved_aliases),
                 },
             )
         )
@@ -146,7 +153,7 @@ class CaseServiceGraphMemory:
                 continue
             event_rows = []
             for event in await self.store.case_events(case.case_id):
-                if event.event_type not in {"case_created", "case_observed_unhealthy", "case_signal_changed"}:
+                if event.event_type not in {"case_observed_unhealthy", "case_signal_changed"}:
                     continue
                 ts = _parse_ts(event.observed_at or event.occurred_at)
                 if ts >= cutoff:

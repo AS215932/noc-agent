@@ -20,6 +20,7 @@ from app.cases.models import (
     OperatorFeedback,
     OutboxIntent,
     TraceRecord,
+    utc_now,
 )
 
 CaseProjection = AtomicCaseProjection | MetaCaseProjection
@@ -65,6 +66,8 @@ class CaseStore(Protocol):
     async def record_alias(self, alias: CaseIdentityAlias) -> CaseIdentityAlias: ...
 
     async def resolve_alias(self, alias_type: str, alias_value: str) -> str | None: ...
+
+    async def reassign_aliases(self, from_case_id: str, to_case_id: str) -> list[CaseIdentityAlias]: ...
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
@@ -255,6 +258,41 @@ class InMemoryCaseStore:
             if alias is None or alias.retired_at is not None:
                 return None
             return alias.case_id
+
+    async def reassign_aliases(self, from_case_id: str, to_case_id: str) -> list[CaseIdentityAlias]:
+        if from_case_id == to_case_id:
+            return []
+        moved: list[CaseIdentityAlias] = []
+        now = utc_now()
+        async with self._lock:
+            active_aliases = [
+                alias
+                for alias in self._aliases.values()
+                if alias.case_id == from_case_id and alias.retired_at is None
+            ]
+            for alias in active_aliases:
+                key = _alias_key(alias.alias_type, alias.alias_value)
+                indexed_id = self._alias_index.get(key)
+                indexed_alias = self._aliases.get(indexed_id) if indexed_id else None
+                target_already_has_alias = bool(
+                    indexed_alias and indexed_alias.case_id == to_case_id and indexed_alias.retired_at is None
+                )
+                if indexed_id == alias.alias_id:
+                    self._alias_index.pop(key, None)
+                alias.retired_at = now
+                if target_already_has_alias or key in self._alias_index:
+                    continue
+                replacement = CaseIdentityAlias(
+                    case_id=to_case_id,
+                    alias_type=alias.alias_type,
+                    alias_value=alias.alias_value,
+                    source=alias.source or "case_link",
+                    confidence=alias.confidence,
+                )
+                self._aliases[replacement.alias_id] = replacement
+                self._alias_index[key] = replacement.alias_id
+                moved.append(replacement.model_copy(deep=True))
+        return moved
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent:
         async with self._lock:

@@ -19,6 +19,7 @@ from app.cases.models import (
     OperatorFeedback,
     OutboxIntent,
     TraceRecord,
+    utc_now,
 )
 from app.cases.store import CaseProjection
 from app.db.config import DatabaseSettings, load_database_settings
@@ -360,6 +361,60 @@ class PostgresCaseStore:
                 alias_value,
             )
         return str(row["case_id"]) if row else None
+
+    async def reassign_aliases(self, from_case_id: str, to_case_id: str) -> list[CaseIdentityAlias]:
+        if from_case_id == to_case_id:
+            return []
+        moved: list[CaseIdentityAlias] = []
+        now = utc_now()
+        async with self.pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                """
+                SELECT alias_id, case_id, alias_type, alias_value, source, confidence, created_at, retired_at
+                FROM case_identity_aliases
+                WHERE case_id = $1 AND retired_at IS NULL
+                FOR UPDATE
+                """,
+                from_case_id,
+            )
+            for row in rows:
+                alias = CaseIdentityAlias.model_validate(dict(row))
+                await conn.execute(
+                    """
+                    UPDATE case_identity_aliases
+                    SET retired_at = $2
+                    WHERE alias_id = $1
+                    """,
+                    alias.alias_id,
+                    now,
+                )
+                replacement = CaseIdentityAlias(
+                    case_id=to_case_id,
+                    alias_type=alias.alias_type,
+                    alias_value=alias.alias_value,
+                    source=alias.source or "case_link",
+                    confidence=alias.confidence,
+                )
+                inserted = await conn.fetchrow(
+                    """
+                    INSERT INTO case_identity_aliases (
+                        alias_id, case_id, alias_type, alias_value, source, confidence, created_at, retired_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                    ON CONFLICT (alias_type, alias_value) WHERE retired_at IS NULL DO NOTHING
+                    RETURNING alias_id
+                    """,
+                    replacement.alias_id,
+                    replacement.case_id,
+                    replacement.alias_type,
+                    replacement.alias_value,
+                    replacement.source,
+                    replacement.confidence,
+                    replacement.created_at,
+                    replacement.retired_at,
+                )
+                if inserted:
+                    moved.append(replacement)
+        return moved
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent:
         payload = intent.model_dump(mode="json")
