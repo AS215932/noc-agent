@@ -387,7 +387,11 @@ async def test_alertmanager_webhook_reactive_primary_investigates_case_that_pass
 
     assert response["source"] == "case_service"
     assert response["incident_id"] == cooled_case.case_id  # response preserves first affected case for compatibility
-    assert background_tasks.add_task.call_args.kwargs["case"]["incident_id"] == active_case.case_id
+    scheduled_payload = background_tasks.add_task.call_args.args[1]
+    scheduled_case = background_tasks.add_task.call_args.kwargs["case"]
+    assert scheduled_payload["alerts"][0]["labels"]["instance"] == "rtr2.as215932.net:9100"
+    assert scheduled_case["incident_id"] == active_case.case_id
+    assert scheduled_case["latest_event"]["display_resource"] == "rtr2.as215932.net"
 
 
 @pytest.mark.asyncio
@@ -707,6 +711,30 @@ async def test_reactive_case_service_control_skips_recently_investigated_duplica
     assert response["status"] == "accepted"
     assert "investigate_alert" not in scheduled
     assert "_handle_case_update" in scheduled
+
+
+@pytest.mark.asyncio
+async def test_reactive_case_service_control_fails_open_when_shadow_has_no_case(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+):
+    class _Service:
+        async def observe(self, observation):
+            raise RuntimeError("case service unavailable")
+
+    class _Runtime:
+        service = _Service()
+
+    import app.main as main_module
+
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+
+    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
+    assert response["status"] == "accepted"
+    assert "investigate_alert" in scheduled
 
 
 @pytest.mark.asyncio

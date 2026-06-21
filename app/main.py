@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+from copy import deepcopy
 from html import escape
 from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
@@ -863,13 +864,25 @@ def _case_service_reactive_investigation_result(shadow_results: list[object]):
     return None
 
 
+def _case_service_result_has_firing_case(result: object) -> bool:
+    observation = getattr(result, "observation", None)
+    return getattr(observation, "status", "") == "firing" and getattr(result, "case", None) is not None
+
+
 def _case_service_reactive_allows_investigation(shadow_results: list[object]) -> bool:
     """Optionally let CaseService own reactive investigation cooldown gating."""
     if case_service_runtime is None or not (
         _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False) or _case_service_reactive_primary_enabled()
     ):
         return True
-    return _case_service_reactive_investigation_result(shadow_results) is not None
+    if _case_service_reactive_investigation_result(shadow_results) is not None:
+        return True
+    if not _case_service_reactive_primary_enabled() and not any(
+        _case_service_result_has_firing_case(result) for result in shadow_results
+    ):
+        log.warn("case_service_reactive_investigation_gate_fail_open_no_case")
+        return True
+    return False
 
 
 async def _link_case_service_results_to_legacy_case(shadow_results: list[object], legacy_case: dict | None) -> None:
@@ -1267,6 +1280,68 @@ def _case_service_primary_result(shadow_results: list[object], *, firing_only: b
     return None if firing_only else fallback
 
 
+def _matching_alert_for_observation(alert_payload: dict, observation: object) -> dict | None:
+    raw_alerts = alert_payload.get("alerts")
+    if not isinstance(raw_alerts, list):
+        return None
+    common_labels = alert_payload.get("commonLabels") if isinstance(alert_payload.get("commonLabels"), dict) else {}
+    common_annotations = alert_payload.get("commonAnnotations") if isinstance(alert_payload.get("commonAnnotations"), dict) else {}
+    observation_labels = getattr(observation, "labels", {}) or {}
+    observation_annotations = getattr(observation, "annotations", {}) or {}
+    snapshot = getattr(observation, "signal_snapshot", {}) or {}
+    observation_fingerprint = str(getattr(observation, "source_fingerprint", "") or "")
+    observation_starts_at = str(snapshot.get("startsAt") or getattr(observation, "observed_at", "") or "")
+    observation_ends_at = str(snapshot.get("endsAt") or "")
+    for raw_alert in raw_alerts:
+        if not isinstance(raw_alert, dict):
+            continue
+        labels = {**common_labels, **(raw_alert.get("labels") if isinstance(raw_alert.get("labels"), dict) else {})}
+        annotations = {
+            **common_annotations,
+            **(raw_alert.get("annotations") if isinstance(raw_alert.get("annotations"), dict) else {}),
+        }
+        raw_fingerprint = str(raw_alert.get("fingerprint") or labels.get("fingerprint") or "")
+        if raw_fingerprint and observation_fingerprint and raw_fingerprint == observation_fingerprint:
+            return deepcopy(raw_alert)
+        raw_starts_at = str(raw_alert.get("startsAt") or raw_alert.get("starts_at") or "")
+        raw_ends_at = str(raw_alert.get("endsAt") or raw_alert.get("ends_at") or "")
+        labels_match = labels == observation_labels
+        starts_match = not observation_starts_at or raw_starts_at == observation_starts_at
+        ends_match = not observation_ends_at or raw_ends_at == observation_ends_at
+        annotations_match = not observation_annotations or annotations == observation_annotations
+        if labels_match and starts_match and ends_match and annotations_match:
+            return deepcopy(raw_alert)
+    return None
+
+
+def _case_service_alert_payload_for_result(alert_payload: dict, result: object) -> dict:
+    observation = getattr(result, "observation", None)
+    if observation is None:
+        return alert_payload
+    selected = deepcopy(alert_payload)
+    selected_alert = _matching_alert_for_observation(alert_payload, observation)
+    if selected_alert is None:
+        snapshot = getattr(observation, "signal_snapshot", {}) or {}
+        selected_alert = {
+            "status": str(getattr(observation, "status", "") or selected.get("status") or "firing"),
+            "labels": deepcopy(getattr(observation, "labels", {}) or {}),
+            "annotations": deepcopy(getattr(observation, "annotations", {}) or {}),
+        }
+        starts_at = snapshot.get("startsAt") or getattr(observation, "observed_at", "") or ""
+        ends_at = snapshot.get("endsAt") or ""
+        generator_url = snapshot.get("generatorURL") or getattr(observation, "payload_ref", "") or ""
+        if starts_at:
+            selected_alert["startsAt"] = starts_at
+        if ends_at:
+            selected_alert["endsAt"] = ends_at
+        if generator_url:
+            selected_alert["generatorURL"] = generator_url
+    selected["alerts"] = [selected_alert]
+    selected["status"] = str(getattr(observation, "status", "") or selected.get("status") or "")
+    selected["truncatedAlerts"] = 0
+    return selected
+
+
 async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[object]:
     """Authoritative CaseService reactive intake; failures must propagate."""
 
@@ -1295,7 +1370,12 @@ async def _case_service_reactive_primary_response(alert_payload: dict, backgroun
     case = getattr(result, "case", None) if result is not None else None
     investigation_case = getattr(investigation_result, "case", None) if investigation_result is not None else None
     if investigation_case is not None:
-        background_tasks.add_task(investigate_alert, alert_payload, case=_case_service_graph_case(investigation_case, alert_payload))
+        investigation_payload = _case_service_alert_payload_for_result(alert_payload, investigation_result)
+        background_tasks.add_task(
+            investigate_alert,
+            investigation_payload,
+            case=_case_service_graph_case(investigation_case, investigation_payload),
+        )
     action = str(getattr(result, "action", "ignored") if result is not None else "ignored")
     return {
         "status": "accepted" if case is not None else "ignored",
