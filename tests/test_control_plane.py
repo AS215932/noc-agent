@@ -444,6 +444,15 @@ async def test_reactive_primary_routes_legacy_approval_reads_to_case_service(mon
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
     memory = isolated_incident_memory
+    legacy = await memory.intake_alert(
+        {
+            "source": "alertmanager",
+            "status": "firing",
+            "groupLabels": {"alertname": "LegacyOnly"},
+            "alerts": [{"labels": {"alertname": "LegacyOnly", "instance": "old"}}],
+        }
+    )
+    assert legacy.case is not None
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(
@@ -469,7 +478,14 @@ async def test_reactive_primary_routes_legacy_approval_reads_to_case_service(mon
 
     pending = await pending_incidents("secret")
     shown = await incident_status(created.case.case_id, "secret")
+    listing = await control_cases(_request())
     detail = await control_case_detail(created.case.case_id, _request())
+    events = await control_case_events(created.case.case_id, _request())
+    commented = await control_case_comment(
+        created.case.case_id,
+        CommentRequest(operator="svag", comment="checking"),
+        _request(),
+    )
     decided = await control_case_decision(
         created.case.case_id,
         LocalDecisionRequest(decision="rejected", operator="svag", comment="nope"),
@@ -479,7 +495,12 @@ async def test_reactive_primary_routes_legacy_approval_reads_to_case_service(mon
     stored = await store.get_case(created.case.case_id)
     assert pending["incidents"][0]["title"] == "case service approval"
     assert shown["title"] == "case service approval"
+    assert listing["source"] == "case_service"
+    assert [case["incident_id"] for case in listing["cases"]] == [created.case.case_id]
+    assert legacy.case["incident_id"] not in [case["incident_id"] for case in listing["cases"]]
     assert detail["source"] == "case_service"
+    assert events["source"] == "case_service"
+    assert commented["case"]["incident_id"] == created.case.case_id
     assert decided["incident"]["status"] == "rejected"
     assert stored.status == "resolved"
 

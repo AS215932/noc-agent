@@ -1082,6 +1082,10 @@ def _case_service_graph_summary_routes_enabled() -> bool:
     )
 
 
+def _case_service_control_routes_enabled() -> bool:
+    return _case_service_graph_summary_routes_enabled()
+
+
 def _case_service_graph_memory():
     if not _case_service_graph_summary_routes_enabled():
         return None
@@ -1796,7 +1800,7 @@ async def control_ui(request: Request, token: str | None = Query(default=None)):
 @app.get("/control/cases")
 async def control_cases(request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
-    if _case_service_control_primary_enabled():
+    if _case_service_control_routes_enabled():
         return await _case_service_control_cases_response()
     cases = await graph_runtime.INCIDENT_MEMORY.list_cases()
     pending = {item["incident_id"] for item in await _control_pending_summaries()}
@@ -1822,14 +1826,10 @@ async def control_cases(request: Request, token: str | None = Query(default=None
 @app.get("/control/cases/{case_id}")
 async def control_case_detail(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
-    if _case_service_control_primary_enabled():
+    if _case_service_control_routes_enabled():
         return await _case_service_control_case_detail_response(case_id)
     detail = await graph_runtime.INCIDENT_MEMORY.case_detail(case_id)
     if detail is None:
-        if _case_service_graph_summary_routes_enabled():
-            case = await _case_service_case_for_identifier(case_id)
-            if case is not None:
-                return await _case_service_control_case_detail_response(case.case_id)
         raise HTTPException(status_code=404, detail="Case not found")
     return {"status": "ok", **detail}
 
@@ -1904,14 +1904,10 @@ async def control_case_service_outbox(
 @app.get("/control/cases/{case_id}/events")
 async def control_case_events(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
     _require_control_request(request, token, x_noc_control_token)
-    if _case_service_control_primary_enabled():
+    if _case_service_control_routes_enabled():
         return await _case_service_control_case_events_response(case_id)
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
-        if _case_service_graph_summary_routes_enabled():
-            case = await _case_service_case_for_identifier(case_id)
-            if case is not None:
-                return await _case_service_control_case_events_response(case.case_id)
         raise HTTPException(status_code=404, detail="Case not found")
     return {"status": "ok", "events": await graph_runtime.INCIDENT_MEMORY.case_events(resolved)}
 
@@ -1925,15 +1921,11 @@ async def control_case_comment(
     x_noc_control_token: str | None = Header(default=None),
 ):
     _require_control_request(request, token, x_noc_control_token)
-    if _case_service_control_primary_enabled():
+    if _case_service_control_routes_enabled():
         case = await _require_case_service_control_case(case_id)
         return await _case_service_control_comment_response(case, request_body)
     case = await graph_runtime.INCIDENT_MEMORY.append_operator_comment(case_id, request_body.operator, request_body.comment)
     if case is None:
-        if _case_service_graph_summary_routes_enabled():
-            case_service_case = await _case_service_case_for_identifier(case_id)
-            if case_service_case is not None:
-                return await _case_service_control_comment_response(case_service_case, request_body)
         raise HTTPException(status_code=404, detail="Case not found")
     await _record_case_service_operator_feedback(
         case_id,
@@ -1954,15 +1946,11 @@ async def control_case_decision(
     x_noc_control_token: str | None = Header(default=None),
 ):
     _require_control_request(request, token, x_noc_control_token)
-    if _case_service_control_primary_enabled():
+    if _case_service_control_routes_enabled():
         case = await _require_case_service_control_case(case_id)
         return await _case_service_control_decision_response(case, request_body)
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
-        if _case_service_graph_summary_routes_enabled():
-            case_service_case = await _case_service_case_for_identifier(case_id)
-            if case_service_case is not None:
-                return await _case_service_control_decision_response(case_service_case, request_body)
         raise HTTPException(status_code=404, detail="Case not found")
     decision = ApprovalDecision(incident_id=resolved, **request_body.model_dump())
     summary = await record_operator_decision(resolved, decision.model_dump(), mcp_runtime=mcp_runtime)
@@ -1993,7 +1981,7 @@ async def control_manual_investigation(
 ):
     _require_control_request(request, token, x_noc_control_token)
     alert_payload = _manual_investigation_payload(request_body.prompt, "web", request_body.operator)
-    if _case_service_control_primary_enabled():
+    if _case_service_control_routes_enabled():
         _require_case_service_runtime()
         results = await _shadow_observe_alert_payload(alert_payload)
         case = next((getattr(result, "case", None) for result in results if getattr(result, "case", None) is not None), None)
