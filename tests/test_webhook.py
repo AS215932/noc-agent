@@ -1,3 +1,4 @@
+import asyncio
 from copy import deepcopy
 
 import pytest
@@ -392,6 +393,25 @@ async def test_alertmanager_webhook_reactive_primary_marks_investigation_started
 
     assert second["incident_id"] == response["incident_id"]
     background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_claims_single_concurrent_duplicate_investigation(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    setup_payload = deepcopy(mock_alert_payload)
+    setup_payload["source"] = "alertmanager"
+    await _shadow_observe_alert_payload(setup_payload)
+    first_tasks = mocker.Mock()
+    second_tasks = mocker.Mock()
+
+    await asyncio.gather(
+        alertmanager_webhook(AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)), first_tasks),
+        alertmanager_webhook(AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)), second_tasks),
+    )
+
+    assert first_tasks.add_task.call_count + second_tasks.add_task.call_count == 1
 
 
 @pytest.mark.asyncio

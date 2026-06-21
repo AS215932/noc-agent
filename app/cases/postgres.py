@@ -58,15 +58,20 @@ class PostgresCaseStore:
 
     async def put_observation(self, observation: ObservationRecord) -> ObservationRecord:
         payload = observation.model_dump(mode="json")
+        conflict_clause = (
+            "ON CONFLICT (dedup_key) WHERE dedup_key <> '' DO UPDATE SET dedup_key = observations.dedup_key"
+            if observation.dedup_key
+            else "ON CONFLICT (observation_id) DO UPDATE SET observation_id = observations.observation_id"
+        )
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 INSERT INTO observations (
                     observation_id, source, detector, status, severity, dedup_key,
                     source_event_id, source_fingerprint, observed_at, received_at,
                     scan_cycle_id, signal_signature, source_health, payload, schema_version
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
-                ON CONFLICT (observation_id) DO UPDATE SET observation_id = observations.observation_id
+                {conflict_clause}
                 RETURNING payload
                 """,
                 observation.observation_id,
@@ -125,6 +130,57 @@ class PostgresCaseStore:
                 case.schema_version,
             )
         return _case_from_payload(_row_payload(row))
+
+    async def claim_investigation(
+        self,
+        case_id: str,
+        *,
+        expected_signal_signature: str,
+        expected_diagnosis_signature: str,
+        expected_last_investigated_at: str,
+        status: str,
+        policy_version: str,
+        now: str,
+    ) -> AtomicCaseProjection | None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", case_id)
+                if not row:
+                    return None
+                case = _case_from_payload(_row_payload(row))
+                if not isinstance(case, AtomicCaseProjection):
+                    return None
+                if (
+                    case.signal_signature != expected_signal_signature
+                    or case.diagnosis_signature != expected_diagnosis_signature
+                    or case.last_investigated_at != expected_last_investigated_at
+                ):
+                    return None
+                case.last_investigated_at = now
+                case.diagnosis_signature = case.signal_signature or case.fingerprint or case.case_id
+                case.investigation_status = status
+                case.investigation_error = ""
+                case.updated_at = now
+                case.policy_version = policy_version
+                payload = case.model_dump(mode="json")
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE cases SET
+                        status = $2,
+                        updated_at = $3,
+                        payload = $4::jsonb,
+                        row_version = cases.row_version + 1,
+                        schema_version = $5
+                    WHERE case_id = $1
+                    RETURNING payload
+                    """,
+                    case.case_id,
+                    case.status,
+                    case.updated_at,
+                    json.dumps(payload),
+                    case.schema_version,
+                )
+        return cast(AtomicCaseProjection, _case_from_payload(_row_payload(updated)))
 
     async def get_case(self, case_id: str) -> CaseProjection | None:
         async with self.pool.acquire() as conn:

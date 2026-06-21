@@ -33,6 +33,18 @@ class CaseStore(Protocol):
 
     async def upsert_case(self, case: CaseProjection) -> CaseProjection: ...
 
+    async def claim_investigation(
+        self,
+        case_id: str,
+        *,
+        expected_signal_signature: str,
+        expected_diagnosis_signature: str,
+        expected_last_investigated_at: str,
+        status: str,
+        policy_version: str,
+        now: str,
+    ) -> AtomicCaseProjection | None: ...
+
     async def get_case(self, case_id: str) -> CaseProjection | None: ...
 
     async def list_cases(self, *, kind: str | None = None, limit: int = 100) -> list[CaseProjection]: ...
@@ -100,6 +112,37 @@ class InMemoryCaseStore:
             stored = case.model_copy(deep=True)
             self._cases[stored.case_id] = stored
             return stored.model_copy(deep=True)
+
+    async def claim_investigation(
+        self,
+        case_id: str,
+        *,
+        expected_signal_signature: str,
+        expected_diagnosis_signature: str,
+        expected_last_investigated_at: str,
+        status: str,
+        policy_version: str,
+        now: str,
+    ) -> AtomicCaseProjection | None:
+        async with self._lock:
+            case = self._cases.get(str(case_id or ""))
+            if not isinstance(case, AtomicCaseProjection):
+                return None
+            if (
+                case.signal_signature != expected_signal_signature
+                or case.diagnosis_signature != expected_diagnosis_signature
+                or case.last_investigated_at != expected_last_investigated_at
+            ):
+                return None
+            claimed = case.model_copy(deep=True)
+            claimed.last_investigated_at = now
+            claimed.diagnosis_signature = claimed.signal_signature or claimed.fingerprint or claimed.case_id
+            claimed.investigation_status = status
+            claimed.investigation_error = ""
+            claimed.updated_at = now
+            claimed.policy_version = policy_version
+            self._cases[claimed.case_id] = claimed
+            return claimed.model_copy(deep=True)
 
     async def get_case(self, case_id: str) -> CaseProjection | None:
         async with self._lock:

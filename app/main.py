@@ -1370,7 +1370,8 @@ async def _case_service_reactive_primary_response(alert_payload: dict, backgroun
     case = getattr(result, "case", None) if result is not None else None
     investigation_case = getattr(investigation_result, "case", None) if investigation_result is not None else None
     if investigation_case is not None:
-        investigation_case = await case_service_runtime.service.mark_investigation_started(investigation_case.case_id)
+        investigation_case = await case_service_runtime.service.claim_investigation(investigation_case)
+    if investigation_case is not None:
         investigation_payload = _case_service_alert_payload_for_result(alert_payload, investigation_result)
         background_tasks.add_task(
             investigate_alert,

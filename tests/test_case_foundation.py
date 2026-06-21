@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -388,7 +389,8 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert created.case is not None
     assert service.should_investigate(created.case)
 
-    started = await service.mark_investigation_started(created.case.case_id)
+    started = await service.claim_investigation(created.case)
+    assert started is not None
     assert not service.should_investigate(started)
     assert started.investigation_status == "in_progress"
     assert started.diagnosis_signature == started.signal_signature
@@ -412,6 +414,26 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert changed.case is not None
     assert service.should_investigate(changed.case)
     assert [event.event_type for event in await store.case_events(changed.case.case_id)][-1] == "case_signal_changed"
+
+
+@pytest.mark.asyncio
+async def test_case_service_investigation_claim_is_atomic_for_stale_cases():
+    store = InMemoryCaseStore()
+    service = CaseService(store, policy=CasePolicy(investigation_cooldown_s=3600))
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="bgp_session", resource="rtr1", status="firing")
+    )
+    assert created.case is not None
+
+    first, second = await asyncio.gather(
+        service.claim_investigation(created.case),
+        service.claim_investigation(created.case),
+    )
+
+    claims = [claim for claim in (first, second) if claim is not None]
+    assert len(claims) == 1
+    assert not service.should_investigate(claims[0])
+    assert [event.event_type for event in await store.case_events(created.case.case_id)].count("investigation_started") == 1
 
 
 @pytest.mark.asyncio
