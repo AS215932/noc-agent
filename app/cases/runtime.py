@@ -42,7 +42,7 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
     return await processor.process_pending(limit=limit or _env_int("NOC_CASE_OUTBOX_LIMIT", 10))
 
 
-async def build_case_service_runtime_from_env() -> CaseServiceRuntime | None:
+async def build_case_service_runtime_from_env(*, force: bool = False) -> CaseServiceRuntime | None:
     """Build optional CaseService runtime.
 
     `NOC_CASESERVICE_SHADOW=1` enables shadow writes. Primary cutover flags
@@ -54,7 +54,8 @@ async def build_case_service_runtime_from_env() -> CaseServiceRuntime | None:
     """
 
     if not (
-        _env_bool("NOC_CASESERVICE_SHADOW", False)
+        force
+        or _env_bool("NOC_CASESERVICE_SHADOW", False)
         or _env_bool("NOC_CASESERVICE_CONTROL_PRIMARY", False)
         or _env_bool("NOC_CASESERVICE_REACTIVE_PRIMARY", False)
         or _env_bool("NOC_PROACTIVE_ENABLED", False)

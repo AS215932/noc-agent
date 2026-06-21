@@ -7,9 +7,14 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from app import log
-from app.graph_runtime import pending_summaries, record_operator_decision, run_investigation_graph, summary_for
+from app.cases.graph_memory import CaseServiceGraphMemory
+from app.cases.models import ObservationRecord
+from app.cases.runtime import build_case_service_runtime_from_env
+from app.graph_runtime import record_operator_decision as _record_graph_operator_decision
+from app.graph_runtime import run_investigation_graph
 from app.mcp_runtime import MCPRuntime
 from app.safe_errors import classify_exception, log_exception
 
@@ -26,6 +31,7 @@ DEFAULT_INVESTIGATION_TIMEOUT_SECONDS = 240
 THREAD_MESSAGE_LIMIT = 1400
 INCIDENT_ID_RE = re.compile(r"^(?:inc|incident)[-_][0-9a-f-]+$", re.IGNORECASE)
 CASE_NUMBER_RE = re.compile(r"^NOC-\d{8}-\d{3}$", re.IGNORECASE)
+_DISCORD_CASE_SERVICE_RUNTIME = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,46 @@ class OperatorResponse:
     incident_id: str | None = None
 
 
+def _current_case_service_runtime():
+    import sys
+
+    main_module = sys.modules.get("app.main")
+    runtime = getattr(main_module, "case_service_runtime", None) if main_module is not None else None
+    return runtime or _DISCORD_CASE_SERVICE_RUNTIME
+
+
+async def pending_summaries(*, case_service_runtime=None) -> list[dict[str, Any]]:
+    runtime = case_service_runtime or _current_case_service_runtime()
+    if runtime is None:
+        return []
+    return await CaseServiceGraphMemory(runtime.store).list_summaries()
+
+
+async def summary_for(incident_id: str, *, case_service_runtime=None) -> dict[str, Any] | None:
+    runtime = case_service_runtime or _current_case_service_runtime()
+    if runtime is None:
+        return None
+    return await CaseServiceGraphMemory(runtime.store).get_summary(incident_id)
+
+
+async def record_operator_decision(
+    incident_id: str,
+    decision: dict[str, Any],
+    *,
+    mcp_runtime=None,
+    case_service_runtime=None,
+) -> dict[str, Any] | None:
+    runtime = case_service_runtime or _current_case_service_runtime()
+    if runtime is None:
+        return None
+    return await _record_graph_operator_decision(
+        incident_id,
+        decision,
+        mcp_runtime=mcp_runtime,
+        incident_memory=CaseServiceGraphMemory(runtime.store),
+    )
+
+
 class NOCDiscordBot:
     def __init__(self):
         if discord is None or app_commands is None:
@@ -74,6 +120,7 @@ class NOCDiscordBot:
             os.getenv("DISCORD_INVESTIGATION_TIMEOUT_SECONDS", str(DEFAULT_INVESTIGATION_TIMEOUT_SECONDS))
         )
         self._mcp_runtime = MCPRuntime(owner="discord_bot")
+        self._case_service_runtime = None
         self._tasks: set[asyncio.Task] = set()
         self._max_case_messages = int(os.getenv("DISCORD_CASE_MESSAGE_CACHE_MAX", "1000"))
         self._case_messages = OrderedDict()
@@ -86,10 +133,12 @@ class NOCDiscordBot:
             return
         log.info("discord_bot_starting")
         try:
+            await self._ensure_case_service_runtime()
             await self._mcp_runtime.connect_tools()
             await self.client.start(token)
         finally:
             await self._mcp_runtime.disconnect()
+            await self._close_owned_case_service_runtime()
 
     async def send_embed(self, title: str, description: str, color: int, fields: list[dict[str, Any]] | None = None):
         if self.channel_id is None:
@@ -161,7 +210,7 @@ class NOCDiscordBot:
             if not await self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
-            incidents = await pending_summaries()
+            incidents = await self._pending_summaries()
             if not incidents:
                 await interaction.response.send_message("No pending NOC proposals.", ephemeral=True)
                 return
@@ -177,7 +226,7 @@ class NOCDiscordBot:
             if not await self._authorized(interaction):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
-            summary = await summary_for(incident_id)
+            summary = await self._summary_for(incident_id)
             await interaction.response.send_message(
                 "Incident not found." if summary is None else _summary_line(summary),
                 ephemeral=True,
@@ -189,7 +238,7 @@ class NOCDiscordBot:
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
             operator = str(getattr(interaction.user, "id", "discord"))
-            summary = await _maybe_await(record_operator_decision(
+            summary = await self._record_operator_decision(
                 incident_id,
                 {
                     "incident_id": incident_id,
@@ -197,7 +246,7 @@ class NOCDiscordBot:
                     "operator": operator,
                     "comment": comment,
                 },
-            ))
+            )
             await interaction.response.send_message(
                 "Incident not found." if summary is None else f"Recorded `{decision}` for `{summary.get('case_number') or incident_id}` (`{summary.get('incident_id')}`).",
                 ephemeral=True,
@@ -271,6 +320,44 @@ class NOCDiscordBot:
         ]
         return "\n".join(lines)
 
+    async def _ensure_case_service_runtime(self):
+        global _DISCORD_CASE_SERVICE_RUNTIME
+        shared = _current_case_service_runtime()
+        if shared is not None:
+            return shared
+        if self._case_service_runtime is None:
+            self._case_service_runtime = await build_case_service_runtime_from_env(force=True)
+            _DISCORD_CASE_SERVICE_RUNTIME = self._case_service_runtime
+        return self._case_service_runtime
+
+    async def _close_owned_case_service_runtime(self) -> None:
+        global _DISCORD_CASE_SERVICE_RUNTIME
+        if self._case_service_runtime is None:
+            return
+        close = getattr(self._case_service_runtime, "close", None)
+        if close is not None:
+            await close()
+        if _DISCORD_CASE_SERVICE_RUNTIME is self._case_service_runtime:
+            _DISCORD_CASE_SERVICE_RUNTIME = None
+        self._case_service_runtime = None
+
+    async def _pending_summaries(self) -> list[dict[str, Any]]:
+        runtime = await self._ensure_case_service_runtime()
+        return await pending_summaries(case_service_runtime=runtime)
+
+    async def _summary_for(self, incident_id: str) -> dict[str, Any] | None:
+        runtime = await self._ensure_case_service_runtime()
+        return await summary_for(incident_id, case_service_runtime=runtime)
+
+    async def _record_operator_decision(self, incident_id: str, decision: dict[str, Any]) -> dict[str, Any] | None:
+        runtime = await self._ensure_case_service_runtime()
+        return await _maybe_await(record_operator_decision(
+            incident_id,
+            decision,
+            mcp_runtime=self._mcp_runtime,
+            case_service_runtime=runtime,
+        ))
+
     async def handle_investigation_interaction(self, interaction, prompt: str) -> None:
         if not await self._authorized(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
@@ -341,7 +428,7 @@ class NOCDiscordBot:
             return
 
         if intent.type == "decision":
-            summary = await _maybe_await(record_operator_decision(
+            summary = await self._record_operator_decision(
                 intent.incident_id,
                 {
                     "incident_id": intent.incident_id,
@@ -349,7 +436,7 @@ class NOCDiscordBot:
                     "operator": operator,
                     "comment": intent.comment,
                 },
-            ))
+            )
             await _safe_send(
                 message.reply,
                 "Incident not found." if summary is None else f"Recorded `{intent.decision}` for `{summary.get('case_number') or intent.incident_id}` (`{summary.get('incident_id')}`).",
@@ -386,8 +473,11 @@ class NOCDiscordBot:
         try:
             await send("Investigation is running. I am collecting context and building a proposal.")
             payload = _operator_investigation_payload(prompt, source)
+            case_service_runtime = await self._ensure_case_service_runtime()
+            graph_memory = CaseServiceGraphMemory(case_service_runtime.store)
+            graph_case = await _create_operator_graph_case(case_service_runtime, graph_memory, payload, prompt, source)
             plan, state = await asyncio.wait_for(
-                run_investigation_graph(payload),
+                run_investigation_graph(payload, case=graph_case, incident_memory=graph_memory),
                 timeout=self.investigation_timeout_s,
             )
             incident_id = state["incident_id"]
@@ -537,19 +627,69 @@ def main() -> None:
 
 
 def _operator_investigation_payload(prompt: str, source: str) -> dict[str, Any]:
+    safe_prompt = _sanitize_operator_text(prompt, limit=1000)
     return {
         "source": source,
         "status": "firing",
         "groupLabels": {"alertname": "Operator Investigation", "host": "manual"},
-        "commonLabels": {"severity": "manual"},
-        "commonAnnotations": {"summary": prompt},
+        "commonLabels": {"severity": "manual", "untrusted_operator_text": "true"},
+        "commonAnnotations": {"summary": safe_prompt},
         "alerts": [
             {
-                "labels": {"alertname": "Operator Investigation", "host": "manual"},
-                "annotations": {"summary": prompt},
+                "labels": {"alertname": "Operator Investigation", "host": "manual", "untrusted_operator_text": "true"},
+                "annotations": {"summary": safe_prompt},
             }
         ],
     }
+
+
+async def _create_operator_graph_case(case_service_runtime, graph_memory: CaseServiceGraphMemory, payload: dict[str, Any], prompt: str, source: str) -> dict[str, Any]:
+    source_event_id = f"{source}:{uuid4().hex[:12]}"
+    safe_prompt = _sanitize_operator_text(prompt, limit=1000)
+    result = await case_service_runtime.service.observe(
+        ObservationRecord(
+            source=source,
+            source_event_id=source_event_id,
+            source_fingerprint=source_event_id,
+            dedup_key=source_event_id,
+            detector="Operator Investigation",
+            rule_id="operator_investigation",
+            entity="manual",
+            resource="manual",
+            severity="UNKNOWN",
+            status="firing",
+            labels={"source": source, "untrusted_operator_text": "true"},
+            annotations={"summary": safe_prompt},
+            signal_snapshot={"prompt": safe_prompt, "source": source},
+            observation_confidence="medium",
+        )
+    )
+    case = getattr(result, "case", None)
+    if case is None:
+        raise RuntimeError("CaseService did not create an operator investigation case")
+    claimed = await case_service_runtime.service.claim_investigation(case)
+    graph_case = await graph_memory.get_case((claimed or case).case_id)
+    if graph_case is None:
+        raise RuntimeError("CaseService graph case not found for operator investigation")
+    graph_case["latest_event"] = graph_case.get("latest_event") or {
+        "received_at": graph_case.get("created_at", ""),
+        "state": "firing",
+        "summary": safe_prompt,
+    }
+    return graph_case
+
+
+def _sanitize_operator_text(value: object, *, limit: int) -> str:
+    text = str(value or "")
+    blocked = set("`<>[]{}")
+    cleaned = []
+    for ch in text:
+        if ch in blocked or ord(ch) < 32:
+            cleaned.append(" ")
+        else:
+            cleaned.append(ch)
+    rendered = " ".join("".join(cleaned).split())
+    return (rendered or "operator requested investigation")[:limit]
 
 
 def parse_discord_operator_request(text: str) -> OperatorIntent:

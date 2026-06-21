@@ -1,9 +1,8 @@
 """Case-grounded state-machine foundation.
 
-This package is intentionally dormant at first: it defines the typed contracts
-and store boundary that later phases will wire into the proactive loop and
-reactive IncidentMemory. Runtime behavior remains owned by the existing modules
-until the strangler flips land.
+This package defines the typed contracts and store boundary used by the
+CaseService-backed proactive, reactive-primary, and control-primary paths.
+Legacy IncidentMemory remains only as a deletion candidate for old tests.
 """
 
 from app.cases.correlation import CorrelationService, MetaCaseResult, event_fingerprint_from_parts

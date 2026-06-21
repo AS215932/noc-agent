@@ -7,36 +7,37 @@ from uuid import uuid4
 from langgraph.types import Command
 
 from app.agents.triage import DiagnosticSynthesis
+from app.alert_utils import case_event_from_alert
 from app.deps.runtime import RuntimeDeps
 from app.graph.graph import build_graph
 from app.graph.routing import resource_id_from_alert
 from app.graph.state import WorkflowState, assert_json_serializable_state, utc_now
-from app.incident_memory import CaseIntakeResult, IncidentMemory, case_event_from_alert
 
 
-INCIDENT_MEMORY = IncidentMemory()
 _GRAPH = None
 _THREAD_GRAPHS: dict[str, Any] = {}
 
 
-async def intake_alert(alert_payload: dict[str, Any]) -> CaseIntakeResult:
-    return await INCIDENT_MEMORY.intake_alert(alert_payload)
+def _require_graph_case(case: dict[str, Any] | None) -> dict[str, Any]:
+    if not case:
+        raise RuntimeError("Investigation graph requires an explicit case")
+    return case
 
 
-def _graph_memory_for_case(case: dict[str, Any] | None, incident_memory=None):
-    if case and case.get("source") == "case_service" and incident_memory is None:
-        raise RuntimeError("CaseService graph runs require explicit graph memory")
-    return incident_memory or INCIDENT_MEMORY
+def _require_graph_memory(incident_memory=None):
+    if incident_memory is None:
+        raise RuntimeError("Investigation graph requires explicit graph memory")
+    return incident_memory
 
 
 async def inject_case_event(case: dict[str, Any], event: dict[str, Any], *, incident_memory=None) -> bool:
-    memory = _graph_memory_for_case(case, incident_memory)
+    memory = _require_graph_memory(incident_memory)
     thread_id = case.get("thread_id")
     if not thread_id:
         return False
     graph = _THREAD_GRAPHS.get(thread_id) or await _graph(
         RuntimeDeps.build(incident_memory=memory),
-        cache=incident_memory is None,
+        cache=False,
     )
     context = await memory.case_context(case["incident_id"])
     config = {"configurable": {"thread_id": thread_id}}
@@ -71,28 +72,6 @@ async def inject_case_event(case: dict[str, Any], event: dict[str, Any], *, inci
         return True
 
 
-async def link_to_parent_case(
-    child_case_id: str,
-    parent_case_id: str,
-    reason: str,
-    evidence_refs: list[str] | None = None,
-) -> dict[str, Any]:
-    result = await INCIDENT_MEMORY.link_to_parent_case(child_case_id, parent_case_id, reason, evidence_refs or [])
-    parent = result.get("parent_case") if isinstance(result, dict) else None
-    if parent:
-        await inject_case_event(
-            parent,
-            {
-                "received_at": utc_now(),
-                "event_type": "linked_child_case",
-                "child_case_id": child_case_id,
-                "summary": reason,
-                "evidence_refs": list(evidence_refs or []),
-            },
-        )
-    return result
-
-
 async def run_investigation_graph(
     alert_payload: dict[str, Any],
     model=None,
@@ -101,26 +80,24 @@ async def run_investigation_graph(
     *,
     incident_memory=None,
 ) -> tuple[DiagnosticSynthesis, WorkflowState]:
-    memory = _graph_memory_for_case(case, incident_memory)
-    if case is None:
-        intake = await memory.intake_alert(alert_payload)
-        case = intake.case
-    incident_id = case["incident_id"] if case else str(uuid4())
-    thread_id = case.get("thread_id") if case and case.get("thread_id") else str(uuid4())
-    case_context = await memory.case_context(incident_id) if case else {}
+    case = _require_graph_case(case)
+    memory = _require_graph_memory(incident_memory)
+    incident_id = case["incident_id"]
+    thread_id = case.get("thread_id") or str(uuid4())
+    case_context = await memory.case_context(incident_id)
     latest_event = (
         case.get("latest_event")
-        if case and case.get("latest_event")
+        if case.get("latest_event")
         else case_context.get("event_timeline", [{}])[-1]
         if case_context.get("event_timeline")
         else case_event_from_alert(alert_payload)
     )
     state: WorkflowState = {
         "incident_id": incident_id,
-        "case_number": case.get("case_number", "") if case else "",
-        "case_status": case.get("status", "") if case else "",
-        "case_event_count": int(case.get("event_count", 0)) if case else 1,
-        "fingerprint": case.get("fingerprint", "") if case else "",
+        "case_number": case.get("case_number", ""),
+        "case_status": case.get("status", ""),
+        "case_event_count": int(case.get("event_count", 0)),
+        "fingerprint": case.get("fingerprint", ""),
         "thread_id": thread_id,
         "current_step": "start",
         "created_at": utc_now(),
@@ -129,10 +106,10 @@ async def run_investigation_graph(
         "resource_id": resource_id_from_alert(alert_payload),
         "related_alerts": [_jsonish_dict(alert_payload)],
         "latest_event": _jsonish_dict(latest_event),
-        "latest_transition": case.get("latest_transition") if case else None,
+        "latest_transition": case.get("latest_transition"),
         "case_context": _jsonish_dict(case_context),
-        "downstream_victims": list(case.get("downstream_victims", [])) if case else [],
-        "needs_reassessment": bool(case.get("needs_reassessment", False)) if case else False,
+        "downstream_victims": list(case.get("downstream_victims", [])),
+        "needs_reassessment": bool(case.get("needs_reassessment", False)),
         "incident_history": [],
         "history_summary": {},
         "telemetry_cache": {},
@@ -153,36 +130,25 @@ async def run_investigation_graph(
         mcp_runtime=mcp_runtime,
         model_override=model,
     )
-    graph = await _graph(runtime, cache=model is None and mcp_runtime is None and incident_memory is None)
+    graph = await _graph(runtime, cache=False)
     _THREAD_GRAPHS[thread_id] = graph
-    if case:
-        await memory.set_case_thread(incident_id, thread_id)
+    await memory.set_case_thread(incident_id, thread_id)
     result_state = await graph.ainvoke(
         state,
         {"configurable": {"thread_id": thread_id}},
     )
     result_state = {key: value for key, value in result_state.items() if key != "__interrupt__"}
     synthesis = DiagnosticSynthesis.model_validate(result_state["diagnostic_synthesis"])
-    if case:
-        await memory.update_case(
-            incident_id,
-            {
-                "status": "waiting_approval",
-                "thread_id": thread_id,
-                "diagnostic_summary": synthesis.incident_summary,
-                "case_context": await memory.case_context(incident_id),
-            },
-        )
+    await memory.update_case(
+        incident_id,
+        {
+            "status": "waiting_approval",
+            "thread_id": thread_id,
+            "diagnostic_summary": synthesis.incident_summary,
+            "case_context": await memory.case_context(incident_id),
+        },
+    )
     return synthesis, result_state
-
-
-async def pending_summaries() -> list[dict[str, Any]]:
-    return await INCIDENT_MEMORY.list_summaries()
-
-
-async def summary_for(incident_id: str) -> dict[str, Any] | None:
-    resolved = await INCIDENT_MEMORY.resolve_case_identifier(incident_id)
-    return await INCIDENT_MEMORY.get_summary(resolved or incident_id)
 
 
 async def record_operator_decision(
@@ -192,7 +158,7 @@ async def record_operator_decision(
     *,
     incident_memory=None,
 ) -> dict[str, Any] | None:
-    memory = incident_memory or INCIDENT_MEMORY
+    memory = _require_graph_memory(incident_memory)
     resolved = await memory.resolve_case_identifier(incident_id)
     incident_id = resolved or incident_id
     decision = {**decision, "incident_id": incident_id}
@@ -239,7 +205,7 @@ async def resume_investigation(
     *,
     incident_memory=None,
 ) -> WorkflowState | None:
-    memory = incident_memory or INCIDENT_MEMORY
+    memory = _require_graph_memory(incident_memory)
     resolved = await memory.resolve_case_identifier(incident_id)
     incident_id = resolved or incident_id
     summary = await memory.get_summary(incident_id)
@@ -248,7 +214,7 @@ async def resume_investigation(
     runtime = RuntimeDeps.build(incident_memory=memory, mcp_runtime=mcp_runtime)
     graph = _THREAD_GRAPHS.get(summary["thread_id"]) or await _graph(
         runtime,
-        cache=mcp_runtime is None and incident_memory is None,
+        cache=False,
     )
     state = await graph.ainvoke(
         Command(resume=decision),

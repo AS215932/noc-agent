@@ -26,7 +26,6 @@ from app.main import (
 from app.agent import DiagnosticSynthesis
 from app.cases import CaseService, InMemoryCaseStore
 from app.incident_memory import IncidentMemory
-import app.graph_runtime as graph_runtime
 import app.main as main_module
 from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
@@ -37,23 +36,15 @@ def restore_runtime_globals():
     """Keep module-level runtime singletons isolated across webhook tests."""
 
     original_case_service_runtime = main_module.case_service_runtime
-    original_incident_memory = graph_runtime.INCIDENT_MEMORY
     yield
     main_module.case_service_runtime = original_case_service_runtime
-    graph_runtime.INCIDENT_MEMORY = original_incident_memory
 
 
 @pytest.fixture
 def isolated_incident_memory():
-    """Install a fresh IncidentMemory and restore the process global after the test."""
+    """Provide a fresh legacy IncidentMemory for no-fallback assertions."""
 
-    original = graph_runtime.INCIDENT_MEMORY
-    memory = IncidentMemory(redis_url="")
-    graph_runtime.INCIDENT_MEMORY = memory
-    try:
-        yield memory
-    finally:
-        graph_runtime.INCIDENT_MEMORY = original
+    yield IncidentMemory(redis_url="")
 
 
 @pytest.fixture
@@ -562,7 +553,7 @@ async def test_mail_poll_accepted(mocker):
 # --- TDD / Future Capabilities Tests ---
 
 @pytest.mark.asyncio
-async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload):
+async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload, isolated_case_service_runtime):
     """
     [TDD Goal] In the future, once the investigation background task runs,
     it should send a summary to a specified Discord Webhook URL.
@@ -575,10 +566,19 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload)
     
     # Use TestModel so we don't actually hit the LLM
     from pydantic_ai.models.test import TestModel
-    from app.agent import noc_triage_agent
-    
+    from app.cases.graph_memory import CaseServiceGraphMemory
+    from app.cases.notifications import observations_from_alertmanager
+
+    _runtime, service, store = isolated_case_service_runtime
+    observation = observations_from_alertmanager({**mock_alert_payload, "source": "alertmanager"})[0]
+    observed = await service.observe(observation)
+    assert observed.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+    graph_case = await graph_memory.get_case(observed.case.case_id)
+    assert graph_case is not None
+
     # Run the test directly overriding the model logic for the scope of the method call
-    await investigate_alert(mock_alert_payload, model=TestModel())
+    await investigate_alert(mock_alert_payload, model=TestModel(), case=graph_case, graph_memory=graph_memory)
 
     assert mock_case_discord.call_count == 2
     titles = [call.kwargs["title"] for call in mock_case_discord.call_args_list]

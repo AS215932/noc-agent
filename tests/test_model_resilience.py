@@ -9,6 +9,9 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from app.agent import DiagnosticSynthesis
+from app.cases import CaseService, InMemoryCaseStore
+from app.cases.graph_memory import CaseServiceGraphMemory
+from app.cases.notifications import observations_from_alertmanager
 from app.main import health_model, investigate_alert, metrics
 from app.model_config import load_model_config
 from app.model_metrics import STATE
@@ -196,8 +199,21 @@ async def test_investigate_alert_sanitizes_provider_failure(mock_alert_payload, 
         )
 
     send_discord = mocker.patch("app.discord.send_discord_notification")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    observation = observations_from_alertmanager({**mock_alert_payload, "source": "alertmanager"})[0]
+    observed = await service.observe(observation)
+    assert observed.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+    graph_case = await graph_memory.get_case(observed.case.case_id)
+    assert graph_case is not None
 
-    await investigate_alert(mock_alert_payload, model=FunctionModel(fail_with_quota, model_name="gemini-3.1-pro-preview"))
+    await investigate_alert(
+        mock_alert_payload,
+        model=FunctionModel(fail_with_quota, model_name="gemini-3.1-pro-preview"),
+        case=graph_case,
+        graph_memory=graph_memory,
+    )
 
     descriptions = [call.kwargs.get("description", "") for call in send_discord.call_args_list]
     combined = "\n".join(descriptions)
