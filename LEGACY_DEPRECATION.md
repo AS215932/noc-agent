@@ -7,23 +7,22 @@ only until the next removal tranches delete the old implementation and tests.
 ## Current cutover state
 
 - `NOC_CASESERVICE_REACTIVE_PRIMARY=1` routes Alertmanager/Icinga intake to CaseService and does not call legacy `IncidentMemory.intake_alert`.
-- Reactive webhooks now fail loudly with `503` when reactive-primary is not enabled; the legacy reactive webhook fallback has been removed.
+- Reactive webhooks fail loudly with `503` when reactive-primary is not enabled; the legacy reactive webhook fallback has been removed.
 - `NOC_CASESERVICE_CONTROL_PRIMARY=1` routes `/control/cases` to CaseService.
 - `NOC_CASESERVICE_REACTIVE_PRIMARY=1` also routes `/control/cases` list/detail/events/comments/decisions/manual investigations to CaseService so reactive-primary cases remain operator-visible without legacy fallback.
-- Legacy `/control/cases` and `/control/incidents` fallback paths now return `410` when no CaseService primary route is active.
-- Proactive investigations now create/claim CaseService cases and use CaseService-backed graph memory instead of legacy `IncidentMemory`.
+- Legacy `/control/cases` and `/control/incidents` fallback paths return `410` when no CaseService primary route is active.
+- Proactive investigations create/claim CaseService cases and use CaseService-backed graph memory instead of legacy `IncidentMemory`.
 - `NOC_PROACTIVE_ENABLED=1` starts the CaseService runtime for proactive case ownership even when shadow/reactive/control flags are unset, and routes `/control/cases` to CaseService for proactive case links.
-- CaseService graph runs must pass an explicit CaseService graph memory adapter; graph runtime rejects CaseService graph cases that would otherwise fall back to legacy memory.
+- Graph runtime no longer owns legacy intake/list/detail fallbacks. Graph execution, event injection, resume, and operator decisions require explicit case + graph memory.
+- Shared alert identity/display helpers now live in `app/alert_utils.py` so app paths no longer import `app.incident_memory`.
 
 ## Remaining intentional legacy code
 
-These remain for legacy-only modules/tests and compatibility surfaces that have
-not yet been deleted:
+These remain only until the deletion tranche:
 
 - `app/incident_memory.py`: legacy in-memory/Redis case implementation.
-- `app/graph_runtime.py`: legacy wrappers and global `INCIDENT_MEMORY` for legacy graph tests and any remaining non-CaseService custom embeddings.
-- Legacy tests under `tests/test_case_intake.py` and legacy sections of `tests/test_graph_runtime.py`.
-- Transitional helper imports in `app/main.py` for rendering graph case titles/events until graph runtime owns those shapes directly.
+- `tests/test_case_intake.py`: legacy-only coverage to be deleted or rewritten.
+- A few no-fallback assertions still instantiate `IncidentMemory` directly to prove primary paths do not read it.
 
 ## Required primary-mode rollout
 
@@ -43,7 +42,6 @@ ownership.
 
 ## Next removal candidates
 
-1. Delete legacy-only graph runtime wrappers (`intake_alert`, legacy pending summaries, global default memory) after remaining tests/custom embeddings are moved.
-2. Replace `case_display_title` / `case_event_from_alert` imports with CaseService/graph-owned helpers.
-3. Delete `app/incident_memory.py` and legacy-only tests.
-4. Re-run a repo-wide dead-code sweep for imports, helpers, docs, and flags after deletion.
+1. Rewrite/delete legacy-only tests under `tests/test_case_intake.py` and remaining no-fallback direct `IncidentMemory` fixtures.
+2. Delete `app/incident_memory.py`.
+3. Re-run a repo-wide dead-code sweep for imports, helpers, docs, and flags after deletion.

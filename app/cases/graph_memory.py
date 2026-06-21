@@ -2,8 +2,8 @@
 
 This adapter exposes the small incident-memory surface the LangGraph runtime
 needs while storing graph context/summaries on CaseService projections/events.
-It is used for CaseService-primary reactive cases so new case paths no longer
-write graph context through legacy IncidentMemory.
+It is used by CaseService-primary reactive/proactive/control cases so new case
+paths no longer write graph context through legacy IncidentMemory.
 """
 
 from __future__ import annotations

@@ -2,8 +2,8 @@
 
 This is the first dormant service slice: it proves observations can be applied
 through a single owner that writes observations, aliases, projections, events,
-and side-effect intents through a CaseStore. The proactive loop and
-IncidentMemory are not wired to it yet.
+and side-effect intents through a CaseStore. Reactive-primary, proactive,
+and control-primary app paths now use this boundary.
 """
 
 from __future__ import annotations

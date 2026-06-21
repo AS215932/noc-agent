@@ -248,7 +248,7 @@ async def test_wrong_guild_channel_role_is_denied(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_noc_investigate_sends_acceptance_and_final_followup(monkeypatch):
-    async def fake_graph(payload):
+    async def fake_graph(payload, **kwargs):
         return _diagnostic_synthesis(), {"incident_id": "inc-1"}
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
@@ -268,7 +268,7 @@ async def test_noc_investigate_sends_acceptance_and_final_followup(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_noc_investigate_reports_graph_exception(monkeypatch):
-    async def fake_graph(payload):
+    async def fake_graph(payload, **kwargs):
         raise RuntimeError("provider exploded with details")
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
@@ -285,7 +285,7 @@ async def test_noc_investigate_reports_graph_exception(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_noc_investigate_reports_timeout(monkeypatch):
-    async def fake_graph(payload):
+    async def fake_graph(payload, **kwargs):
         await asyncio.sleep(1)
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
@@ -303,7 +303,7 @@ async def test_noc_investigate_reports_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_mention_investigation_uses_same_safe_runner(monkeypatch):
-    async def fake_graph(payload):
+    async def fake_graph(payload, **kwargs):
         assert payload["source"] == "discord-mention"
         assert payload["commonAnnotations"]["summary"] == "noc health"
         return _diagnostic_synthesis(), {"incident_id": "inc-mention"}
@@ -327,7 +327,7 @@ async def test_mention_investigation_uses_same_safe_runner(monkeypatch):
 async def test_status_mention_uses_fast_status_not_graph(monkeypatch):
     graph_called = False
 
-    async def fake_graph(payload):
+    async def fake_graph(payload, **kwargs):
         nonlocal graph_called
         graph_called = True
         return _diagnostic_synthesis(), {"incident_id": "inc-unexpected"}
@@ -407,7 +407,7 @@ async def test_degraded_status_mention_posts_thread(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unknown_mention_returns_help_and_starts_no_work(monkeypatch):
-    async def fake_graph(payload):
+    async def fake_graph(payload, **kwargs):
         raise AssertionError("graph should not run")
 
     monkeypatch.delenv("DISCORD_ALLOWED_ROLE_IDS", raising=False)
@@ -442,7 +442,7 @@ async def test_unauthorized_mention_rejects_before_work(monkeypatch):
 async def test_decision_mention_records_operator_decision(monkeypatch):
     calls = []
 
-    def fake_decision(incident_id, decision):
+    def fake_decision(incident_id, decision, **kwargs):
         calls.append((incident_id, decision))
         return {"incident_id": incident_id, "status": "approved", "title": "Done"}
 

@@ -36,8 +36,8 @@ from app.mcp_runtime import MCPRuntime
 from app.config import load_proactive_settings
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.proactive.loop import ProactiveLoop
+from app.alert_utils import case_display_title, case_event_from_alert
 from app.graph_runtime import record_operator_decision, run_investigation_graph
-from app.incident_memory import case_display_title, case_event_from_alert
 from app.noc_state import ApprovalDecision
 
 mcp_runtime = MCPRuntime(owner="api")

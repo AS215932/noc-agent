@@ -300,8 +300,10 @@ network access or production credentials.
 or degraded, including backend name and pending/failed outbox counts when the
 runtime is enabled. The control plane also exposes read-only CaseService views
 under `/control/case-service/...` for projections, events, traces, feedback, and
-outbox rows. Reactive-primary and control-primary routes read and write
-CaseService case projections instead of `IncidentMemory`.
+outbox rows. Reactive-primary, proactive, Discord, and control-primary routes
+read and write CaseService case projections instead of `IncidentMemory`. Graph
+execution requires an explicit CaseService graph case and graph memory adapter;
+there is no implicit graph-runtime legacy case fallback.
 Prometheus exports `noc_agent_case_service_runtime_enabled`,
 `noc_agent_case_service_shadow_observations_total`,
 `noc_agent_case_service_shadow_failures_total`, and

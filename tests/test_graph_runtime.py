@@ -3,24 +3,57 @@ from pydantic_ai.models.test import TestModel
 
 import app.graph_runtime as graph_runtime
 from app.agents.triage import DiagnosticSynthesis
+from app.alert_utils import case_event_from_alert
 from app.cases import CaseService, InMemoryCaseStore, ObservationRecord
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.graph.nodes import NodeRunner
-from app.incident_memory import IncidentMemory
+
+
+_ALERT = {
+    "status": "firing",
+    "groupLabels": {"alertname": "BGP Peer Down", "host": "rtr"},
+    "commonLabels": {"severity": "critical"},
+    "alerts": [{"labels": {"alertname": "BGP Peer Down", "host": "rtr"}}],
+}
+
+
+async def _case_service_graph_case(alert: dict | None = None):
+    alert = alert or _ALERT
+    labels = {**alert.get("groupLabels", {}), **alert.get("commonLabels", {})}
+    first = (alert.get("alerts") or [{}])[0]
+    labels.update(first.get("labels", {}))
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(
+            source=str(alert.get("source") or "alertmanager"),
+            detector=str(labels.get("alertname") or "alert"),
+            resource=str(labels.get("host") or labels.get("instance") or "rtr"),
+            status="firing",
+            severity="HIGH",
+            signal_snapshot={"summary": "BGP peer is down", "labels": labels},
+        )
+    )
+    assert created.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+    graph_case = await graph_memory.get_case(created.case.case_id)
+    assert graph_case is not None
+    graph_case["latest_event"] = case_event_from_alert(alert)
+    return store, service, graph_memory, graph_case
 
 
 @pytest.mark.asyncio
 async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     monkeypatch.setattr(graph_runtime, "_GRAPH", None)
-    alert = {
-        "status": "firing",
-        "groupLabels": {"alertname": "BGP Peer Down", "host": "rtr"},
-        "commonLabels": {"severity": "critical"},
-        "alerts": [{"labels": {"alertname": "BGP Peer Down", "host": "rtr"}}],
-    }
+    graph_runtime._THREAD_GRAPHS.clear()
+    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
 
-    plan, state = await graph_runtime.run_investigation_graph(alert, model=TestModel())
+    plan, state = await graph_runtime.run_investigation_graph(
+        _ALERT,
+        model=TestModel(),
+        case=graph_case,
+        incident_memory=graph_memory,
+    )
 
     assert plan.incident_summary is not None
     assert "diagnostic_synthesis" in state
@@ -31,7 +64,7 @@ async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
     assert "perimeter_context" not in state
     assert state["perimeter_context_version"]
     assert state["manifest_hash"]
-    summary = await graph_runtime.summary_for(state["incident_id"])
+    summary = await graph_memory.get_summary(state["incident_id"])
     assert summary is not None
     assert summary["status"] == "waiting_approval"
     assert summary["thread_id"] == state["thread_id"]
@@ -39,19 +72,20 @@ async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_graph_resume_uses_stable_thread_id(monkeypatch):
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", IncidentMemory(redis_url=""))
     monkeypatch.setattr(graph_runtime, "_GRAPH", None)
-    alert = {
-        "status": "firing",
-        "groupLabels": {"alertname": "BGP Peer Down", "host": "rtr"},
-        "commonLabels": {"severity": "critical"},
-        "alerts": [{"labels": {"alertname": "BGP Peer Down", "host": "rtr"}}],
-    }
+    graph_runtime._THREAD_GRAPHS.clear()
+    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
 
-    _plan, state = await graph_runtime.run_investigation_graph(alert, model=TestModel())
+    _plan, state = await graph_runtime.run_investigation_graph(
+        _ALERT,
+        model=TestModel(),
+        case=graph_case,
+        incident_memory=graph_memory,
+    )
     resumed = await graph_runtime.resume_investigation(
         state["incident_id"],
         {"decision": "acknowledged", "operator": "pytest", "comment": "ok"},
+        incident_memory=graph_memory,
     )
 
     assert resumed is not None
@@ -59,12 +93,10 @@ async def test_graph_resume_uses_stable_thread_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_case_service_graph_case_requires_explicit_memory(monkeypatch):
-    class FailingLegacyMemory:
-        def __getattr__(self, name):
-            raise AssertionError(f"legacy incident memory used for {name}")
+async def test_graph_requires_explicit_case_and_memory():
+    with pytest.raises(RuntimeError, match="explicit case"):
+        await graph_runtime.run_investigation_graph(_ALERT, model=TestModel(), incident_memory=object())
 
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", FailingLegacyMemory())
     graph_case = {
         "incident_id": "case_123",
         "case_number": "NOC-123",
@@ -73,70 +105,31 @@ async def test_case_service_graph_case_requires_explicit_memory(monkeypatch):
         "thread_id": None,
         "source": "case_service",
     }
-
-    with pytest.raises(RuntimeError, match="CaseService graph runs require explicit graph memory"):
-        await graph_runtime.run_investigation_graph(
-            {"status": "firing", "alerts": [{"labels": {"alertname": "PacketLoss", "instance": "edge1"}}]},
-            model=TestModel(),
-            case=graph_case,
-        )
+    with pytest.raises(RuntimeError, match="explicit graph memory"):
+        await graph_runtime.run_investigation_graph(_ALERT, model=TestModel(), case=graph_case)
 
 
 @pytest.mark.asyncio
 async def test_graph_uses_case_service_memory_when_case_provided(monkeypatch):
-    class FailingLegacyMemory:
-        def __getattr__(self, name):
-            raise AssertionError(f"legacy incident memory used for {name}")
-
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", FailingLegacyMemory())
     monkeypatch.setattr(graph_runtime, "_GRAPH", None)
     graph_runtime._THREAD_GRAPHS.clear()
-    store = InMemoryCaseStore()
-    service = CaseService(store)
-    created = await service.observe(
-        ObservationRecord(
-            source="alertmanager",
-            detector="BGP Peer Down",
-            resource="rtr1",
-            status="firing",
-            severity="HIGH",
-            signal_snapshot={"summary": "BGP peer is down"},
-        )
-    )
-    assert created.case is not None
-    graph_memory = CaseServiceGraphMemory(store)
-    alert = {
-        "status": "firing",
-        "groupLabels": {"alertname": "BGP Peer Down", "host": "rtr1"},
-        "commonLabels": {"severity": "critical"},
-        "alerts": [{"labels": {"alertname": "BGP Peer Down", "host": "rtr1"}}],
-    }
-    graph_case = {
-        "incident_id": created.case.case_id,
-        "case_number": created.case.case_number,
-        "fingerprint": created.case.fingerprint,
-        "resource_id": created.case.resource_id,
-        "status": created.case.status,
-        "latest_event": {"received_at": created.case.opened_at, "state": "firing", "summary": "BGP peer is down"},
-        "thread_id": None,
-        "source": "case_service",
-    }
+    store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
 
     _plan, state = await graph_runtime.run_investigation_graph(
-        alert,
+        _ALERT,
         model=TestModel(),
         case=graph_case,
         incident_memory=graph_memory,
     )
 
-    summary = await graph_memory.get_summary(created.case.case_id)
-    stored = await store.get_case(created.case.case_id)
-    event_types = [event.event_type for event in await store.case_events(created.case.case_id)]
+    summary = await graph_memory.get_summary(graph_case["incident_id"])
+    stored = await store.get_case(graph_case["incident_id"])
+    event_types = [event.event_type for event in await store.case_events(graph_case["incident_id"])]
     assert summary is not None
     assert summary["status"] == "waiting_approval"
     assert summary["thread_id"] == state["thread_id"]
     assert "case_context" not in summary
-    assert stored.last_diagnosis["graph_summary"]["incident_id"] == created.case.case_id
+    assert stored.last_diagnosis["graph_summary"]["incident_id"] == graph_case["incident_id"]
     assert "graph_summary_recorded" in event_types
 
 
@@ -240,75 +233,44 @@ async def test_case_service_graph_summary_cannot_resolve_case_without_operator_d
 
 
 @pytest.mark.asyncio
-async def test_incident_memory_marks_chronic_after_four_distinct_events(monkeypatch):
-    monkeypatch.setenv("NOC_ACTIVE_INCIDENT_SUPPRESSION_SECONDS", "0")
-    memory = IncidentMemory(redis_url="")
-    alert = {"groupLabels": {"alertname": "InstanceDown", "host": "noc"}}
-    for idx in range(4):
-        result = await memory.correlate(f"noc-{idx}", alert)
-    assert result["chronic"] is False
-
-    memory = IncidentMemory(redis_url="")
-    last = None
-    for _ in range(4):
-        memory._local.active.clear()
-        last = await memory.correlate("noc", alert)
-    assert last is not None
-    assert last["chronic"] is True
-
-
-@pytest.mark.asyncio
-async def test_record_operator_decision_updates_summary(monkeypatch):
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
-    case_result = await memory.intake_alert(
-        {
-            "source": "icinga2",
-            "status": "firing",
-            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
-            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
-        }
+async def test_record_operator_decision_updates_case_service_summary():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="icinga2", detector="noc-agent-uptime", resource="noc", status="firing")
     )
-    incident_id = case_result.case["incident_id"]
-    await memory.put_summary(
-        incident_id,
+    assert created.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+    await graph_memory.put_summary(
+        created.case.case_id,
         {
-            "incident_id": incident_id,
-            "case_number": case_result.case["case_number"],
+            "incident_id": created.case.case_id,
+            "case_number": created.case.case_number,
             "status": "waiting_approval",
             "title": "test",
         },
     )
 
     updated = await graph_runtime.record_operator_decision(
-        incident_id,
-        {"incident_id": incident_id, "decision": "approved", "operator": "svag", "comment": "ok"},
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "decision": "approved", "operator": "svag", "comment": "ok"},
+        incident_memory=graph_memory,
     )
-    case = await memory.get_case(incident_id)
-    stored_summary = await memory.get_summary(incident_id)
+    case = await store.get_case(created.case.case_id)
+    stored_summary = await graph_memory.get_summary(created.case.case_id)
 
     assert updated["status"] == "approved"
     assert updated["operator_decision"]["operator"] == "svag"
     assert stored_summary["status"] == "approved"
-    assert stored_summary["incident_id"] == incident_id
-    assert stored_summary["case_number"] == case_result.case["case_number"]
-    assert case["status"] == "resolved"
-    assert case["decision_status"] == "approved"
+    assert stored_summary["incident_id"] == created.case.case_id
+    assert stored_summary["case_number"] == created.case.case_number
+    assert case.status == "resolved"
 
 
 @pytest.mark.asyncio
 async def test_inject_case_event_updates_existing_graph_state(monkeypatch):
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
-    result = await memory.intake_alert(
-        {
-            "source": "icinga2",
-            "status": "firing",
-            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
-            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
-        }
-    )
-    case = await memory.set_case_thread(result.case["incident_id"], "thread-1")
+    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
+    case = await graph_memory.set_case_thread(graph_case["incident_id"], "thread-1")
 
     class FakeSnapshot:
         values = {
@@ -330,7 +292,7 @@ async def test_inject_case_event_updates_existing_graph_state(monkeypatch):
     monkeypatch.setitem(graph_runtime._THREAD_GRAPHS, "thread-1", graph)
     event = {"received_at": "2026-05-20T19:40:00Z", "state": "CRITICAL", "summary": "worse"}
 
-    assert await graph_runtime.inject_case_event(case, event) is True
+    assert await graph_runtime.inject_case_event(case, event, incident_memory=graph_memory) is True
     assert graph.update["related_alerts"] == [{"status": "firing"}, event]
     assert "diagnostic_synthesis" not in graph.update
     assert graph.update["latest_event"] == event
@@ -338,37 +300,18 @@ async def test_inject_case_event_updates_existing_graph_state(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_inject_case_event_without_thread_id_leaves_thread_graphs_unchanged(monkeypatch):
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
+    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
     original_graphs = {"thread-existing": object()}
     monkeypatch.setattr(graph_runtime, "_THREAD_GRAPHS", dict(original_graphs))
 
-    result = await memory.intake_alert(
-        {
-            "source": "icinga2",
-            "status": "firing",
-            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
-            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
-        }
-    )
-
-    assert await graph_runtime.inject_case_event(result.case, {"state": "CRITICAL"}) is False
+    assert await graph_runtime.inject_case_event(graph_case, {"state": "CRITICAL"}, incident_memory=graph_memory) is False
     assert graph_runtime._THREAD_GRAPHS == original_graphs
 
 
 @pytest.mark.asyncio
 async def test_inject_case_event_retries_without_as_node(monkeypatch):
-    memory = IncidentMemory(redis_url="")
-    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", memory)
-    result = await memory.intake_alert(
-        {
-            "source": "icinga2",
-            "status": "firing",
-            "groupLabels": {"alertname": "noc-agent-uptime", "host": "noc"},
-            "alerts": [{"labels": {"alertname": "noc-agent-uptime", "host": "noc", "state": "WARNING"}}],
-        }
-    )
-    case = await memory.set_case_thread(result.case["incident_id"], "thread-fallback")
+    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
+    case = await graph_memory.set_case_thread(graph_case["incident_id"], "thread-fallback")
 
     class EmptySnapshot:
         values = {}
@@ -388,7 +331,7 @@ async def test_inject_case_event_retries_without_as_node(monkeypatch):
     graph = FallbackGraph()
     monkeypatch.setattr(graph_runtime, "_THREAD_GRAPHS", {"thread-fallback": graph})
 
-    assert await graph_runtime.inject_case_event(case, {"state": "CRITICAL"}) is True
+    assert await graph_runtime.inject_case_event(case, {"state": "CRITICAL"}, incident_memory=graph_memory) is True
     assert graph.calls[0]["kwargs"] == {"as_node": "intake_event_injection"}
     assert graph.calls[1]["kwargs"] == {}
 

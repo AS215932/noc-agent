@@ -7,7 +7,6 @@ from fastapi import HTTPException
 
 from app.cases import CaseService, InMemoryCaseStore, ObservationRecord
 from app.cases.graph_memory import CaseServiceGraphMemory
-import app.graph_runtime as graph_runtime
 from app.incident_memory import IncidentMemory
 import app.main as main_module
 from app.main import (
@@ -37,15 +36,9 @@ def _request(token: str = "secret"):
 
 @pytest.fixture
 def isolated_incident_memory():
-    """Install a fresh IncidentMemory and restore the process global after the test."""
+    """Provide a fresh legacy IncidentMemory for no-fallback assertions."""
 
-    original = graph_runtime.INCIDENT_MEMORY
-    memory = IncidentMemory(redis_url="")
-    graph_runtime.INCIDENT_MEMORY = memory
-    try:
-        yield memory
-    finally:
-        graph_runtime.INCIDENT_MEMORY = original
+    yield IncidentMemory(redis_url="")
 
 
 @pytest.mark.asyncio
