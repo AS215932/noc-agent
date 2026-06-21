@@ -365,6 +365,49 @@ async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigati
 
 
 @pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_investigates_case_that_passed_gate(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    _, service, _ = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    setup_payload = deepcopy(mock_alert_payload)
+    setup_payload["source"] = "alertmanager"
+    setup_payload["alerts"].append(deepcopy(setup_payload["alerts"][0]))
+    setup_payload["alerts"][1]["labels"]["instance"] = "rtr2.as215932.net:9100"
+    first_results = await _shadow_observe_alert_payload(setup_payload)
+    cooled_case = getattr(first_results[0], "case")
+    active_case = getattr(first_results[1], "case")
+    await service.record_investigation_result(cooled_case.case_id, diagnosis={"summary": "already investigated"})
+    request_payload = deepcopy(mock_alert_payload)
+    request_payload["alerts"].append(deepcopy(request_payload["alerts"][0]))
+    request_payload["alerts"][1]["labels"]["instance"] = "rtr2.as215932.net:9100"
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(request_payload), background_tasks)
+
+    assert response["source"] == "case_service"
+    assert response["incident_id"] == cooled_case.case_id  # response preserves first affected case for compatibility
+    assert background_tasks.add_task.call_args.kwargs["case"]["incident_id"] == active_case.case_id
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_surfaces_store_failures(
+    monkeypatch, mock_alert_payload, isolated_case_service_runtime
+):
+    runtime, _, _ = isolated_case_service_runtime
+
+    class _FailingService:
+        async def observe(self, observation):
+            raise RuntimeError("case store unavailable")
+
+    runtime.service = _FailingService()
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+
+    with pytest.raises(RuntimeError, match="case store unavailable"):
+        await alertmanager_webhook(AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)), BackgroundTasks())
+
+
+@pytest.mark.asyncio
 async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, isolated_incident_memory):
     background_tasks = mocker.Mock()
     mock_alert_payload["status"] = "resolved"

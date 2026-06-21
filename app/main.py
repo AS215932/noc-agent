@@ -830,12 +830,13 @@ def _case_service_reactive_primary_enabled() -> bool:
     return _env_bool("NOC_CASESERVICE_REACTIVE_PRIMARY", False)
 
 
-def _case_service_reactive_allows_investigation(shadow_results: list[object]) -> bool:
-    """Optionally let CaseService own reactive investigation cooldown gating."""
+def _case_service_reactive_investigation_result(shadow_results: list[object]):
+    """Return the firing CaseService result that should be investigated, if any."""
+    first_firing = None
     if case_service_runtime is None or not (
         _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False) or _case_service_reactive_primary_enabled()
     ):
-        return True
+        return _case_service_primary_result(shadow_results, firing_only=True)
     service = case_service_runtime.service
     firing_case_ids: list[str] = []
     try:
@@ -846,19 +847,29 @@ def _case_service_reactive_allows_investigation(shadow_results: list[object]) ->
             case = getattr(result, "case", None)
             if case is None:
                 continue
+            if first_firing is None:
+                first_firing = result
             firing_case_ids.append(str(getattr(case, "case_id", "")))
             if service.should_investigate(case):
-                return True
+                return result
     except Exception as e:
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="reactive_control", category=safe.category)
         log_exception("case_service_reactive_investigation_gate_failed", e, category=safe.category)
         log.warn("case_service_reactive_investigation_gate_fail_open", category=safe.category)
+        return first_firing
+    if firing_case_ids:
+        log.info("case_service_reactive_investigation_suppressed", case_ids=firing_case_ids)
+    return None
+
+
+def _case_service_reactive_allows_investigation(shadow_results: list[object]) -> bool:
+    """Optionally let CaseService own reactive investigation cooldown gating."""
+    if case_service_runtime is None or not (
+        _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False) or _case_service_reactive_primary_enabled()
+    ):
         return True
-    if not firing_case_ids:
-        return True
-    log.info("case_service_reactive_investigation_suppressed", case_ids=firing_case_ids)
-    return False
+    return _case_service_reactive_investigation_result(shadow_results) is not None
 
 
 async def _link_case_service_results_to_legacy_case(shadow_results: list[object], legacy_case: dict | None) -> None:
@@ -1256,15 +1267,35 @@ def _case_service_primary_result(shadow_results: list[object], *, firing_only: b
     return None if firing_only else fallback
 
 
+async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[object]:
+    """Authoritative CaseService reactive intake; failures must propagate."""
+
+    observations = _reactive_observations_from_alert_payload(alert_payload)
+    results: list[object] = []
+    for observation in observations:
+        result = await case_service_runtime.service.observe(observation)
+        results.append(result)
+        record_case_service_shadow_observation(
+            path="reactive_primary",
+            source=getattr(observation, "source", ""),
+            status=getattr(observation, "status", ""),
+            action=str(getattr(result, "action", "unknown")),
+        )
+        await _maybe_request_reactive_case_report(observation, result)
+    if results:
+        log.info("case_service_reactive_primary_observed", count=len(results), source=alert_payload.get("source"))
+    return results
+
+
 async def _case_service_reactive_primary_response(alert_payload: dict, background_tasks: BackgroundTasks, *, label: str) -> dict:
     _require_case_service_runtime()
-    shadow_results = await _shadow_observe_alert_payload(alert_payload)
+    shadow_results = await _observe_case_service_reactive_primary(alert_payload)
     result = _case_service_primary_result(shadow_results)
-    firing_result = _case_service_primary_result(shadow_results, firing_only=True)
+    investigation_result = _case_service_reactive_investigation_result(shadow_results)
     case = getattr(result, "case", None) if result is not None else None
-    firing_case = getattr(firing_result, "case", None) if firing_result is not None else None
-    if firing_case is not None and _case_service_reactive_allows_investigation(shadow_results):
-        background_tasks.add_task(investigate_alert, alert_payload, case=_case_service_graph_case(firing_case, alert_payload))
+    investigation_case = getattr(investigation_result, "case", None) if investigation_result is not None else None
+    if investigation_case is not None:
+        background_tasks.add_task(investigate_alert, alert_payload, case=_case_service_graph_case(investigation_case, alert_payload))
     action = str(getattr(result, "action", "ignored") if result is not None else "ignored")
     return {
         "status": "accepted" if case is not None else "ignored",
