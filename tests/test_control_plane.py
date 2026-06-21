@@ -112,6 +112,20 @@ async def test_control_cases_use_case_number_and_comments(monkeypatch, isolated_
 
 
 @pytest.mark.asyncio
+async def test_legacy_control_disabled_without_case_service_routes(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_LEGACY_INCIDENT_MEMORY_ENABLED", "0")
+    monkeypatch.delenv("NOC_CASESERVICE_CONTROL_PRIMARY", raising=False)
+    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await control_cases(_request())
+
+    assert exc.value.status_code == 410
+    assert "Legacy IncidentMemory control paths are disabled" in exc.value.detail
+
+
+@pytest.mark.asyncio
 async def test_case_service_control_lists_detail_and_outbox(monkeypatch):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     store = InMemoryCaseStore()
@@ -443,6 +457,7 @@ async def test_case_service_primary_rejected_decision_updates_case_projection(mo
 async def test_reactive_primary_routes_legacy_approval_reads_to_case_service(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    monkeypatch.setenv("NOC_LEGACY_INCIDENT_MEMORY_ENABLED", "0")
     memory = isolated_incident_memory
     legacy = await memory.intake_alert(
         {

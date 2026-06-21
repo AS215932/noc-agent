@@ -2,7 +2,7 @@ import asyncio
 from copy import deepcopy
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
 
 from app.main import (
@@ -316,6 +316,18 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, isolate
         BackgroundTasks(),
     )
     assert response["status"] == "accepted"
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_legacy_disabled_requires_reactive_primary(monkeypatch, mock_alert_payload):
+    monkeypatch.setenv("NOC_LEGACY_INCIDENT_MEMORY_ENABLED", "0")
+    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), BackgroundTasks())
+
+    assert exc.value.status_code == 503
+    assert "NOC_CASESERVICE_REACTIVE_PRIMARY" in exc.value.detail
+
 
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_legacy(

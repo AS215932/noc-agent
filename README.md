@@ -268,7 +268,19 @@ decisions, and manual investigations use CaseService as the primary case store.
 It also starts the CaseService runtime even if `NOC_CASESERVICE_SHADOW` is not
 set. This path intentionally does not fall back to legacy `IncidentMemory` for
 old or unmapped cases; keep the flag off if preserving old/open legacy cases
-matters.
+matters. `NOC_CASESERVICE_REACTIVE_PRIMARY=1` also routes the `/control/cases`
+surface to CaseService so reactive-primary cases remain operator-visible without
+legacy fallback.
+
+Legacy `IncidentMemory` reactive/control paths can be disabled with:
+
+```bash
+NOC_LEGACY_INCIDENT_MEMORY_ENABLED=0
+```
+
+When disabled, legacy webhook intake fails loudly unless reactive-primary is
+enabled, and legacy control routes return gone unless CaseService primary routes
+are active. See `LEGACY_DEPRECATION.md` for the removal audit.
 
 Outbox side effects are also opt-in:
 
@@ -366,6 +378,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_REACTIVE_CONTROL` (default `0`; gate reactive graph investigations from case state)
 - `NOC_CASESERVICE_REACTIVE_PRIMARY` (default `0`; make reactive webhooks use CaseService without legacy intake)
 - `NOC_CASESERVICE_CONTROL_PRIMARY` (default `0`; make `/control/cases` use CaseService without legacy fallback)
+- `NOC_LEGACY_INCIDENT_MEMORY_ENABLED` (default `1`; set `0` to disable legacy reactive/control paths)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`
