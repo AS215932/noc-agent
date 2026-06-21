@@ -826,9 +826,15 @@ async def _maybe_request_reactive_case_report(observation, observe_result: objec
     )
 
 
+def _case_service_reactive_primary_enabled() -> bool:
+    return _env_bool("NOC_CASESERVICE_REACTIVE_PRIMARY", False)
+
+
 def _case_service_reactive_allows_investigation(shadow_results: list[object]) -> bool:
     """Optionally let CaseService own reactive investigation cooldown gating."""
-    if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False):
+    if case_service_runtime is None or not (
+        _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False) or _case_service_reactive_primary_enabled()
+    ):
         return True
     service = case_service_runtime.service
     firing_case_ids: list[str] = []
@@ -1236,6 +1242,40 @@ async def _record_case_service_primary_decision(case, request_body) -> dict | No
     return summary
 
 
+def _case_service_primary_result(shadow_results: list[object], *, firing_only: bool = False):
+    fallback = None
+    for result in shadow_results:
+        case = getattr(result, "case", None)
+        if case is None:
+            continue
+        if fallback is None:
+            fallback = result
+        observation = getattr(result, "observation", None)
+        if getattr(observation, "status", "") == "firing":
+            return result
+    return None if firing_only else fallback
+
+
+async def _case_service_reactive_primary_response(alert_payload: dict, background_tasks: BackgroundTasks, *, label: str) -> dict:
+    _require_case_service_runtime()
+    shadow_results = await _shadow_observe_alert_payload(alert_payload)
+    result = _case_service_primary_result(shadow_results)
+    firing_result = _case_service_primary_result(shadow_results, firing_only=True)
+    case = getattr(result, "case", None) if result is not None else None
+    firing_case = getattr(firing_result, "case", None) if firing_result is not None else None
+    if firing_case is not None and _case_service_reactive_allows_investigation(shadow_results):
+        background_tasks.add_task(investigate_alert, alert_payload, case=_case_service_graph_case(firing_case, alert_payload))
+    action = str(getattr(result, "action", "ignored") if result is not None else "ignored")
+    return {
+        "status": "accepted" if case is not None else "ignored",
+        "message": f"{label} {action}",
+        "action": action,
+        "case_number": _case_service_control_identifier(case) if case is not None else None,
+        "incident_id": getattr(case, "case_id", None) if case is not None else None,
+        "source": "case_service",
+    }
+
+
 async def _apply_case_service_primary_decision_state(case, request_body, graph_summary: dict | None):
     if request_body.decision not in {"approved", "rejected"}:
         return case
@@ -1392,6 +1432,8 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
     """Receives alerts from Prometheus Alertmanager and triggers the NOC agent."""
     alert_payload = payload.model_dump()
     alert_payload["source"] = "alertmanager"
+    if _case_service_reactive_primary_enabled():
+        return await _case_service_reactive_primary_response(alert_payload, background_tasks, label="Alert")
     shadow_results = await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
     await _link_case_service_results_to_legacy_case(shadow_results, result.case or result.parent_case)
@@ -1416,6 +1458,8 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
 async def icinga_webhook(payload: IcingaNotification, background_tasks: BackgroundTasks):
     """Receives Icinga2 NotificationCommand POSTs and triggers the NOC agent."""
     alert_payload = _icinga_to_alert_payload(payload)
+    if _case_service_reactive_primary_enabled():
+        return await _case_service_reactive_primary_response(alert_payload, background_tasks, label="Icinga notification")
     shadow_results = await _shadow_observe_alert_payload(alert_payload)
     result = await intake_alert(alert_payload)
     await _link_case_service_results_to_legacy_case(shadow_results, result.case or result.parent_case)

@@ -296,6 +296,72 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, isolate
     assert response["status"] == "accepted"
 
 @pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_legacy(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    cases = await store.list_cases(kind="atomic")
+    legacy_cases = await isolated_incident_memory.list_cases()
+    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
+    assert response["source"] == "case_service"
+    assert response["status"] == "accepted"
+    assert response["incident_id"] == cases[0].case_id
+    assert legacy_cases == []
+    assert scheduled == ["investigate_alert"]
+    assert background_tasks.add_task.call_args.kwargs["case"]["incident_id"] == cases[0].case_id
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigation(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    payload = deepcopy(mock_alert_payload)
+    payload["source"] = "alertmanager"
+    first_results = await _shadow_observe_alert_payload(payload)
+    case = getattr(first_results[0], "case")
+    await service.record_investigation_result(case.case_id, diagnosis={"summary": "already investigated"})
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    assert response["source"] == "case_service"
+    assert response["incident_id"] == case.case_id
+    background_tasks.add_task.assert_not_called()
+    assert await isolated_incident_memory.list_cases() == []
+
+
+@pytest.mark.asyncio
 async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, isolated_incident_memory):
     background_tasks = mocker.Mock()
     mock_alert_payload["status"] = "resolved"
