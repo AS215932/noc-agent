@@ -34,6 +34,7 @@ from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
 from app.config import load_proactive_settings
+from app.cases.graph_memory import CaseServiceGraphMemory
 from app.proactive.loop import ProactiveLoop
 import app.graph_runtime as graph_runtime
 from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
@@ -717,7 +718,14 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
 
     run_started = start_run("triage")
     try:
-        plan, graph_state = await run_investigation_graph(alert_payload, model=model, mcp_runtime=runtime, case=case)
+        graph_memory = _case_service_graph_memory_for_case(case)
+        plan, graph_state = await run_investigation_graph(
+            alert_payload,
+            model=model,
+            mcp_runtime=runtime,
+            case=case,
+            incident_memory=graph_memory,
+        )
         record_success("triage", run_started, _SyntheticRunResult())
     except Exception as e:
         safe = classify_exception(e)
@@ -941,16 +949,21 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
             case = await service.case_for_alias("source_fp", getattr(observation, "source_fingerprint", ""))
             if case is None:
                 continue
+            existing_diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
+            graph_summary = existing_diagnosis.get("graph_summary") if isinstance(existing_diagnosis.get("graph_summary"), dict) else None
+            diagnosis = {
+                "source": "reactive_graph",
+                "incident_id": str(graph_state.get("incident_id") or ""),
+                "summary": _safe_monitor_text(getattr(plan, "incident_summary", ""), limit=700),
+                "severity": str(getattr(plan, "severity", "")),
+                "confidence_score": float(getattr(plan, "confidence_score", 0.0) or 0.0),
+                "requires_human": bool(getattr(plan, "requires_human", False)),
+            }
+            if graph_summary is not None:
+                diagnosis["graph_summary"] = _safe_case_service_output_value(graph_summary)
             await service.record_investigation_result(
                 case.case_id,
-                diagnosis={
-                    "source": "reactive_graph",
-                    "incident_id": str(graph_state.get("incident_id") or ""),
-                    "summary": _safe_monitor_text(getattr(plan, "incident_summary", ""), limit=700),
-                    "severity": str(getattr(plan, "severity", "")),
-                    "confidence_score": float(getattr(plan, "confidence_score", 0.0) or 0.0),
-                    "requires_human": bool(getattr(plan, "requires_human", False)),
-                },
+                diagnosis=diagnosis,
                 recommendations=[_safe_monitor_text(item, limit=240) for item in recommendations[:20]],
                 status="complete",
             )
@@ -1063,6 +1076,18 @@ def _case_service_control_primary_enabled() -> bool:
     return _env_bool("NOC_CASESERVICE_CONTROL_PRIMARY", False)
 
 
+def _case_service_graph_summary_routes_enabled() -> bool:
+    return case_service_runtime is not None and hasattr(case_service_runtime, "store") and (
+        _case_service_control_primary_enabled() or _case_service_reactive_primary_enabled()
+    )
+
+
+def _case_service_graph_memory():
+    if not _case_service_graph_summary_routes_enabled():
+        return None
+    return CaseServiceGraphMemory(case_service_runtime.store)
+
+
 async def _require_case_service_control_case(identifier: str):
     _require_case_service_runtime()
     case = await _case_service_case_for_identifier(identifier)
@@ -1172,6 +1197,12 @@ def _case_service_control_timeline(events, feedback) -> list[dict[str, object]]:
     return sorted(rows, key=lambda item: str(item.get("received_at") or ""))
 
 
+def _case_service_graph_memory_for_case(case: dict | None):
+    if case_service_runtime is None or not hasattr(case_service_runtime, "store") or not case or case.get("source") != "case_service":
+        return None
+    return CaseServiceGraphMemory(case_service_runtime.store)
+
+
 def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
     event = case_event_from_alert(alert_payload)
     identity = getattr(case, "identity", {}) or {}
@@ -1198,6 +1229,7 @@ def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
         "downstream_victims": [],
         "parents_checked": [],
         "needs_reassessment": False,
+        "source": "case_service",
     }
 
 
@@ -1240,27 +1272,70 @@ def _case_service_graph_incident_identifier(case) -> str:
 
 
 async def _case_service_graph_summary(case) -> dict | None:
-    identifiers = []
-    for candidate in (_case_service_graph_incident_identifier(case), getattr(case, "case_id", "") or ""):
-        rendered = _safe_monitor_token(candidate, limit=128)
-        if rendered and rendered not in identifiers:
-            identifiers.append(rendered)
-    for identifier in identifiers:
-        try:
-            summary = await graph_runtime.INCIDENT_MEMORY.get_summary(identifier)
-        except Exception as e:
-            safe = classify_exception(e)
-            log_exception("case_service_graph_summary_lookup_failed", e, category=safe.category)
-            return None
-        if isinstance(summary, dict):
+    diagnosis = getattr(case, "last_diagnosis", {}) or {}
+    summary = diagnosis.get("graph_summary") if isinstance(diagnosis, dict) else None
+    return _safe_case_service_output_value(summary) if isinstance(summary, dict) else None
+
+
+async def _control_pending_summaries() -> list[dict]:
+    graph_memory = _case_service_graph_memory()
+    if graph_memory is None:
+        return await pending_summaries()
+    case_service_summaries = await graph_memory.list_summaries()
+    if _case_service_control_primary_enabled():
+        return case_service_summaries
+    merged = {str(item.get("incident_id") or ""): item for item in await pending_summaries()}
+    for summary in case_service_summaries:
+        incident_id = str(summary.get("incident_id") or "")
+        if incident_id:
+            merged[incident_id] = summary
+    return list(merged.values())
+
+
+async def _control_summary_for(incident_id: str) -> dict | None:
+    graph_memory = _case_service_graph_memory()
+    if graph_memory is not None:
+        summary = await graph_memory.get_summary(incident_id)
+        if summary is not None:
             return summary
-    return None
+        if _case_service_control_primary_enabled():
+            return None
+    return await summary_for(incident_id)
+
+
+async def _record_control_incident_decision(incident_id: str, request_body) -> dict | None:
+    graph_memory = _case_service_graph_memory()
+    decision_payload = request_body.model_dump(exclude={"incident_id"})
+    if graph_memory is not None:
+        existing = await graph_memory.get_summary(incident_id)
+        if existing is not None:
+            decision = ApprovalDecision(incident_id=incident_id, **decision_payload)
+            summary = await record_operator_decision(
+                incident_id,
+                decision.model_dump(),
+                mcp_runtime=mcp_runtime,
+                incident_memory=graph_memory,
+            )
+            case_id = await graph_memory.resolve_case_identifier(incident_id)
+            case = await case_service_runtime.store.get_case(case_id) if case_id else None
+            if case is not None:
+                await _apply_case_service_primary_decision_state(case, request_body, summary)
+            return summary
+        if _case_service_control_primary_enabled():
+            return None
+    decision = ApprovalDecision(incident_id=incident_id, **decision_payload)
+    return await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
 
 
 async def _record_case_service_primary_decision(case, request_body) -> dict | None:
     incident_id = _case_service_graph_incident_identifier(case)
-    decision = ApprovalDecision(incident_id=incident_id, **request_body.model_dump())
-    summary = await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
+    decision = ApprovalDecision(incident_id=incident_id, **request_body.model_dump(exclude={"incident_id"}))
+    summary = await record_operator_decision(
+        incident_id,
+        decision.model_dump(),
+        mcp_runtime=mcp_runtime,
+        incident_memory=CaseServiceGraphMemory(case_service_runtime.store),
+    )
     if summary is None and request_body.decision == "approved":
         raise HTTPException(status_code=409, detail="No resumable investigation found for CaseService case")
     return summary
@@ -1389,6 +1464,40 @@ async def _case_service_reactive_primary_response(alert_payload: dict, backgroun
     }
 
 
+async def _case_service_control_comment_response(case, request_body) -> dict[str, object]:
+    await _write_case_service_operator_feedback(
+        case,
+        operator=request_body.operator,
+        feedback_type="operator_note",
+        comment=request_body.comment,
+        payload={"source": "control_case_comment"},
+        legacy_identifier=case.case_id,
+    )
+    updated = await _case_service_case_for_identifier(case.case_id) or case
+    return {"status": "ok", "case": _case_service_control_case_payload(updated)}
+
+
+async def _case_service_control_decision_response(case, request_body) -> dict[str, object]:
+    summary = await _record_case_service_primary_decision(case, request_body)
+    if request_body.decision == "acknowledged":
+        case = await case_service_runtime.service.ack(
+            case.case_id,
+            operator=_safe_monitor_token(request_body.operator, limit=120),
+        )
+    else:
+        case = await _apply_case_service_primary_decision_state(case, request_body, summary)
+    await _write_case_service_operator_feedback(
+        case,
+        operator=request_body.operator,
+        feedback_type=_feedback_type_for_decision(request_body.decision),
+        comment=request_body.comment,
+        payload={"source": "control_case_decision", "decision": request_body.decision},
+        legacy_identifier=case.case_id,
+    )
+    updated = await _case_service_case_for_identifier(case.case_id) or case
+    return {"status": "ok", "incident": summary or _case_service_control_summary(updated)}
+
+
 async def _apply_case_service_primary_decision_state(case, request_body, graph_summary: dict | None):
     if request_body.decision not in {"approved", "rejected"}:
         return case
@@ -1397,6 +1506,9 @@ async def _apply_case_service_primary_decision_state(case, request_body, graph_s
     from app.cases.models import CaseEvent, utc_now
 
     now = utc_now()
+    latest = await case_service_runtime.store.get_case(case.case_id)
+    if latest is not None:
+        case = latest
     summary_status = str((graph_summary or {}).get("status") or request_body.decision)
     case.status = "waiting_approval" if summary_status == "waiting_approval" else "resolved"
     if case.status == "resolved":
@@ -1404,6 +1516,8 @@ async def _apply_case_service_primary_decision_state(case, request_body, graph_s
         case.resolution_reason = f"operator_{request_body.decision}"
     case.updated_at = now
     diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
+    if isinstance(graph_summary, dict):
+        diagnosis["graph_summary"] = _safe_case_service_output_value(graph_summary)
     diagnosis["operator_decision"] = _safe_case_service_output_value(request_body.model_dump())
     diagnosis["decision_status"] = _safe_monitor_token(summary_status, limit=64)
     case.last_diagnosis = diagnosis
@@ -1661,13 +1775,13 @@ async def health_check():
 @app.get("/control/incidents/pending")
 async def pending_incidents(x_noc_control_token: str | None = Header(default=None)):
     _require_control_token(x_noc_control_token)
-    return {"status": "ok", "incidents": await pending_summaries()}
+    return {"status": "ok", "incidents": await _control_pending_summaries()}
 
 
 @app.get("/control/incidents/{incident_id}")
 async def incident_status(incident_id: str, x_noc_control_token: str | None = Header(default=None)):
     _require_control_token(x_noc_control_token)
-    summary = await summary_for(incident_id)
+    summary = await _control_summary_for(incident_id)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return summary
@@ -1685,7 +1799,7 @@ async def control_cases(request: Request, token: str | None = Query(default=None
     if _case_service_control_primary_enabled():
         return await _case_service_control_cases_response()
     cases = await graph_runtime.INCIDENT_MEMORY.list_cases()
-    pending = {item["incident_id"] for item in await pending_summaries()}
+    pending = {item["incident_id"] for item in await _control_pending_summaries()}
     return {
         "status": "ok",
         "cases": [
@@ -1712,6 +1826,10 @@ async def control_case_detail(case_id: str, request: Request, token: str | None 
         return await _case_service_control_case_detail_response(case_id)
     detail = await graph_runtime.INCIDENT_MEMORY.case_detail(case_id)
     if detail is None:
+        if _case_service_graph_summary_routes_enabled():
+            case = await _case_service_case_for_identifier(case_id)
+            if case is not None:
+                return await _case_service_control_case_detail_response(case.case_id)
         raise HTTPException(status_code=404, detail="Case not found")
     return {"status": "ok", **detail}
 
@@ -1790,6 +1908,10 @@ async def control_case_events(case_id: str, request: Request, token: str | None 
         return await _case_service_control_case_events_response(case_id)
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
+        if _case_service_graph_summary_routes_enabled():
+            case = await _case_service_case_for_identifier(case_id)
+            if case is not None:
+                return await _case_service_control_case_events_response(case.case_id)
         raise HTTPException(status_code=404, detail="Case not found")
     return {"status": "ok", "events": await graph_runtime.INCIDENT_MEMORY.case_events(resolved)}
 
@@ -1805,18 +1927,13 @@ async def control_case_comment(
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_primary_enabled():
         case = await _require_case_service_control_case(case_id)
-        await _write_case_service_operator_feedback(
-            case,
-            operator=request_body.operator,
-            feedback_type="operator_note",
-            comment=request_body.comment,
-            payload={"source": "control_case_comment"},
-            legacy_identifier=case.case_id,
-        )
-        updated = await _case_service_case_for_identifier(case.case_id) or case
-        return {"status": "ok", "case": _case_service_control_case_payload(updated)}
+        return await _case_service_control_comment_response(case, request_body)
     case = await graph_runtime.INCIDENT_MEMORY.append_operator_comment(case_id, request_body.operator, request_body.comment)
     if case is None:
+        if _case_service_graph_summary_routes_enabled():
+            case_service_case = await _case_service_case_for_identifier(case_id)
+            if case_service_case is not None:
+                return await _case_service_control_comment_response(case_service_case, request_body)
         raise HTTPException(status_code=404, detail="Case not found")
     await _record_case_service_operator_feedback(
         case_id,
@@ -1839,26 +1956,13 @@ async def control_case_decision(
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_primary_enabled():
         case = await _require_case_service_control_case(case_id)
-        summary = await _record_case_service_primary_decision(case, request_body)
-        if request_body.decision == "acknowledged":
-            case = await case_service_runtime.service.ack(
-                case.case_id,
-                operator=_safe_monitor_token(request_body.operator, limit=120),
-            )
-        else:
-            case = await _apply_case_service_primary_decision_state(case, request_body, summary)
-        await _write_case_service_operator_feedback(
-            case,
-            operator=request_body.operator,
-            feedback_type=_feedback_type_for_decision(request_body.decision),
-            comment=request_body.comment,
-            payload={"source": "control_case_decision", "decision": request_body.decision},
-            legacy_identifier=case.case_id,
-        )
-        updated = await _case_service_case_for_identifier(case.case_id) or case
-        return {"status": "ok", "incident": summary or _case_service_control_summary(updated)}
+        return await _case_service_control_decision_response(case, request_body)
     resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
     if not resolved:
+        if _case_service_graph_summary_routes_enabled():
+            case_service_case = await _case_service_case_for_identifier(case_id)
+            if case_service_case is not None:
+                return await _case_service_control_decision_response(case_service_case, request_body)
         raise HTTPException(status_code=404, detail="Case not found")
     decision = ApprovalDecision(incident_id=resolved, **request_body.model_dump())
     summary = await record_operator_decision(resolved, decision.model_dump(), mcp_runtime=mcp_runtime)
@@ -2133,8 +2237,7 @@ async def decide_incident(
     x_noc_control_token: str | None = Header(default=None),
 ):
     _require_control_token(x_noc_control_token)
-    decision = ApprovalDecision(incident_id=incident_id, **request.model_dump())
-    summary = await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
+    summary = await _record_control_incident_decision(incident_id, request)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     await _record_case_service_operator_feedback(
@@ -2150,13 +2253,7 @@ async def decide_incident(
 @app.post("/approval/resume")
 async def signed_resume(request: SignedApprovalRequest, x_noc_signature: str | None = Header(default=None)):
     _require_signed_callback(request, x_noc_signature)
-    decision = ApprovalDecision(
-        incident_id=request.incident_id,
-        decision=request.decision,
-        operator=request.operator,
-        comment=request.comment,
-    )
-    summary = await record_operator_decision(request.incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
+    summary = await _record_control_incident_decision(request.incident_id, request)
     if summary is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     await _record_case_service_operator_feedback(

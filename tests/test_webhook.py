@@ -827,6 +827,12 @@ async def test_record_reactive_case_investigation_stamps_case(monkeypatch, mock_
     results = await _shadow_observe_alert_payload(payload)
     assert results and getattr(results[0], "case") is not None
     case_id = getattr(results[0], "case").case_id
+    preexisting = await store.get_case(case_id)
+    assert preexisting is not None
+    preexisting.last_diagnosis = {
+        "graph_summary": {"incident_id": case_id, "status": "waiting_approval", "thread_id": "thread-1"}
+    }
+    await store.upsert_case(preexisting)
     plan = DiagnosticSynthesis(
         read_only=True,
         incident_summary="node exporter down on rtr1",
@@ -847,6 +853,7 @@ async def test_record_reactive_case_investigation_stamps_case(monkeypatch, mock_
     assert getattr(stored, "diagnosis_signature") == getattr(stored, "signal_signature")
     assert getattr(stored, "last_diagnosis")["source"] == "reactive_graph"
     assert getattr(stored, "last_diagnosis")["incident_id"] == "legacy-inc"
+    assert getattr(stored, "last_diagnosis")["graph_summary"]["thread_id"] == "thread-1"
     assert "check node_exporter service" in getattr(stored, "recommendations")
 
 
