@@ -20,12 +20,12 @@ dependencies = [
     "redis>=5.2.1",
     "discord.py>=2.5.0",
     "pyjwt[crypto]>=2.9",
+    "asyncpg>=0.30",
 ]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
 postgres = [
-    "asyncpg>=0.30",
     "langgraph-checkpoint-postgres>=3.0",
 ]
 
