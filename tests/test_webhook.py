@@ -1,3 +1,4 @@
+import asyncio
 from copy import deepcopy
 
 import pytest
@@ -53,6 +54,27 @@ def isolated_incident_memory():
         yield memory
     finally:
         graph_runtime.INCIDENT_MEMORY = original
+
+
+@pytest.fixture
+def isolated_case_service_runtime():
+    """Install a fresh CaseService runtime and restore the process global after the test."""
+
+    original = main_module.case_service_runtime
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    main_module.case_service_runtime = runtime
+    try:
+        yield runtime, service, store
+    finally:
+        main_module.case_service_runtime = original
 
 
 @pytest.fixture
@@ -294,6 +316,171 @@ async def test_alertmanager_webhook_accepted(mock_alert_payload, mocker, isolate
         BackgroundTasks(),
     )
     assert response["status"] == "accepted"
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_legacy(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory, isolated_case_service_runtime
+):
+    _, _, store = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    cases = await store.list_cases(kind="atomic")
+    legacy_cases = await isolated_incident_memory.list_cases()
+    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
+    assert response["source"] == "case_service"
+    assert response["status"] == "accepted"
+    assert response["incident_id"] == cases[0].case_id
+    assert legacy_cases == []
+    assert scheduled == ["investigate_alert"]
+    assert background_tasks.add_task.call_args.kwargs["case"]["incident_id"] == cases[0].case_id
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigation(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory, isolated_case_service_runtime
+):
+    _, service, _ = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    payload = deepcopy(mock_alert_payload)
+    payload["source"] = "alertmanager"
+    first_results = await _shadow_observe_alert_payload(payload)
+    case = getattr(first_results[0], "case")
+    await service.record_investigation_result(case.case_id, diagnosis={"summary": "already investigated"})
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    assert response["source"] == "case_service"
+    assert response["incident_id"] == case.case_id
+    background_tasks.add_task.assert_not_called()
+    assert await isolated_incident_memory.list_cases() == []
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_marks_investigation_started_before_queue(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    _, _, store = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    case = await store.get_case(response["incident_id"])
+    assert case is not None
+    assert case.investigation_status == "in_progress"
+    assert case.last_investigated_at
+    assert case.diagnosis_signature == case.signal_signature
+    background_tasks.add_task.assert_called_once()
+    background_tasks.add_task.reset_mock()
+
+    second = await alertmanager_webhook(
+        AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)),
+        background_tasks,
+    )
+
+    assert second["incident_id"] == response["incident_id"]
+    background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_claims_single_concurrent_duplicate_investigation(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    setup_payload = deepcopy(mock_alert_payload)
+    setup_payload["source"] = "alertmanager"
+    await _shadow_observe_alert_payload(setup_payload)
+    first_tasks = mocker.Mock()
+    second_tasks = mocker.Mock()
+
+    await asyncio.gather(
+        alertmanager_webhook(AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)), first_tasks),
+        alertmanager_webhook(AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)), second_tasks),
+    )
+
+    assert first_tasks.add_task.call_count + second_tasks.add_task.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_does_not_claim_after_same_batch_resolve(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    _, _, store = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    payload = deepcopy(mock_alert_payload)
+    payload["alerts"].append(deepcopy(payload["alerts"][0]))
+    payload["alerts"][1]["status"] = "resolved"
+    payload["alerts"][1]["endsAt"] = "2026-05-02T10:03:00Z"
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(payload), background_tasks)
+
+    case = await store.get_case(response["incident_id"])
+    assert case is not None
+    assert case.status == "resolved"
+    assert case.investigation_status == ""
+    background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_investigates_case_that_passed_gate(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    _, service, _ = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    setup_payload = deepcopy(mock_alert_payload)
+    setup_payload["source"] = "alertmanager"
+    setup_payload["alerts"].append(deepcopy(setup_payload["alerts"][0]))
+    setup_payload["alerts"][1]["labels"]["instance"] = "rtr2.as215932.net:9100"
+    first_results = await _shadow_observe_alert_payload(setup_payload)
+    cooled_case = getattr(first_results[0], "case")
+    active_case = getattr(first_results[1], "case")
+    await service.record_investigation_result(cooled_case.case_id, diagnosis={"summary": "already investigated"})
+    request_payload = deepcopy(mock_alert_payload)
+    request_payload["alerts"].append(deepcopy(request_payload["alerts"][0]))
+    request_payload["alerts"][1]["labels"]["instance"] = "rtr2.as215932.net:9100"
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(request_payload), background_tasks)
+
+    assert response["source"] == "case_service"
+    assert response["incident_id"] == cooled_case.case_id  # response preserves first affected case for compatibility
+    scheduled_payload = background_tasks.add_task.call_args.args[1]
+    scheduled_case = background_tasks.add_task.call_args.kwargs["case"]
+    assert scheduled_payload["alerts"][0]["labels"]["instance"] == "rtr2.as215932.net:9100"
+    assert scheduled_case["incident_id"] == active_case.case_id
+    assert scheduled_case["latest_event"]["display_resource"] == "rtr2.as215932.net"
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_surfaces_store_failures(
+    monkeypatch, mock_alert_payload, isolated_case_service_runtime
+):
+    runtime, _, _ = isolated_case_service_runtime
+
+    class _FailingService:
+        async def observe(self, observation):
+            raise RuntimeError("case store unavailable")
+
+    runtime.service = _FailingService()
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+
+    with pytest.raises(RuntimeError, match="case store unavailable"):
+        await alertmanager_webhook(AlertManagerPayload.model_validate(deepcopy(mock_alert_payload)), BackgroundTasks())
+
 
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_ignores_recovery(mock_alert_payload, mocker, isolated_incident_memory):
@@ -595,6 +782,30 @@ async def test_reactive_case_service_control_skips_recently_investigated_duplica
     assert response["status"] == "accepted"
     assert "investigate_alert" not in scheduled
     assert "_handle_case_update" in scheduled
+
+
+@pytest.mark.asyncio
+async def test_reactive_case_service_control_fails_open_when_shadow_has_no_case(
+    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory
+):
+    class _Service:
+        async def observe(self, observation):
+            raise RuntimeError("case service unavailable")
+
+    class _Runtime:
+        service = _Service()
+
+    import app.main as main_module
+
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", _Runtime())
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+
+    scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
+    assert response["status"] == "accepted"
+    assert "investigate_alert" in scheduled
 
 
 @pytest.mark.asyncio

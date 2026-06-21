@@ -180,6 +180,8 @@ class CaseService:
         if the investigation is older than the policy cooldown.
         """
 
+        if _investigation_blocked_status(case.status):
+            return False
         if not case.last_investigated_at or not case.diagnosis_signature:
             return True
         if case.signal_signature and case.diagnosis_signature != case.signal_signature:
@@ -189,6 +191,29 @@ class CaseService:
             return True
         now = now or datetime.now(timezone.utc)
         return (now - last) >= timedelta(seconds=self.policy.investigation_cooldown_s)
+
+    async def claim_investigation(self, case: AtomicCaseProjection, *, status: str = "in_progress") -> AtomicCaseProjection | None:
+        """Atomically claim a queued/running investigation slot before graph execution."""
+
+        if not self.should_investigate(case):
+            return None
+        event = CaseEvent(
+            case_id=case.case_id,
+            event_type="investigation_started",
+            actor_type="system",
+            policy_version=self.policy.policy_version,
+            payload={"diagnosis_signature": _investigation_signature(case), "status": status},
+        )
+        return await self.store.claim_investigation(
+            case.case_id,
+            expected_signal_signature=case.signal_signature,
+            expected_diagnosis_signature=case.diagnosis_signature,
+            expected_last_investigated_at=case.last_investigated_at,
+            status=status,
+            policy_version=self.policy.policy_version,
+            now=utc_now(),
+            event=event,
+        )
 
     async def record_investigation_result(
         self,
@@ -203,7 +228,7 @@ class CaseService:
         now = utc_now()
         case.last_investigated_at = now
         case.last_diagnosis = diagnosis
-        case.diagnosis_signature = case.signal_signature
+        case.diagnosis_signature = _investigation_signature(case)
         case.recommendations = recommendations or []
         case.investigation_status = status
         case.investigation_error = error
@@ -448,43 +473,39 @@ class CaseService:
             signal_signature=observation.signal_signature,
             policy_version=self.policy.policy_version,
         )
-        case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
-        await self.store.record_alias(CaseIdentityAlias(case_id=case.case_id, alias_type=alias_type, alias_value=alias_value))
-        if observation.source_fingerprint:
-            await self.store.record_alias(
-                CaseIdentityAlias(case_id=case.case_id, alias_type="source_fp", alias_value=observation.source_fingerprint)
-            )
-        if observation.source_event_id:
-            await self.store.record_alias(
+        aliases = [CaseIdentityAlias(case_id=case.case_id, alias_type=alias_type, alias_value=alias_value)]
+        if observation.source_fingerprint and (alias_type, alias_value) != ("source_fp", observation.source_fingerprint):
+            aliases.append(CaseIdentityAlias(case_id=case.case_id, alias_type="source_fp", alias_value=observation.source_fingerprint))
+        if observation.source_event_id and (alias_type, alias_value) != ("source_event_id", observation.source_event_id):
+            aliases.append(
                 CaseIdentityAlias(case_id=case.case_id, alias_type="source_event_id", alias_value=observation.source_event_id)
             )
         events = [
-            await self.store.append_event(
-                CaseEvent(
-                    case_id=case.case_id,
-                    event_type="case_created",
-                    actor_type="system",
-                    source=observation.source,
-                    observed_at=observation.observed_at,
-                    policy_version=self.policy.policy_version,
-                    payload={"observation_id": observation.observation_id, "alias_type": alias_type},
-                )
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="case_created",
+                actor_type="system",
+                source=observation.source,
+                observed_at=observation.observed_at,
+                policy_version=self.policy.policy_version,
+                payload={"observation_id": observation.observation_id, "alias_type": alias_type},
             ),
-            await self.store.append_event(
-                CaseEvent(
-                    case_id=case.case_id,
-                    event_type="case_observed_unhealthy",
-                    actor_type="monitor",
-                    source=observation.source,
-                    observed_at=observation.observed_at,
-                    policy_version=self.policy.policy_version,
-                    payload={
-                        "observation_id": observation.observation_id,
-                        "signal_signature": observation.signal_signature,
-                    },
-                )
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="case_observed_unhealthy",
+                actor_type="monitor",
+                source=observation.source,
+                observed_at=observation.observed_at,
+                policy_version=self.policy.policy_version,
+                payload={
+                    "observation_id": observation.observation_id,
+                    "signal_signature": observation.signal_signature,
+                },
             ),
         ]
+        case, events, created = await self.store.create_atomic_case(case, aliases=aliases, events=events)
+        if not created:
+            return await self._update_unhealthy(case, observation)
         return ObserveResult("created", observation, case, events)
 
     async def _update_unhealthy(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
@@ -565,6 +586,14 @@ def observation_alias(observation: ObservationRecord) -> tuple[AliasType, str]:
 def observation_identity_fingerprint(observation: ObservationRecord) -> str:
     identity = _case_identity(observation)
     return hashlib.sha256(stable_json(identity).encode("utf-8")).hexdigest()[:16]
+
+
+def _investigation_signature(case: AtomicCaseProjection) -> str:
+    return case.signal_signature or case.fingerprint or case.case_id
+
+
+def _investigation_blocked_status(status: str) -> bool:
+    return str(status or "") in {"resolved", "closed", "expired", "linked"}
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:

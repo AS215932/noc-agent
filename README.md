@@ -244,6 +244,18 @@ investigation. Successful graph investigations are stamped back onto CaseService
 case state so repeated identical signals can be skipped until the policy
 cooldown or a signal change.
 
+Reactive webhook intake can be cut over to CaseService with:
+
+```bash
+NOC_CASESERVICE_REACTIVE_PRIMARY=1
+```
+
+With this flag, Alertmanager/Icinga webhooks create/update CaseService cases and
+no longer call legacy `IncidentMemory.intake_alert`. Firing cases still schedule
+the existing graph investigation with a CaseService-derived graph case, and
+CaseService owns duplicate investigation gating. The flag starts the CaseService
+runtime even if `NOC_CASESERVICE_SHADOW` is not set.
+
 The legacy control case surface can be cut over to CaseService with:
 
 ```bash
@@ -351,6 +363,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
 - `NOC_CASESERVICE_REACTIVE_CONTROL` (default `0`; gate reactive graph investigations from case state)
+- `NOC_CASESERVICE_REACTIVE_PRIMARY` (default `0`; make reactive webhooks use CaseService without legacy intake)
 - `NOC_CASESERVICE_CONTROL_PRIMARY` (default `0`; make `/control/cases` use CaseService without legacy fallback)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)

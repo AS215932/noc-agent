@@ -2,8 +2,8 @@ import os
 
 import pytest
 
-from app.cases.models import AtomicCaseProjection, MetaCaseProjection
-from app.cases.postgres import _case_from_payload, _load_asyncpg
+from app.cases.models import AtomicCaseProjection, MetaCaseProjection, ObservationRecord
+from app.cases.postgres import PostgresCaseStore, _case_from_payload, _load_asyncpg
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS, schema_sql
 
@@ -62,6 +62,46 @@ def test_postgres_payload_rehydrates_atomic_or_meta_projection():
     rehydrated_meta = _case_from_payload(meta.model_dump(mode="json"))
     assert isinstance(rehydrated_meta, MetaCaseProjection)
     assert rehydrated_meta.event_fingerprint == "event_fp"
+
+
+@pytest.mark.asyncio
+async def test_postgres_observation_insert_refreshes_payload_on_dedup_key():
+    class _Conn:
+        def __init__(self):
+            self.queries = []
+
+        async def fetchrow(self, query, *args):
+            self.queries.append(query)
+            return {"payload": args[13]}
+
+    class _Acquire:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Pool:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def acquire(self):
+            return _Acquire(self.conn)
+
+    conn = _Conn()
+    store = PostgresCaseStore(_Pool(conn))
+    observation = ObservationRecord(source="alertmanager", status="firing", dedup_key="alertmanager:event:firing")
+
+    stored = await store.put_observation(observation)
+
+    assert stored.dedup_key == observation.dedup_key
+    assert "ON CONFLICT (dedup_key) WHERE dedup_key <> ''" in conn.queries[0]
+    assert "signal_signature = EXCLUDED.signal_signature" in conn.queries[0]
+    assert "payload = jsonb_set(EXCLUDED.payload" in conn.queries[0]
+
 
 
 def test_postgres_store_reports_missing_asyncpg_as_optional_dependency():

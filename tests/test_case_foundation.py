@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -388,6 +389,12 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert created.case is not None
     assert service.should_investigate(created.case)
 
+    started = await service.claim_investigation(created.case)
+    assert started is not None
+    assert not service.should_investigate(started)
+    assert started.investigation_status == "in_progress"
+    assert started.diagnosis_signature == started.signal_signature
+
     investigated = await service.record_investigation_result(
         created.case.case_id,
         diagnosis={"root_cause": "disk growth"},
@@ -396,6 +403,10 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert not service.should_investigate(investigated)
     assert investigated.last_diagnosis["root_cause"] == "disk growth"
     assert investigated.diagnosis_signature == investigated.signal_signature
+    assert [event.event_type for event in await store.case_events(created.case.case_id)][-2:] == [
+        "investigation_started",
+        "investigation_recorded",
+    ]
 
     changed = await service.observe(
         ObservationRecord(source="proactive", rule_id="disk_fill", resource="log", status="firing", signal_snapshot={"free": 2})
@@ -403,6 +414,70 @@ async def test_case_service_investigation_reuse_is_case_grounded():
     assert changed.case is not None
     assert service.should_investigate(changed.case)
     assert [event.event_type for event in await store.case_events(changed.case.case_id)][-1] == "case_signal_changed"
+
+
+@pytest.mark.asyncio
+async def test_case_service_investigation_claim_is_atomic_for_stale_cases():
+    store = InMemoryCaseStore()
+    service = CaseService(store, policy=CasePolicy(investigation_cooldown_s=3600))
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="bgp_session", resource="rtr1", status="firing")
+    )
+    assert created.case is not None
+
+    first, second = await asyncio.gather(
+        service.claim_investigation(created.case),
+        service.claim_investigation(created.case),
+    )
+
+    claims = [claim for claim in (first, second) if claim is not None]
+    assert len(claims) == 1
+    assert not service.should_investigate(claims[0])
+    assert [event.event_type for event in await store.case_events(created.case.case_id)].count("investigation_started") == 1
+
+
+@pytest.mark.asyncio
+async def test_case_service_rejects_stale_claim_after_case_resolved():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    firing = await service.observe(
+        ObservationRecord(source="alertmanager", source_fingerprint="alert-fp", resource="rtr1", status="firing")
+    )
+    assert firing.case is not None
+    resolved = await service.observe(
+        ObservationRecord(source="alertmanager", source_fingerprint="alert-fp", resource="rtr1", status="resolved")
+    )
+    assert resolved.case is not None
+    assert resolved.case.status == "resolved"
+
+    claimed = await service.claim_investigation(firing.case)
+
+    assert claimed is None
+    assert [event.event_type for event in await store.case_events(firing.case.case_id)].count("investigation_started") == 0
+
+
+@pytest.mark.asyncio
+async def test_case_service_first_case_creation_is_idempotent_by_alias():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    first = ObservationRecord(
+        source="alertmanager",
+        source_fingerprint="alert-fp",
+        source_event_id="event-1",
+        dedup_key="alertmanager:event-1:firing",
+        detector="InstanceDown",
+        resource="rtr1",
+        status="firing",
+    )
+    duplicate = first.model_copy(update={"observation_id": "obs_duplicate"})
+
+    first_result, second_result = await asyncio.gather(service.observe(first), service.observe(duplicate))
+
+    assert first_result.case is not None
+    assert second_result.case is not None
+    assert first_result.case.case_id == second_result.case.case_id
+    assert len(await store.list_cases(kind="atomic")) == 1
+    assert await store.resolve_alias("source_fp", "alert-fp") == first_result.case.case_id
 
 
 @pytest.mark.asyncio

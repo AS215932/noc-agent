@@ -58,15 +58,35 @@ class PostgresCaseStore:
 
     async def put_observation(self, observation: ObservationRecord) -> ObservationRecord:
         payload = observation.model_dump(mode="json")
+        conflict_clause = (
+            """
+                ON CONFLICT (dedup_key) WHERE dedup_key <> '' DO UPDATE SET
+                    source = EXCLUDED.source,
+                    detector = EXCLUDED.detector,
+                    status = EXCLUDED.status,
+                    severity = EXCLUDED.severity,
+                    source_event_id = EXCLUDED.source_event_id,
+                    source_fingerprint = EXCLUDED.source_fingerprint,
+                    observed_at = EXCLUDED.observed_at,
+                    received_at = EXCLUDED.received_at,
+                    scan_cycle_id = EXCLUDED.scan_cycle_id,
+                    signal_signature = EXCLUDED.signal_signature,
+                    source_health = EXCLUDED.source_health,
+                    payload = jsonb_set(EXCLUDED.payload, '{observation_id}', to_jsonb(observations.observation_id)),
+                    schema_version = EXCLUDED.schema_version
+            """
+            if observation.dedup_key
+            else "ON CONFLICT (observation_id) DO UPDATE SET observation_id = observations.observation_id"
+        )
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 INSERT INTO observations (
                     observation_id, source, detector, status, severity, dedup_key,
                     source_event_id, source_fingerprint, observed_at, received_at,
                     scan_cycle_id, signal_signature, source_health, payload, schema_version
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
-                ON CONFLICT (observation_id) DO UPDATE SET observation_id = observations.observation_id
+                {conflict_clause}
                 RETURNING payload
                 """,
                 observation.observation_id,
@@ -126,6 +146,145 @@ class PostgresCaseStore:
             )
         return _case_from_payload(_row_payload(row))
 
+    async def create_atomic_case(
+        self,
+        case: AtomicCaseProjection,
+        *,
+        aliases: list[CaseIdentityAlias],
+        events: list[CaseEvent],
+    ) -> tuple[AtomicCaseProjection, list[CaseEvent], bool]:
+        if not aliases:
+            raise ValueError("at least one case identity alias is required")
+        payload = case.model_dump(mode="json")
+        lock_key = f"{aliases[0].alias_type}:{aliases[0].alias_value}"
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
+                for alias in aliases:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT c.payload FROM case_identity_aliases a
+                        JOIN cases c ON c.case_id = a.case_id
+                        WHERE a.alias_type = $1 AND a.alias_value = $2 AND a.retired_at IS NULL
+                        FOR UPDATE OF a, c
+                        """,
+                        alias.alias_type,
+                        alias.alias_value,
+                    )
+                    if existing:
+                        existing_case = _case_from_payload(_row_payload(existing))
+                        if isinstance(existing_case, AtomicCaseProjection):
+                            return existing_case, [], False
+                        raise ValueError(f"active alias {alias.alias_type}:{alias.alias_value} resolved to non-atomic case")
+                if case.fingerprint:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT payload FROM cases
+                        WHERE kind = 'atomic'
+                          AND fingerprint = $1
+                          AND status NOT IN ('resolved', 'expired', 'closed', 'linked')
+                        FOR UPDATE
+                        """,
+                        case.fingerprint,
+                    )
+                    if existing:
+                        existing_case = _case_from_payload(_row_payload(existing))
+                        if isinstance(existing_case, AtomicCaseProjection):
+                            return existing_case, [], False
+                await conn.execute(
+                    """
+                    INSERT INTO cases (
+                        case_id, kind, status, fingerprint, case_number, event_fingerprint,
+                        updated_at, opened_at, payload, schema_version
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+                    """,
+                    case.case_id,
+                    case.kind,
+                    case.status,
+                    case.fingerprint,
+                    case.case_number,
+                    "",
+                    case.updated_at,
+                    case.opened_at,
+                    json.dumps(payload),
+                    case.schema_version,
+                )
+                for alias in aliases:
+                    await conn.execute(
+                        """
+                        INSERT INTO case_identity_aliases (
+                            alias_id, case_id, alias_type, alias_value, source, confidence, created_at, retired_at
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                        """,
+                        alias.alias_id,
+                        alias.case_id,
+                        alias.alias_type,
+                        alias.alias_value,
+                        alias.source,
+                        alias.confidence,
+                        alias.created_at,
+                        alias.retired_at,
+                    )
+                stored_events = []
+                for event in events:
+                    stored_events.append(await _insert_case_event(conn, event))
+        return case.model_copy(deep=True), stored_events, True
+
+    async def claim_investigation(
+        self,
+        case_id: str,
+        *,
+        expected_signal_signature: str,
+        expected_diagnosis_signature: str,
+        expected_last_investigated_at: str,
+        status: str,
+        policy_version: str,
+        now: str,
+        event: CaseEvent,
+    ) -> AtomicCaseProjection | None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", case_id)
+                if not row:
+                    return None
+                case = _case_from_payload(_row_payload(row))
+                if not isinstance(case, AtomicCaseProjection):
+                    return None
+                if str(case.status or "") in {"resolved", "closed", "expired", "linked"}:
+                    return None
+                if (
+                    case.signal_signature != expected_signal_signature
+                    or case.diagnosis_signature != expected_diagnosis_signature
+                    or case.last_investigated_at != expected_last_investigated_at
+                ):
+                    return None
+                case.last_investigated_at = now
+                case.diagnosis_signature = case.signal_signature or case.fingerprint or case.case_id
+                case.investigation_status = status
+                case.investigation_error = ""
+                case.updated_at = now
+                case.policy_version = policy_version
+                payload = case.model_dump(mode="json")
+                updated = await conn.fetchrow(
+                    """
+                    UPDATE cases SET
+                        status = $2,
+                        updated_at = $3,
+                        payload = $4::jsonb,
+                        row_version = cases.row_version + 1,
+                        schema_version = $5
+                    WHERE case_id = $1
+                    RETURNING payload
+                    """,
+                    case.case_id,
+                    case.status,
+                    case.updated_at,
+                    json.dumps(payload),
+                    case.schema_version,
+                )
+                await _insert_case_event(conn, event)
+        return cast(AtomicCaseProjection, _case_from_payload(_row_payload(updated)))
+
     async def get_case(self, case_id: str) -> CaseProjection | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1", case_id)
@@ -140,34 +299,8 @@ class PostgresCaseStore:
         return [_case_from_payload(_row_payload(row)) for row in rows]
 
     async def append_event(self, event: CaseEvent) -> CaseEvent:
-        payload = event.model_dump(mode="json")
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO case_events (
-                    event_id, case_id, meta_case_id, event_type, actor_type, actor_id,
-                    source, occurred_at, observed_at, correlation_id, causation_id,
-                    policy_version, payload, schema_version
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
-                ON CONFLICT (event_id) DO UPDATE SET event_id = case_events.event_id
-                RETURNING payload
-                """,
-                event.event_id,
-                event.case_id,
-                event.meta_case_id,
-                event.event_type,
-                event.actor_type,
-                event.actor_id,
-                event.source,
-                event.occurred_at,
-                event.observed_at,
-                event.correlation_id,
-                event.causation_id,
-                event.policy_version,
-                json.dumps(payload),
-                event.schema_version,
-            )
-        return CaseEvent.model_validate(_row_payload(row))
+            return await _insert_case_event(conn, event)
 
     async def case_events(self, case_id: str) -> list[CaseEvent]:
         async with self.pool.acquire() as conn:
@@ -374,6 +507,37 @@ class PostgresCaseStore:
             else:
                 rows = await conn.fetch("SELECT payload FROM operator_feedback ORDER BY created_at")
         return [OperatorFeedback.model_validate(_row_payload(row)) for row in rows]
+
+
+async def _insert_case_event(conn: Any, event: CaseEvent) -> CaseEvent:
+    payload = event.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO case_events (
+            event_id, case_id, meta_case_id, event_type, actor_type, actor_id,
+            source, occurred_at, observed_at, correlation_id, causation_id,
+            policy_version, payload, schema_version
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
+        ON CONFLICT (event_id) DO UPDATE SET event_id = case_events.event_id
+        RETURNING payload
+        """,
+        event.event_id,
+        event.case_id,
+        event.meta_case_id,
+        event.event_type,
+        event.actor_type,
+        event.actor_id,
+        event.source,
+        event.occurred_at,
+        event.observed_at,
+        event.correlation_id,
+        event.causation_id,
+        event.policy_version,
+        json.dumps(payload),
+        event.schema_version,
+    )
+    return CaseEvent.model_validate(_row_payload(row))
+
 
 
 def _load_asyncpg() -> Any:
