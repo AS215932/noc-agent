@@ -251,10 +251,11 @@ NOC_CASESERVICE_REACTIVE_PRIMARY=1
 ```
 
 With this flag, Alertmanager/Icinga webhooks create/update CaseService cases and
-no longer call legacy `IncidentMemory.intake_alert`. Firing cases still schedule
-the existing graph investigation with a CaseService-derived graph case, and
-CaseService owns duplicate investigation gating. The flag starts the CaseService
-runtime even if `NOC_CASESERVICE_SHADOW` is not set.
+no longer call legacy `IncidentMemory.intake_alert`. Firing cases schedule the
+graph investigation with a CaseService-derived graph case, use CaseService-backed
+graph context/summaries instead of legacy `IncidentMemory`, and CaseService owns
+duplicate investigation gating. The flag starts the CaseService runtime even if
+`NOC_CASESERVICE_SHADOW` is not set.
 
 The legacy control case surface can be cut over to CaseService with:
 

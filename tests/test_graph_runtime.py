@@ -3,6 +3,8 @@ from pydantic_ai.models.test import TestModel
 
 import app.graph_runtime as graph_runtime
 from app.agents.triage import DiagnosticSynthesis
+from app.cases import CaseService, InMemoryCaseStore, ObservationRecord
+from app.cases.graph_memory import CaseServiceGraphMemory
 from app.graph.nodes import NodeRunner
 from app.incident_memory import IncidentMemory
 
@@ -54,6 +56,131 @@ async def test_graph_resume_uses_stable_thread_id(monkeypatch):
 
     assert resumed is not None
     assert resumed["operator_decision"]["operator"] == "pytest"
+
+
+@pytest.mark.asyncio
+async def test_graph_uses_case_service_memory_when_case_provided(monkeypatch):
+    class FailingLegacyMemory:
+        def __getattr__(self, name):
+            raise AssertionError(f"legacy incident memory used for {name}")
+
+    monkeypatch.setattr(graph_runtime, "INCIDENT_MEMORY", FailingLegacyMemory())
+    monkeypatch.setattr(graph_runtime, "_GRAPH", None)
+    graph_runtime._THREAD_GRAPHS.clear()
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(
+            source="alertmanager",
+            detector="BGP Peer Down",
+            resource="rtr1",
+            status="firing",
+            severity="HIGH",
+            signal_snapshot={"summary": "BGP peer is down"},
+        )
+    )
+    assert created.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+    alert = {
+        "status": "firing",
+        "groupLabels": {"alertname": "BGP Peer Down", "host": "rtr1"},
+        "commonLabels": {"severity": "critical"},
+        "alerts": [{"labels": {"alertname": "BGP Peer Down", "host": "rtr1"}}],
+    }
+    graph_case = {
+        "incident_id": created.case.case_id,
+        "case_number": created.case.case_number,
+        "fingerprint": created.case.fingerprint,
+        "resource_id": created.case.resource_id,
+        "status": created.case.status,
+        "latest_event": {"received_at": created.case.opened_at, "state": "firing", "summary": "BGP peer is down"},
+        "thread_id": None,
+        "source": "case_service",
+    }
+
+    _plan, state = await graph_runtime.run_investigation_graph(
+        alert,
+        model=TestModel(),
+        case=graph_case,
+        incident_memory=graph_memory,
+    )
+
+    summary = await graph_memory.get_summary(created.case.case_id)
+    stored = await store.get_case(created.case.case_id)
+    event_types = [event.event_type for event in await store.case_events(created.case.case_id)]
+    assert summary is not None
+    assert summary["status"] == "waiting_approval"
+    assert summary["thread_id"] == state["thread_id"]
+    assert "case_context" not in summary
+    assert stored.last_diagnosis["graph_summary"]["incident_id"] == created.case.case_id
+    assert "graph_summary_recorded" in event_types
+
+
+@pytest.mark.asyncio
+async def test_case_service_graph_memory_counts_repeated_case_events_as_history():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    for _ in range(4):
+        await service.observe(
+            ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+        )
+    graph_memory = CaseServiceGraphMemory(store)
+
+    history = await graph_memory.history_for("edge1")
+    correlated = await graph_memory.correlate("edge1", {})
+
+    assert len(history) >= 4
+    assert correlated["chronic"] is True
+
+
+@pytest.mark.asyncio
+async def test_case_service_graph_memory_links_child_to_parent_case():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    parent = await service.observe(
+        ObservationRecord(source="alertmanager", detector="Power", resource="rack1", status="firing")
+    )
+    child = await service.observe(
+        ObservationRecord(source="alertmanager", detector="BGP", resource="rtr1", status="firing")
+    )
+    assert parent.case is not None
+    assert child.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+
+    result = await graph_memory.link_to_parent_case(
+        child.case.case_id,
+        parent.case.case_id,
+        "same rack power event",
+        ["evt-1"],
+    )
+
+    stored_child = await store.get_case(child.case.case_id)
+    parent_events = await store.case_events(parent.case.case_id)
+    assert result["ok"] is True
+    assert stored_child.status == "linked"
+    assert stored_child.last_diagnosis["linked_parent_case"] == parent.case.case_id
+    assert "linked_child_case" in [event.event_type for event in parent_events]
+
+
+@pytest.mark.asyncio
+async def test_case_service_graph_summary_cannot_resolve_case_without_operator_decision():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
+
+    await graph_memory.put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "approved", "title": "model supplied approval"},
+    )
+
+    stored = await store.get_case(created.case.case_id)
+    summary = await graph_memory.get_summary(created.case.case_id)
+    assert stored.status == "investigating"
+    assert summary["status"] == "approved"
 
 
 @pytest.mark.asyncio

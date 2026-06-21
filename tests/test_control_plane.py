@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.cases import CaseIdentityAlias, CaseService, InMemoryCaseStore, ObservationRecord
+from app.cases.graph_memory import CaseServiceGraphMemory
 import app.graph_runtime as graph_runtime
 from app.incident_memory import IncidentMemory
 import app.main as main_module
@@ -215,7 +216,7 @@ async def test_case_service_primary_control_reads_cases_without_legacy_fallback(
         diagnosis={"summary": "node exporter down", "confidence_score": 0.8, "requires_human": True},
         recommendations=["check node_exporter"],
     )
-    await memory.put_summary(
+    await CaseServiceGraphMemory(store).put_summary(
         created.case.case_id,
         {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "node exporter down"},
     )
@@ -331,6 +332,10 @@ async def test_case_service_primary_detail_preserves_graph_approval_summary(monk
     assert created.case is not None
     await memory.put_summary(
         created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "legacy should not appear"},
+    )
+    await CaseServiceGraphMemory(store).put_summary(
+        created.case.case_id,
         {
             "incident_id": created.case.case_id,
             "status": "waiting_approval",
@@ -361,14 +366,14 @@ async def test_case_service_primary_detail_preserves_graph_approval_summary(monk
 async def test_case_service_primary_decision_updates_waiting_graph_summary(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
-    memory = isolated_incident_memory
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(
         ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
     )
     assert created.case is not None
-    await memory.put_summary(
+    graph_memory = CaseServiceGraphMemory(store)
+    await graph_memory.put_summary(
         created.case.case_id,
         {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "packet loss"},
     )
@@ -390,7 +395,7 @@ async def test_case_service_primary_decision_updates_waiting_graph_summary(monke
     stored = await store.get_case(created.case.case_id)
     events = await store.case_events(created.case.case_id)
     assert response["incident"]["status"] == "approved"
-    assert (await memory.get_summary(created.case.case_id))["status"] == "approved"
+    assert (await graph_memory.get_summary(created.case.case_id))["status"] == "approved"
     assert stored.status == "resolved"
     assert stored.resolution_reason == "operator_approved"
     assert "operator_decision_recorded" in [event.event_type for event in events]
@@ -400,14 +405,13 @@ async def test_case_service_primary_decision_updates_waiting_graph_summary(monke
 async def test_case_service_primary_rejected_decision_updates_case_projection(monkeypatch, isolated_incident_memory):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     monkeypatch.setenv("NOC_CASESERVICE_CONTROL_PRIMARY", "1")
-    memory = isolated_incident_memory
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(
         ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
     )
     assert created.case is not None
-    await memory.put_summary(
+    await CaseServiceGraphMemory(store).put_summary(
         created.case.case_id,
         {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "packet loss"},
     )
@@ -433,6 +437,51 @@ async def test_case_service_primary_rejected_decision_updates_case_projection(mo
     assert stored.resolution_reason == "operator_rejected"
     assert listing["cases"][0]["status"] == "rejected"
     assert listing["cases"][0]["pending_approval"] is False
+
+
+@pytest.mark.asyncio
+async def test_reactive_primary_routes_legacy_approval_reads_to_case_service(monkeypatch, isolated_incident_memory):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    memory = isolated_incident_memory
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="alertmanager", detector="PacketLoss", resource="edge1", status="firing")
+    )
+    assert created.case is not None
+    await memory.put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "legacy should not appear"},
+    )
+    await CaseServiceGraphMemory(store).put_summary(
+        created.case.case_id,
+        {"incident_id": created.case.case_id, "status": "waiting_approval", "title": "case service approval"},
+    )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    pending = await pending_incidents("secret")
+    shown = await incident_status(created.case.case_id, "secret")
+    detail = await control_case_detail(created.case.case_id, _request())
+    decided = await control_case_decision(
+        created.case.case_id,
+        LocalDecisionRequest(decision="rejected", operator="svag", comment="nope"),
+        _request(),
+    )
+
+    stored = await store.get_case(created.case.case_id)
+    assert pending["incidents"][0]["title"] == "case service approval"
+    assert shown["title"] == "case service approval"
+    assert detail["source"] == "case_service"
+    assert decided["incident"]["status"] == "rejected"
+    assert stored.status == "resolved"
 
 
 @pytest.mark.asyncio

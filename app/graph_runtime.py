@@ -23,15 +23,16 @@ async def intake_alert(alert_payload: dict[str, Any]) -> CaseIntakeResult:
     return await INCIDENT_MEMORY.intake_alert(alert_payload)
 
 
-async def inject_case_event(case: dict[str, Any], event: dict[str, Any]) -> bool:
+async def inject_case_event(case: dict[str, Any], event: dict[str, Any], *, incident_memory=None) -> bool:
+    memory = incident_memory or INCIDENT_MEMORY
     thread_id = case.get("thread_id")
     if not thread_id:
         return False
     graph = _THREAD_GRAPHS.get(thread_id) or await _graph(
-        RuntimeDeps.build(incident_memory=INCIDENT_MEMORY),
-        cache=True,
+        RuntimeDeps.build(incident_memory=memory),
+        cache=incident_memory is None,
     )
-    context = await INCIDENT_MEMORY.case_context(case["incident_id"])
+    context = await memory.case_context(case["incident_id"])
     config = {"configurable": {"thread_id": thread_id}}
     existing_values: dict[str, Any] = {}
     if hasattr(graph, "aget_state"):
@@ -91,14 +92,23 @@ async def run_investigation_graph(
     model=None,
     mcp_runtime=None,
     case: dict[str, Any] | None = None,
+    *,
+    incident_memory=None,
 ) -> tuple[DiagnosticSynthesis, WorkflowState]:
+    memory = incident_memory or INCIDENT_MEMORY
     if case is None:
-        intake = await INCIDENT_MEMORY.intake_alert(alert_payload)
+        intake = await memory.intake_alert(alert_payload)
         case = intake.case
     incident_id = case["incident_id"] if case else str(uuid4())
     thread_id = case.get("thread_id") if case and case.get("thread_id") else str(uuid4())
-    case_context = await INCIDENT_MEMORY.case_context(incident_id) if case else {}
-    latest_event = case_context.get("event_timeline", [{}])[-1] if case_context.get("event_timeline") else case_event_from_alert(alert_payload)
+    case_context = await memory.case_context(incident_id) if case else {}
+    latest_event = (
+        case.get("latest_event")
+        if case and case.get("latest_event")
+        else case_context.get("event_timeline", [{}])[-1]
+        if case_context.get("event_timeline")
+        else case_event_from_alert(alert_payload)
+    )
     state: WorkflowState = {
         "incident_id": incident_id,
         "case_number": case.get("case_number", "") if case else "",
@@ -133,14 +143,14 @@ async def run_investigation_graph(
     assert_json_serializable_state(state)
 
     runtime = RuntimeDeps.build(
-        incident_memory=INCIDENT_MEMORY,
+        incident_memory=memory,
         mcp_runtime=mcp_runtime,
         model_override=model,
     )
-    graph = await _graph(runtime, cache=model is None and mcp_runtime is None)
+    graph = await _graph(runtime, cache=model is None and mcp_runtime is None and incident_memory is None)
     _THREAD_GRAPHS[thread_id] = graph
     if case:
-        await INCIDENT_MEMORY.set_case_thread(incident_id, thread_id)
+        await memory.set_case_thread(incident_id, thread_id)
     result_state = await graph.ainvoke(
         state,
         {"configurable": {"thread_id": thread_id}},
@@ -148,13 +158,13 @@ async def run_investigation_graph(
     result_state = {key: value for key, value in result_state.items() if key != "__interrupt__"}
     synthesis = DiagnosticSynthesis.model_validate(result_state["diagnostic_synthesis"])
     if case:
-        await INCIDENT_MEMORY.update_case(
+        await memory.update_case(
             incident_id,
             {
                 "status": "waiting_approval",
                 "thread_id": thread_id,
                 "diagnostic_summary": synthesis.incident_summary,
-                "case_context": await INCIDENT_MEMORY.case_context(incident_id),
+                "case_context": await memory.case_context(incident_id),
             },
         )
     return synthesis, result_state
@@ -169,17 +179,24 @@ async def summary_for(incident_id: str) -> dict[str, Any] | None:
     return await INCIDENT_MEMORY.get_summary(resolved or incident_id)
 
 
-async def record_operator_decision(incident_id: str, decision: dict[str, Any], mcp_runtime=None) -> dict[str, Any] | None:
-    resolved = await INCIDENT_MEMORY.resolve_case_identifier(incident_id)
+async def record_operator_decision(
+    incident_id: str,
+    decision: dict[str, Any],
+    mcp_runtime=None,
+    *,
+    incident_memory=None,
+) -> dict[str, Any] | None:
+    memory = incident_memory or INCIDENT_MEMORY
+    resolved = await memory.resolve_case_identifier(incident_id)
     incident_id = resolved or incident_id
     decision = {**decision, "incident_id": incident_id}
-    summary = await INCIDENT_MEMORY.get_summary(incident_id)
+    summary = await memory.get_summary(incident_id)
     if not summary:
         return None
     status = decision.get("decision", "acknowledged")
     final_state = None
     if status == "approved" and summary.get("thread_id"):
-        final_state = await resume_investigation(incident_id, decision, mcp_runtime=mcp_runtime)
+        final_state = await resume_investigation(incident_id, decision, mcp_runtime=mcp_runtime, incident_memory=memory)
     summary.update(
         {
             "status": "approved" if status == "approved" else "rejected" if status == "rejected" else "finalized",
@@ -195,8 +212,8 @@ async def record_operator_decision(incident_id: str, decision: dict[str, Any], m
             summary["status"] = "resolved"
         elif final_state.get("approval_state") in {"verification_failed", "execution_failed", "approved_no_executable_action"}:
             summary["status"] = "waiting_approval"
-    await INCIDENT_MEMORY.put_summary(incident_id, summary)
-    await INCIDENT_MEMORY.update_case(
+    await memory.put_summary(incident_id, summary)
+    await memory.update_case(
         incident_id,
         {
             "status": "waiting_approval" if summary["status"] == "waiting_approval" else "resolved",
@@ -209,14 +226,24 @@ async def record_operator_decision(incident_id: str, decision: dict[str, Any], m
     return summary
 
 
-async def resume_investigation(incident_id: str, decision: dict[str, Any], mcp_runtime=None) -> WorkflowState | None:
-    resolved = await INCIDENT_MEMORY.resolve_case_identifier(incident_id)
+async def resume_investigation(
+    incident_id: str,
+    decision: dict[str, Any],
+    mcp_runtime=None,
+    *,
+    incident_memory=None,
+) -> WorkflowState | None:
+    memory = incident_memory or INCIDENT_MEMORY
+    resolved = await memory.resolve_case_identifier(incident_id)
     incident_id = resolved or incident_id
-    summary = await INCIDENT_MEMORY.get_summary(incident_id)
+    summary = await memory.get_summary(incident_id)
     if not summary or not summary.get("thread_id"):
         return None
-    runtime = RuntimeDeps.build(incident_memory=INCIDENT_MEMORY, mcp_runtime=mcp_runtime)
-    graph = _THREAD_GRAPHS.get(summary["thread_id"]) or await _graph(runtime, cache=mcp_runtime is None)
+    runtime = RuntimeDeps.build(incident_memory=memory, mcp_runtime=mcp_runtime)
+    graph = _THREAD_GRAPHS.get(summary["thread_id"]) or await _graph(
+        runtime,
+        cache=mcp_runtime is None and incident_memory is None,
+    )
     state = await graph.ainvoke(
         Command(resume=decision),
         {"configurable": {"thread_id": summary["thread_id"]}},
