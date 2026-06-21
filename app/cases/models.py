@@ -51,8 +51,6 @@ AliasType = Literal[
     "source_event_id",
     "rule_entity",
     "issue_marker",
-    "legacy_case_number",
-    "legacy_incident_id",
     "external_issue_id",
 ]
 OutboxIntentType = Literal[

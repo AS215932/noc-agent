@@ -2,7 +2,6 @@
 
 This package defines the typed contracts and store boundary used by the
 CaseService-backed proactive, reactive-primary, and control-primary paths.
-Legacy IncidentMemory remains only as a deletion candidate for old tests.
 """
 
 from app.cases.correlation import CorrelationService, MetaCaseResult, event_fingerprint_from_parts

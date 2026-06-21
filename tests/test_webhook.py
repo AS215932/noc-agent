@@ -25,7 +25,6 @@ from app.main import (
 )
 from app.agent import DiagnosticSynthesis
 from app.cases import CaseService, InMemoryCaseStore
-from app.incident_memory import IncidentMemory
 import app.main as main_module
 from app.mcp_runtime import MCPRuntime
 from fastapi import Response, status
@@ -38,13 +37,6 @@ def restore_runtime_globals():
     original_case_service_runtime = main_module.case_service_runtime
     yield
     main_module.case_service_runtime = original_case_service_runtime
-
-
-@pytest.fixture
-def isolated_incident_memory():
-    """Provide a fresh legacy IncidentMemory for no-fallback assertions."""
-
-    yield IncidentMemory(redis_url="")
 
 
 @pytest.fixture
@@ -318,12 +310,12 @@ async def test_alertmanager_webhook_requires_reactive_primary(monkeypatch, mock_
         await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), BackgroundTasks())
 
     assert exc.value.status_code == 503
-    assert "legacy IncidentMemory intake has been removed" in exc.value.detail
+    assert "legacy reactive intake has been removed" in exc.value.detail
 
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_legacy(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory, isolated_case_service_runtime
+async def test_alertmanager_webhook_reactive_primary_uses_case_service(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
     _, _, store = isolated_case_service_runtime
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
@@ -335,19 +327,17 @@ async def test_alertmanager_webhook_reactive_primary_uses_case_service_without_l
     )
 
     cases = await store.list_cases(kind="atomic")
-    legacy_cases = await isolated_incident_memory.list_cases()
     scheduled = [call.args[0].__name__ for call in background_tasks.add_task.call_args_list]
     assert response["source"] == "case_service"
     assert response["status"] == "accepted"
     assert response["incident_id"] == cases[0].case_id
-    assert legacy_cases == []
     assert scheduled == ["investigate_alert"]
     assert background_tasks.add_task.call_args.kwargs["case"]["incident_id"] == cases[0].case_id
 
 
 @pytest.mark.asyncio
 async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigation(
-    monkeypatch, mock_alert_payload, mocker, isolated_incident_memory, isolated_case_service_runtime
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
     _, service, _ = isolated_case_service_runtime
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
@@ -366,7 +356,6 @@ async def test_alertmanager_webhook_reactive_primary_gates_duplicate_investigati
     assert response["source"] == "case_service"
     assert response["incident_id"] == case.case_id
     background_tasks.add_task.assert_not_called()
-    assert await isolated_incident_memory.list_cases() == []
 
 
 @pytest.mark.asyncio
@@ -602,7 +591,7 @@ async def test_icinga_webhook_requires_reactive_primary(mocker):
         await icinga_webhook(notification, mocker.Mock())
 
     assert exc.value.status_code == 503
-    assert "legacy IncidentMemory intake has been removed" in exc.value.detail
+    assert "legacy reactive intake has been removed" in exc.value.detail
 
 def test_triage_fields_turn_internal_schema_failure_into_operator_guidance(mock_alert_payload):
     plan = DiagnosticSynthesis.model_validate({
@@ -734,7 +723,7 @@ async def test_shadow_observe_alert_payload_preserves_partial_results(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_alertmanager_webhook_does_not_create_legacy_aliases(
+async def test_alertmanager_webhook_records_source_alias(
     monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
     _, _, store = isolated_case_service_runtime
@@ -742,36 +731,11 @@ async def test_alertmanager_webhook_does_not_create_legacy_aliases(
     background_tasks = mocker.Mock()
 
     response = await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), background_tasks)
+    cases = await store.list_cases(kind="atomic")
 
     assert response["status"] == "accepted"
-    assert await store.resolve_alias("legacy_case_number", response["case_number"] or "") is None
-    assert await store.resolve_alias("legacy_incident_id", response["incident_id"] or "") is None
-
-
-@pytest.mark.asyncio
-async def test_reactive_case_service_control_without_primary_is_removed(
-    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
-):
-    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
-    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
-
-    with pytest.raises(HTTPException) as exc:
-        await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), mocker.Mock())
-
-    assert exc.value.status_code == 503
-
-
-@pytest.mark.asyncio
-async def test_reactive_case_service_control_no_longer_fails_open_to_legacy(
-    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
-):
-    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_CONTROL", "1")
-    monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
-
-    with pytest.raises(HTTPException) as exc:
-        await alertmanager_webhook(AlertManagerPayload.model_validate(mock_alert_payload), mocker.Mock())
-
-    assert exc.value.status_code == 503
+    assert cases
+    assert await store.resolve_alias("source_fp", cases[0].fingerprint) == cases[0].case_id
 
 
 @pytest.mark.asyncio

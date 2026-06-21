@@ -117,14 +117,14 @@ def _env_bool(name: str, default: bool) -> bool:
 def _require_case_service_reactive_primary() -> None:
     raise HTTPException(
         status_code=503,
-        detail="Reactive webhooks require NOC_CASESERVICE_REACTIVE_PRIMARY=1; legacy IncidentMemory intake has been removed",
+        detail="Reactive webhooks require NOC_CASESERVICE_REACTIVE_PRIMARY=1; legacy reactive intake has been removed",
     )
 
 
 def _require_case_service_control_routes() -> None:
     raise HTTPException(
         status_code=410,
-        detail="Control case routes require CaseService primary routes; legacy IncidentMemory control paths have been removed",
+        detail="Control case routes require CaseService primary routes; legacy control paths have been removed",
     )
 
 
@@ -647,7 +647,7 @@ async def investigate_alert(
             model=model,
             mcp_runtime=runtime,
             case=case,
-            incident_memory=graph_memory,
+            graph_memory=graph_memory,
         )
         record_success("triage", run_started, _SyntheticRunResult())
     except Exception as e:
@@ -765,9 +765,7 @@ def _case_service_reactive_primary_enabled() -> bool:
 def _case_service_reactive_investigation_result(shadow_results: list[object]):
     """Return the firing CaseService result that should be investigated, if any."""
     first_firing = None
-    if case_service_runtime is None or not (
-        _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False) or _case_service_reactive_primary_enabled()
-    ):
+    if case_service_runtime is None or not _case_service_reactive_primary_enabled():
         return _case_service_primary_result(shadow_results, firing_only=True)
     service = case_service_runtime.service
     firing_case_ids: list[str] = []
@@ -786,7 +784,7 @@ def _case_service_reactive_investigation_result(shadow_results: list[object]):
                 return result
     except Exception as e:
         safe = classify_exception(e)
-        record_case_service_shadow_failure(path="reactive_control", category=safe.category)
+        record_case_service_shadow_failure(path="reactive_primary", category=safe.category)
         log_exception("case_service_reactive_investigation_gate_failed", e, category=safe.category)
         log.warn("case_service_reactive_investigation_gate_fail_open", category=safe.category)
         return first_firing
@@ -840,7 +838,7 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
             )
     except Exception as e:
         safe = classify_exception(e)
-        record_case_service_shadow_failure(path="reactive_control", category=safe.category)
+        record_case_service_shadow_failure(path="reactive_primary", category=safe.category)
         log_exception("case_service_reactive_investigation_record_failed", e, category=safe.category)
 
 
@@ -852,10 +850,6 @@ async def _case_service_case_for_identifier(identifier: str):
     case = await store.get_case(lookup_identifier)
     if case is not None:
         return case
-    for alias_type in ("legacy_incident_id", "legacy_case_number"):
-        case_id = await store.resolve_alias(alias_type, lookup_identifier)
-        if case_id:
-            return await store.get_case(case_id)
     for candidate in await store.list_cases(limit=500):
         if str(getattr(candidate, "case_number", "") or "").strip() == lookup_identifier:
             return candidate
@@ -869,7 +863,7 @@ async def _write_case_service_operator_feedback(
     feedback_type: str,
     comment: str = "",
     payload: dict | None = None,
-    legacy_identifier: str = "",
+    submitted_identifier: str = "",
 ):
     from app.cases.models import OperatorFeedback
 
@@ -883,7 +877,7 @@ async def _write_case_service_operator_feedback(
             payload={
                 **_safe_case_service_feedback_payload(payload or {}),
                 "comment": rendered_comment,
-                "legacy_identifier": _safe_monitor_token(legacy_identifier or case.case_id, limit=128),
+                "submitted_identifier": _safe_monitor_token(submitted_identifier or case.case_id, limit=128),
                 "untrusted_operator_text": True,
                 "model_consumption_allowed": False,
             },
@@ -920,7 +914,7 @@ async def _record_case_service_operator_feedback(
             feedback_type=feedback_type,
             comment=comment,
             payload=payload,
-            legacy_identifier=identifier,
+            submitted_identifier=identifier,
         )
     except Exception as e:
         safe = classify_exception(e)
@@ -1178,7 +1172,7 @@ async def _record_control_incident_decision(incident_id: str, request_body) -> d
         incident_id,
         decision.model_dump(),
         mcp_runtime=mcp_runtime,
-        incident_memory=graph_memory,
+        graph_memory=graph_memory,
     )
     case_id = await graph_memory.resolve_case_identifier(incident_id)
     case = await case_service_runtime.store.get_case(case_id) if case_id else None
@@ -1194,7 +1188,7 @@ async def _record_case_service_primary_decision(case, request_body) -> dict | No
         incident_id,
         decision.model_dump(),
         mcp_runtime=mcp_runtime,
-        incident_memory=CaseServiceGraphMemory(case_service_runtime.store),
+        graph_memory=CaseServiceGraphMemory(case_service_runtime.store),
     )
     if summary is None and request_body.decision == "approved":
         raise HTTPException(status_code=409, detail="No resumable investigation found for CaseService case")
@@ -1331,7 +1325,7 @@ async def _case_service_control_comment_response(case, request_body) -> dict[str
         feedback_type="operator_note",
         comment=request_body.comment,
         payload={"source": "control_case_comment"},
-        legacy_identifier=case.case_id,
+        submitted_identifier=case.case_id,
     )
     updated = await _case_service_case_for_identifier(case.case_id) or case
     return {"status": "ok", "case": _case_service_control_case_payload(updated)}
@@ -1352,7 +1346,7 @@ async def _case_service_control_decision_response(case, request_body) -> dict[st
         feedback_type=_feedback_type_for_decision(request_body.decision),
         comment=request_body.comment,
         payload={"source": "control_case_decision", "decision": request_body.decision},
-        legacy_identifier=case.case_id,
+        submitted_identifier=case.case_id,
     )
     updated = await _case_service_case_for_identifier(case.case_id) or case
     return {"status": "ok", "incident": summary or _case_service_control_summary(updated)}

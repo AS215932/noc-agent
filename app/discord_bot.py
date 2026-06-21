@@ -98,7 +98,7 @@ async def record_operator_decision(
         incident_id,
         decision,
         mcp_runtime=mcp_runtime,
-        incident_memory=CaseServiceGraphMemory(runtime.store),
+        graph_memory=CaseServiceGraphMemory(runtime.store),
     )
 
 
@@ -477,7 +477,7 @@ class NOCDiscordBot:
             graph_memory = CaseServiceGraphMemory(case_service_runtime.store)
             graph_case = await _create_operator_graph_case(case_service_runtime, graph_memory, payload, prompt, source)
             plan, state = await asyncio.wait_for(
-                run_investigation_graph(payload, case=graph_case, incident_memory=graph_memory),
+                run_investigation_graph(payload, case=graph_case, graph_memory=graph_memory),
                 timeout=self.investigation_timeout_s,
             )
             incident_id = state["incident_id"]

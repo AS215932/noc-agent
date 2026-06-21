@@ -34,7 +34,7 @@ class NodeRunner:
         self.runtime = runtime
 
     async def correlate_and_dedupe(self, state: WorkflowState) -> dict[str, Any]:
-        result = await self.runtime.incident_memory.correlate(state["resource_id"], state["normalized_alert"])
+        result = await self.runtime.graph_memory.correlate(state["resource_id"], state["normalized_alert"])
         update = {
             "current_step": "correlate_and_dedupe",
             "updated_at": utc_now(),
@@ -48,7 +48,7 @@ class NodeRunner:
         return update
 
     async def recall_history(self, state: WorkflowState) -> dict[str, Any]:
-        history = await self.runtime.incident_memory.history_for(state["resource_id"])
+        history = await self.runtime.graph_memory.history_for(state["resource_id"])
         update = {
             "current_step": "recall_history",
             "updated_at": utc_now(),
@@ -193,8 +193,8 @@ class NodeRunner:
         summary["fingerprint"] = state.get("fingerprint", "")
         summary["event_count"] = state.get("case_event_count", 0)
         summary["case_context"] = state.get("case_context", {})
-        await self.runtime.incident_memory.put_summary(state["incident_id"], summary)
-        await self.runtime.incident_memory.update_case(
+        await self.runtime.graph_memory.put_summary(state["incident_id"], summary)
+        await self.runtime.graph_memory.update_case(
             state["incident_id"],
             {
                 "status": "waiting_approval",
@@ -385,7 +385,7 @@ class NodeRunner:
             """Link a downstream victim case to an upstream parent NOC case."""
             if child_case_id != state["incident_id"]:
                 return {"ok": False, "error": "child_case_id must match the active case"}
-            return await self.runtime.incident_memory.link_to_parent_case(
+            return await self.runtime.graph_memory.link_to_parent_case(
                 child_case_id,
                 parent_case_id,
                 reason,

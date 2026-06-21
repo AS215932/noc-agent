@@ -72,7 +72,6 @@ module = [
     "app.graph.checkpointing",
     "app.graph.nodes",
     "app.graph_runtime",
-    "app.incident_memory",
     "app.mail",
     "app.main",
     "app.quota",

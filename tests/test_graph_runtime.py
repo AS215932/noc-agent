@@ -52,7 +52,7 @@ async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
         _ALERT,
         model=TestModel(),
         case=graph_case,
-        incident_memory=graph_memory,
+        graph_memory=graph_memory,
     )
 
     assert plan.incident_summary is not None
@@ -80,12 +80,12 @@ async def test_graph_resume_uses_stable_thread_id(monkeypatch):
         _ALERT,
         model=TestModel(),
         case=graph_case,
-        incident_memory=graph_memory,
+        graph_memory=graph_memory,
     )
     resumed = await graph_runtime.resume_investigation(
         state["incident_id"],
         {"decision": "acknowledged", "operator": "pytest", "comment": "ok"},
-        incident_memory=graph_memory,
+        graph_memory=graph_memory,
     )
 
     assert resumed is not None
@@ -95,7 +95,7 @@ async def test_graph_resume_uses_stable_thread_id(monkeypatch):
 @pytest.mark.asyncio
 async def test_graph_requires_explicit_case_and_memory():
     with pytest.raises(RuntimeError, match="explicit case"):
-        await graph_runtime.run_investigation_graph(_ALERT, model=TestModel(), incident_memory=object())
+        await graph_runtime.run_investigation_graph(_ALERT, model=TestModel(), graph_memory=object())
 
     graph_case = {
         "incident_id": "case_123",
@@ -119,7 +119,7 @@ async def test_graph_uses_case_service_memory_when_case_provided(monkeypatch):
         _ALERT,
         model=TestModel(),
         case=graph_case,
-        incident_memory=graph_memory,
+        graph_memory=graph_memory,
     )
 
     summary = await graph_memory.get_summary(graph_case["incident_id"])
@@ -254,7 +254,7 @@ async def test_record_operator_decision_updates_case_service_summary():
     updated = await graph_runtime.record_operator_decision(
         created.case.case_id,
         {"incident_id": created.case.case_id, "decision": "approved", "operator": "svag", "comment": "ok"},
-        incident_memory=graph_memory,
+        graph_memory=graph_memory,
     )
     case = await store.get_case(created.case.case_id)
     stored_summary = await graph_memory.get_summary(created.case.case_id)
@@ -265,75 +265,6 @@ async def test_record_operator_decision_updates_case_service_summary():
     assert stored_summary["incident_id"] == created.case.case_id
     assert stored_summary["case_number"] == created.case.case_number
     assert case.status == "resolved"
-
-
-@pytest.mark.asyncio
-async def test_inject_case_event_updates_existing_graph_state(monkeypatch):
-    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
-    case = await graph_memory.set_case_thread(graph_case["incident_id"], "thread-1")
-
-    class FakeSnapshot:
-        values = {
-            "related_alerts": [{"status": "firing"}],
-            "diagnostic_synthesis": {"incident_summary": "keep me"},
-        }
-
-    class FakeGraph:
-        def __init__(self):
-            self.update = None
-
-        async def aget_state(self, config):
-            return FakeSnapshot()
-
-        async def aupdate_state(self, config, values, as_node=None):
-            self.update = values
-
-    graph = FakeGraph()
-    monkeypatch.setitem(graph_runtime._THREAD_GRAPHS, "thread-1", graph)
-    event = {"received_at": "2026-05-20T19:40:00Z", "state": "CRITICAL", "summary": "worse"}
-
-    assert await graph_runtime.inject_case_event(case, event, incident_memory=graph_memory) is True
-    assert graph.update["related_alerts"] == [{"status": "firing"}, event]
-    assert "diagnostic_synthesis" not in graph.update
-    assert graph.update["latest_event"] == event
-
-
-@pytest.mark.asyncio
-async def test_inject_case_event_without_thread_id_leaves_thread_graphs_unchanged(monkeypatch):
-    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
-    original_graphs = {"thread-existing": object()}
-    monkeypatch.setattr(graph_runtime, "_THREAD_GRAPHS", dict(original_graphs))
-
-    assert await graph_runtime.inject_case_event(graph_case, {"state": "CRITICAL"}, incident_memory=graph_memory) is False
-    assert graph_runtime._THREAD_GRAPHS == original_graphs
-
-
-@pytest.mark.asyncio
-async def test_inject_case_event_retries_without_as_node(monkeypatch):
-    _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
-    case = await graph_memory.set_case_thread(graph_case["incident_id"], "thread-fallback")
-
-    class EmptySnapshot:
-        values = {}
-
-    class FallbackGraph:
-        def __init__(self):
-            self.calls = []
-
-        async def aget_state(self, config):
-            return EmptySnapshot()
-
-        async def aupdate_state(self, config, values, **kwargs):
-            self.calls.append({"config": config, "values": values, "kwargs": kwargs})
-            if len(self.calls) == 1:
-                raise RuntimeError("as_node not supported")
-
-    graph = FallbackGraph()
-    monkeypatch.setattr(graph_runtime, "_THREAD_GRAPHS", {"thread-fallback": graph})
-
-    assert await graph_runtime.inject_case_event(case, {"state": "CRITICAL"}, incident_memory=graph_memory) is True
-    assert graph.calls[0]["kwargs"] == {"as_node": "intake_event_injection"}
-    assert graph.calls[1]["kwargs"] == {}
 
 
 @pytest.mark.asyncio

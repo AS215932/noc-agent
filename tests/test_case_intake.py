@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 
-from app.incident_memory import IncidentMemory, case_display_title, fingerprint_alert
+from app.alert_utils import case_display_title, case_event_from_alert, fingerprint_alert
+from app.cases import CaseService, InMemoryCaseStore
+from app.cases.graph_memory import CaseServiceGraphMemory
+from app.cases.notifications import observation_from_icinga_alert_payload
 
 
 def _icinga_alert(state="WARNING", output="WARNING: uptime_seconds=556 (<1800)"):
@@ -27,6 +30,10 @@ def _icinga_alert(state="WARNING", output="WARNING: uptime_seconds=556 (<1800)")
     }
 
 
+async def _observe(service: CaseService, alert: dict):
+    return await service.observe(observation_from_icinga_alert_payload(alert))
+
+
 def test_fingerprint_ignores_state_and_output_changes():
     warning = _icinga_alert("WARNING", "WARNING: uptime_seconds=556 (<1800)")
     critical = _icinga_alert("CRITICAL", "CRITICAL: uptime_seconds=258 (<300)")
@@ -34,126 +41,85 @@ def test_fingerprint_ignores_state_and_output_changes():
     assert fingerprint_alert(warning) == fingerprint_alert(critical)
 
 
-@pytest.mark.asyncio
-async def test_case_title_uses_case_number_without_raw_dict():
-    memory = IncidentMemory(redis_url="")
+def test_case_title_uses_case_number_without_raw_dict():
+    event = case_event_from_alert(_icinga_alert("WARNING"))
+    title = case_display_title({"case_number": "NOC-20260621-001", "identity": event["identity"]}, event)
 
-    result = await memory.intake_alert(_icinga_alert("WARNING"))
-    title = case_display_title(result.case, result.event)
-
-    assert title.startswith("NOC-")
-    assert title.endswith(": noc-agent-uptime on noc")
+    assert title == "NOC-20260621-001: noc-agent-uptime on noc"
     assert "{" not in title
 
 
 @pytest.mark.asyncio
 async def test_concurrent_identical_alerts_allocate_one_case():
-    memory = IncidentMemory(redis_url="")
-    alerts = [
-        _icinga_alert("WARNING", f"WARNING: uptime_seconds={500 + idx} (<1800)")
-        for idx in range(8)
-    ]
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    alerts = [_icinga_alert("WARNING", f"WARNING: uptime_seconds={500 + idx} (<1800)") for idx in range(8)]
 
-    results = await asyncio.gather(*(memory.intake_alert(alert) for alert in alerts))
+    results = await asyncio.gather(*(_observe(service, alert) for alert in alerts))
 
-    assert [result.action for result in results].count("created") == 1
-    assert len({result.case["case_number"] for result in results if result.case}) == 1
-    case = results[0].case
-    if results[0].action != "created":
-        case = next(result.case for result in results if result.action == "created")
-    stored = await memory.get_case(case["incident_id"])
-    events = await memory.case_events(case["incident_id"])
-    assert stored["event_count"] == 8
-    assert len(events) == 8
+    case_ids = {result.case.case_id for result in results if result.case is not None}
+    assert len(case_ids) == 1
+    events = await store.case_events(next(iter(case_ids)))
+    assert [event.event_type for event in events].count("case_created") == 1
+    assert [event.event_type for event in events].count("case_observed_unhealthy") >= 1
 
 
 @pytest.mark.asyncio
-async def test_warning_to_critical_attaches_and_records_transition():
-    memory = IncidentMemory(redis_url="")
+async def test_warning_to_critical_attaches_and_records_signal_change():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
 
-    first = await memory.intake_alert(_icinga_alert("WARNING", "WARNING: uptime_seconds=556 (<1800)"))
-    second = await memory.intake_alert(_icinga_alert("CRITICAL", "CRITICAL: uptime_seconds=258 (<300)"))
+    first = await _observe(service, _icinga_alert("WARNING", "WARNING: uptime_seconds=556 (<1800)"))
+    second = await _observe(service, _icinga_alert("CRITICAL", "CRITICAL: uptime_seconds=258 (<300)"))
 
     assert first.action == "created"
-    assert second.action == "escalated"
-    assert second.case["incident_id"] == first.case["incident_id"]
-    assert second.case["latest_transition"] == {
-        "from": "WARNING",
-        "to": "CRITICAL",
-        "meaning": "severity escalation for same issue",
-    }
-    assert second.should_investigate is False
+    assert second.action == "updated"
+    assert second.case.case_id == first.case.case_id
+    event_types = [event.event_type for event in await store.case_events(first.case.case_id)]
+    assert "case_signal_changed" in event_types
 
 
 @pytest.mark.asyncio
-async def test_recovered_pending_reopens_same_case_during_cooldown():
-    memory = IncidentMemory(redis_url="")
+async def test_positive_recovery_resolves_case_and_recurrence_reopens_it():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
 
-    created = await memory.intake_alert(_icinga_alert("CRITICAL"))
-    recovered = await memory.intake_alert(_icinga_alert("OK", "OK: uptime recovered"))
-    reopened = await memory.intake_alert(_icinga_alert("WARNING", "WARNING: uptime_seconds=700 (<1800)"))
+    created = await _observe(service, _icinga_alert("CRITICAL"))
+    recovered = await _observe(service, _icinga_alert("OK", "OK: uptime recovered"))
+    reopened = await _observe(service, _icinga_alert("WARNING", "WARNING: uptime_seconds=700 (<1800)"))
 
-    assert recovered.action == "recovered"
-    assert recovered.case["status"] == "recovered_pending"
-    assert reopened.action == "reopened"
-    assert reopened.case["incident_id"] == created.case["incident_id"]
-    assert reopened.case["case_number"] == created.case["case_number"]
-    assert reopened.case["status"] == "investigating"
-
-
-@pytest.mark.asyncio
-async def test_resolved_case_releases_fingerprint_for_future_case():
-    memory = IncidentMemory(redis_url="")
-
-    created = await memory.intake_alert(_icinga_alert("CRITICAL"))
-    await memory.update_case(created.case["incident_id"], {"status": "resolved"})
-    future = await memory.intake_alert(_icinga_alert("WARNING", "WARNING: uptime_seconds=700 (<1800)"))
-
-    assert future.action == "created"
-    assert future.case["incident_id"] != created.case["incident_id"]
-    assert future.case["case_number"] != created.case["case_number"]
+    assert created.case is not None
+    assert recovered.action == "resolved_positive_clean"
+    assert recovered.case.case_id == created.case.case_id
+    assert recovered.case.status == "resolved"
+    assert reopened.case.case_id == created.case.case_id
+    assert reopened.case.status == "investigating"
 
 
 @pytest.mark.asyncio
-async def test_topology_parent_case_receives_downstream_victim():
-    memory = IncidentMemory(redis_url="")
-    await memory.set_topology_parents("noc", ["vm:noc"])
-    await memory.set_topology_parents("vm:noc", ["xcpng:host:xoa"])
-    parent = await memory.intake_alert(
-        {
-            "source": "icinga2",
-            "status": "firing",
-            "groupLabels": {"alertname": "xcpng-host-memory", "host": "xcpng:host:xoa"},
-            "alerts": [{"labels": {"alertname": "xcpng-host-memory", "host": "xcpng:host:xoa", "state": "CRITICAL"}}],
-        }
+async def test_case_service_graph_memory_links_child_to_parent_and_routes_alias():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    parent = await service.observe(
+        observation_from_icinga_alert_payload(
+            {
+                "source": "icinga2",
+                "status": "firing",
+                "groupLabels": {"alertname": "xcpng-host-memory", "host": "xcpng:host:xoa"},
+                "alerts": [{"labels": {"alertname": "xcpng-host-memory", "host": "xcpng:host:xoa", "state": "CRITICAL"}}],
+            }
+        )
     )
+    child = await _observe(service, _icinga_alert("CRITICAL"))
+    assert parent.case is not None
+    assert child.case is not None
+    graph_memory = CaseServiceGraphMemory(store)
 
-    child = await memory.intake_alert(_icinga_alert("CRITICAL"))
-
-    assert parent.action == "created"
-    assert child.action == "linked_parent"
-    assert child.should_investigate is False
-    assert child.case["event_count"] == 1
-    assert child.parent_case["incident_id"] == parent.case["incident_id"]
-    assert "noc" in child.parent_case["downstream_victims"]
-
-
-@pytest.mark.asyncio
-async def test_reactive_link_routes_future_child_events_to_parent():
-    memory = IncidentMemory(redis_url="")
-    child = await memory.intake_alert(_icinga_alert("CRITICAL"))
-    parent = await memory.intake_alert(
-        {
-            "source": "icinga2",
-            "status": "firing",
-            "groupLabels": {"alertname": "xcpng-host-memory", "host": "xcpng:host:xoa"},
-            "alerts": [{"labels": {"alertname": "xcpng-host-memory", "host": "xcpng:host:xoa", "state": "CRITICAL"}}],
-        }
-    )
-
-    linked = await memory.link_to_parent_case(child.case["incident_id"], parent.case["incident_id"], "same host pressure", ["ev1"])
-    future = await memory.intake_alert(_icinga_alert("WARNING", "WARNING: uptime_seconds=800 (<1800)"))
+    linked = await graph_memory.link_to_parent_case(child.case.case_id, parent.case.case_id, "same host pressure", ["ev1"])
 
     assert linked["ok"] is True
-    assert future.case["incident_id"] == parent.case["incident_id"]
-    assert "noc" in future.case["downstream_victims"]
+    assert linked["event_count"] == 2
+    stored_child = await store.get_case(child.case.case_id)
+    assert stored_child.status == "linked"
+    assert stored_child.last_diagnosis["linked_parent_case"] == parent.case.case_id
+    assert await store.resolve_alias("source_fp", child.observation.source_fingerprint) == parent.case.case_id

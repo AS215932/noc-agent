@@ -1,9 +1,8 @@
 """Postgres schema for case-grounded operational state.
 
 The first version stores strongly-versioned JSONB projections plus relational
-indexes/uniqueness constraints for the invariants the state machine needs. It is
-suitable for a strangler migration: existing Redis/local IncidentMemory can run
-while these tables are shadow-written and compared.
+indexes/uniqueness constraints for the invariants the state machine needs. These
+tables now back the primary reactive, control-plane, and proactive case paths.
 """
 
 from __future__ import annotations
