@@ -126,6 +126,7 @@ async def test_control_cases_require_case_service_primary_routes(monkeypatch):
     monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
     monkeypatch.delenv("NOC_CASESERVICE_CONTROL_PRIMARY", raising=False)
     monkeypatch.delenv("NOC_CASESERVICE_REACTIVE_PRIMARY", raising=False)
+    monkeypatch.delenv("NOC_PROACTIVE_ENABLED", raising=False)
 
     with pytest.raises(HTTPException) as exc:
         await control_cases(_request())
@@ -172,6 +173,31 @@ async def test_case_service_control_lists_detail_and_outbox(monkeypatch):
     assert [event["event_type"] for event in detail["events"]] == ["case_created", "case_observed_unhealthy"]
     assert outbox["outbox"][0]["intent_type"] == "report"
     assert outbox["outbox"][0]["case_id"] == created.case.case_id
+
+
+@pytest.mark.asyncio
+async def test_proactive_enabled_exposes_case_service_control_routes(monkeypatch):
+    monkeypatch.setenv("NOC_CONTROL_TOKEN", "secret")
+    monkeypatch.setenv("NOC_PROACTIVE_ENABLED", "1")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="proactive", detector="disk_fill", resource="log:/var", status="firing")
+    )
+    assert created.case is not None
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    listing = await control_cases(_request())
+
+    assert listing["source"] == "case_service"
+    assert listing["cases"][0]["incident_id"] == created.case.case_id
 
 
 @pytest.mark.asyncio

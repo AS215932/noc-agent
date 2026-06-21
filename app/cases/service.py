@@ -182,6 +182,8 @@ class CaseService:
 
         if _investigation_blocked_status(case.status):
             return False
+        if case.investigation_status == "failed":
+            return True
         if not case.last_investigated_at or not case.diagnosis_signature:
             return True
         if case.signal_signature and case.diagnosis_signature != case.signal_signature:

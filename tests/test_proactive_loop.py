@@ -433,22 +433,38 @@ async def test_case_service_shadow_failure_is_nonfatal(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_deep_cycle_records_observations_and_journal(tmp_path):
-    from app.proactive.memory import ProactiveMemory
-
-    mem = ProactiveMemory(tmp_path / "memory")
-    mem.ensure()
-
-    class _IM:
-        async def list_cases(self):
-            return []
+async def test_case_service_primary_observation_failure_fails_cycle(tmp_path):
+    class _BrokenCaseService:
+        async def observe(self, observation):
+            raise RuntimeError("primary store unavailable")
 
     lp = ProactiveLoop(
         _runtime(),
         settings=_settings(tmp_path, shadow=True),
         reporter=_Capture(),
         model_chain=lambda: ["m"],
-        incident_memory=_IM(),
+        case_service=_BrokenCaseService(),
+        case_service_primary=True,
+    )
+
+    report = await lp.run_once(deep=True)
+
+    assert report.outcome == "error"
+    assert report.errors
+
+
+@pytest.mark.asyncio
+async def test_deep_cycle_records_observations_and_journal(tmp_path):
+    from app.proactive.memory import ProactiveMemory
+
+    mem = ProactiveMemory(tmp_path / "memory")
+    mem.ensure()
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
         memory=mem,
     )
     report = await lp.run_once(deep=True)
@@ -459,8 +475,7 @@ async def test_deep_cycle_records_observations_and_journal(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_case_service_control_replaces_investigations_json_for_cooldown(tmp_path, monkeypatch):
-    monkeypatch.setenv("NOC_CASESERVICE_CONTROL", "1")
+async def test_case_service_primary_replaces_investigations_json_for_cooldown(tmp_path):
     store = InMemoryCaseStore()
     case_service = CaseService(store)
     seen = []
@@ -476,6 +491,7 @@ async def test_case_service_control_replaces_investigations_json_for_cooldown(tm
         investigator=investigator,
         model_chain=lambda: ["m"],
         case_service=case_service,
+        case_service_primary=True,
     )
 
     await lp.run_once(deep=True)  # both current hotspots investigated and stamped on their cases
@@ -492,8 +508,7 @@ async def test_case_service_control_replaces_investigations_json_for_cooldown(tm
 
 
 @pytest.mark.asyncio
-async def test_case_service_control_marks_cases_reported_after_successful_digest(tmp_path, monkeypatch):
-    monkeypatch.setenv("NOC_CASESERVICE_CONTROL", "1")
+async def test_case_service_primary_marks_cases_reported_after_successful_digest(tmp_path):
     store = InMemoryCaseStore()
     case_service = CaseService(store)
     lp = ProactiveLoop(
@@ -502,6 +517,7 @@ async def test_case_service_control_marks_cases_reported_after_successful_digest
         reporter=_Capture(),
         model_chain=lambda: ["m"],
         case_service=case_service,
+        case_service_primary=True,
     )
 
     report = await lp.run_once(deep=True)

@@ -34,7 +34,6 @@ from app.proactive.models import (
     Hotspot,
     Observation,
     ProactiveCycleReport,
-    hotspot_to_alert_payload,
     utc_now,
 )
 from app.model_metrics import record_case_service_shadow_failure, record_case_service_shadow_observation
@@ -78,25 +77,26 @@ class ProactiveLoop:
         investigator: Investigator | None = None,
         model_chain: Callable[[], list[str]] | None = None,
         active_lessons: Callable[[], list[str]] | None = None,
-        incident_memory: Any | None = None,
         memory: Any | None = None,
         suppressions: Any | None = None,
         case_service: Any | None = None,
+        case_service_primary: bool | None = None,
     ):
         self.mcp_runtime = mcp_runtime
         self.settings = settings or load_proactive_settings()
         self._reporter = reporter or self._default_report
         self._investigator = investigator
         self._model_chain = model_chain or _default_model_chain
-        self.incident_memory = incident_memory
         self.memory = memory
         self.case_service = case_service
-        self.case_service_control = os.getenv("NOC_CASESERVICE_CONTROL", "").strip().lower() in {
+        env_case_service_control = os.getenv("NOC_CASESERVICE_CONTROL", "").strip().lower() in {
             "1",
             "true",
             "yes",
             "on",
         }
+        requested_case_service_primary = env_case_service_control if case_service_primary is None else case_service_primary
+        self.case_service_control = bool(self.case_service is not None and requested_case_service_primary)
         if active_lessons is not None:
             self._active_lessons = active_lessons
         elif memory is not None:
@@ -299,9 +299,17 @@ class ProactiveLoop:
             case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
             if case is None:
                 return
+            existing_diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
+            graph_summary = existing_diagnosis.get("graph_summary")
+            diagnosis: dict[str, Any] = {
+                "incident_id": outcome.incident_id,
+                "source": "proactive_loop",
+            }
+            if isinstance(graph_summary, dict):
+                diagnosis["graph_summary"] = graph_summary
             await case_service.record_investigation_result(
                 case.case_id,
-                diagnosis={"incident_id": outcome.incident_id, "source": "proactive_loop"},
+                diagnosis=diagnosis,
                 recommendations=[],
                 status="complete",
             )
@@ -538,6 +546,8 @@ class ProactiveLoop:
             safe = classify_exception(exc)
             record_case_service_shadow_failure(path="proactive", category=safe.category)
             log_exception("proactive_case_shadow_observe_failed", exc, category=safe.category)
+            if self.case_service_control:
+                raise
 
     def _merge_with_carried(
         self, raw: list[Hotspot], *, do_deep: bool, degraded: bool
@@ -602,8 +612,8 @@ class ProactiveLoop:
                     )
                 )
             if do_deep:
-                if self.incident_memory is not None:
-                    proposed = await self.memory.evaluate_outcomes(self.incident_memory)
+                if self.case_service_control and self.case_service is not None:
+                    proposed = await self.memory.evaluate_outcomes(self.case_service)
                     if proposed:
                         log.info("proactive_lessons_proposed", count=len(proposed))
                 self.memory.write_journal(
@@ -715,13 +725,16 @@ class ProactiveLoop:
     async def _case_for_hotspot(self, hotspot: Hotspot) -> dict[str, Any] | None:
         """The NOC case this hotspot's investigation is attached to (for linking
         the digest line to the diagnosis). Best-effort."""
-        if self.incident_memory is None:
+        if self.case_service is None:
             return None
         try:
-            from app.incident_memory import fingerprint_alert
-
-            fp = fingerprint_alert(hotspot_to_alert_payload(hotspot))
-            return await self.incident_memory.case_for_fingerprint(fp)
+            case = await self.case_service.case_for_alias("source_fp", hotspot.fingerprint())
+            if case is None:
+                return None
+            return {
+                "incident_id": getattr(case, "case_id", ""),
+                "case_number": getattr(case, "case_number", "") or getattr(case, "case_id", ""),
+            }
         except Exception:  # linking is advisory; never break the digest
             return None
 

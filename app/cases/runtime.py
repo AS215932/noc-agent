@@ -47,7 +47,8 @@ async def build_case_service_runtime_from_env() -> CaseServiceRuntime | None:
 
     `NOC_CASESERVICE_SHADOW=1` enables shadow writes. Primary cutover flags
     (`NOC_CASESERVICE_CONTROL_PRIMARY=1` or `NOC_CASESERVICE_REACTIVE_PRIMARY=1`)
-    also require a runtime. If a DB URL is configured, Postgres is used. If
+    and the proactive loop (`NOC_PROACTIVE_ENABLED=1`) also require a runtime.
+    If a DB URL is configured, Postgres is used. If
     Postgres is explicitly required, missing DB/supporting packages fail loud.
     Otherwise the runtime can use in-memory storage for local/dev canaries.
     """
@@ -56,6 +57,7 @@ async def build_case_service_runtime_from_env() -> CaseServiceRuntime | None:
         _env_bool("NOC_CASESERVICE_SHADOW", False)
         or _env_bool("NOC_CASESERVICE_CONTROL_PRIMARY", False)
         or _env_bool("NOC_CASESERVICE_REACTIVE_PRIMARY", False)
+        or _env_bool("NOC_PROACTIVE_ENABLED", False)
     ):
         return None
     db = load_database_settings()

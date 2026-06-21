@@ -1,5 +1,6 @@
 import pytest
 
+from app.cases import CaseService, InMemoryCaseStore, ObservationRecord
 from app.proactive.memory import MemoryPolicyEngine, ProactiveMemory, RealAlert, classify_observation
 from app.proactive.models import CandidateLesson, Observation, utc_now
 
@@ -59,7 +60,7 @@ def test_classify_observation_confirmed_unconfirmed_pending():
     assert classify_observation(obs, proactive_only, now, window_h=2, min_age_h=2) == "unconfirmed"
 
 
-class _FakeIncidentMemory:
+class _FakeCaseSource:
     def __init__(self, cases):
         self._cases = cases
 
@@ -82,12 +83,40 @@ async def test_evaluate_outcomes_proposes_lesson_after_threshold(tmp_path):
         {"resource_id": "rtr", "updated_at": _iso(now - 3 * 3600), "latest_event": {"source": "alertmanager", "received_at": _iso(now - 3 * 3600)}},
         {"resource_id": "cr1-nl1", "updated_at": _iso(now - 3 * 3600), "latest_event": {"source": "icinga2", "received_at": _iso(now - 3 * 3600)}},
     ]
-    proposed = await mem.evaluate_outcomes(_FakeIncidentMemory(cases), now=now, window_h=6, min_age_h=2, confirm_threshold=2)
+    proposed = await mem.evaluate_outcomes(_FakeCaseSource(cases), now=now, window_h=6, min_age_h=2, confirm_threshold=2)
     assert len(proposed) == 1
     assert proposed[0].scope == {"rule_id": "bgp_risk"}
     assert proposed[0].occurrences == 2
     # Observations are marked confirmed (idempotent on re-run).
     assert all(row.get("outcome") == "confirmed" for row in mem.load_observations())
+
+
+@pytest.mark.asyncio
+async def test_evaluate_outcomes_reads_case_service_cases(tmp_path):
+    import time
+
+    now = time.time()
+    mem = ProactiveMemory(tmp_path)
+    mem.record_observation(
+        Observation(rule_id="bgp_risk", resource="rtr", severity="MEDIUM", created_at=_iso(now - 4 * 3600))
+    )
+    service = CaseService(InMemoryCaseStore())
+    await service.observe(
+        ObservationRecord(
+            source="alertmanager",
+            detector="BGPDown",
+            resource="rtr",
+            status="firing",
+            severity="HIGH",
+            observed_at=_iso(now - 3 * 3600),
+        )
+    )
+
+    proposed = await mem.evaluate_outcomes(service, now=now, window_h=6, min_age_h=2, confirm_threshold=1)
+
+    assert len(proposed) == 1
+    assert proposed[0].scope == {"rule_id": "bgp_risk"}
+    assert mem.load_observations()[0]["outcome"] == "confirmed"
 
 
 def _iso(ts: float) -> str:
