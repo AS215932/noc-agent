@@ -417,6 +417,29 @@ async def test_case_service_investigation_reuse_is_case_grounded():
 
 
 @pytest.mark.asyncio
+async def test_case_service_failed_investigation_uses_retry_backoff():
+    store = InMemoryCaseStore()
+    service = CaseService(store, policy=CasePolicy(investigation_cooldown_s=3600, investigation_failure_retry_s=300))
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="log", status="firing", signal_snapshot={"free": 4})
+    )
+    assert created.case is not None
+    started = await service.claim_investigation(created.case)
+    assert started is not None
+    failed = await service.record_investigation_result(
+        created.case.case_id,
+        diagnosis={"error": "model_unavailable"},
+        status="failed",
+        error="model_unavailable",
+    )
+
+    failed_at = datetime.fromisoformat(failed.last_investigated_at)
+
+    assert not service.should_investigate(failed, now=failed_at + timedelta(seconds=299))
+    assert service.should_investigate(failed, now=failed_at + timedelta(seconds=300))
+
+
+@pytest.mark.asyncio
 async def test_case_service_investigation_claim_is_atomic_for_stale_cases():
     store = InMemoryCaseStore()
     service = CaseService(store, policy=CasePolicy(investigation_cooldown_s=3600))

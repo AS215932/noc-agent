@@ -23,6 +23,7 @@ from typing import Any
 
 from app import log
 from app.proactive.models import CandidateLesson, LessonStatus, Observation
+from app.cases.models import AtomicCaseProjection
 from app.safe_errors import classify_exception, log_exception
 
 
@@ -187,7 +188,7 @@ class ProactiveMemory:
 
     async def evaluate_outcomes(
         self,
-        incident_memory: Any,
+        case_source: Any,
         *,
         now: float | None = None,
         window_h: float = 6.0,
@@ -201,7 +202,7 @@ class ProactiveMemory:
         if not rows:
             return []
         try:
-            real_alerts = await _collect_real_alerts(incident_memory)
+            real_alerts = await _collect_real_alerts(case_source)
         except Exception as exc:
             safe = classify_exception(exc)
             log_exception("proactive_collect_real_alerts_failed", exc, category=safe.category)
@@ -288,16 +289,30 @@ class RealAlert:
         self.alertname = alertname
 
 
-async def _collect_real_alerts(incident_memory: Any) -> list[RealAlert]:
-    """Best-effort: derive recent reactive alerts from the case store."""
-    cases = await incident_memory.list_cases()
+async def _collect_real_alerts(case_source: Any) -> list[RealAlert]:
+    """Best-effort: derive recent reactive alerts from CaseService or dict-like stores."""
+    cases = await _list_case_source(case_source)
     alerts: list[RealAlert] = []
     for case in cases:
-        event = case.get("latest_event") or {}
-        source = str(event.get("source") or case.get("source") or "")
-        ts = _parse_ts(event.get("received_at")) or _parse_ts(case.get("updated_at"))
-        resource = str(case.get("resource_id") or event.get("resource_key") or "")
+        if isinstance(case, AtomicCaseProjection):
+            source = str(case.origin or "")
+            ts = _parse_ts(case.last_seen or case.updated_at or case.opened_at)
+            resource = str(case.resource_id or "")
+            alertname = str(case.detector or case.rule_id or "")
+        else:
+            event = case.get("latest_event") or {}
+            source = str(event.get("source") or case.get("source") or "")
+            ts = _parse_ts(event.get("received_at")) or _parse_ts(case.get("updated_at"))
+            resource = str(case.get("resource_id") or event.get("resource_key") or "")
+            alertname = str(event.get("alertname") or "")
         if ts is None or not resource:
             continue
-        alerts.append(RealAlert(resource=resource, ts=ts, source=source, alertname=str(event.get("alertname") or "")))
+        alerts.append(RealAlert(resource=resource, ts=ts, source=source, alertname=alertname))
     return alerts
+
+
+async def _list_case_source(case_source: Any) -> list[Any]:
+    store = getattr(case_source, "store", None)
+    if store is not None and hasattr(store, "list_cases"):
+        return list(await store.list_cases(kind="atomic", limit=500))
+    return list(await case_source.list_cases())

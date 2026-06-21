@@ -119,9 +119,10 @@ Each cycle:
 2. **Rank & gate** — score by severity, snapshot a decision context, and gate
    expensive investigation against the daily ledger and severity floor
    (`app/proactive/governance.py`, `app/proactive/ledger.py`).
-3. **Investigate** — render the top hotspot as a synthetic alert and run it
-   through the *same* investigation graph the webhooks use, with heavy read-only
-   probes (`tcpdump_capture`, `dns_probe_burst`, `multi_source_probe`) stripped
+3. **Investigate** — attach the top hotspot to a CaseService case, render it as
+   a synthetic alert, and run it through the *same* investigation graph the
+   webhooks use with CaseService-backed graph memory. Heavy read-only probes
+   (`tcpdump_capture`, `dns_probe_burst`, `multi_source_probe`) are stripped
    unless `NOC_PROACTIVE_AUTO_HEAVY_PROBES=1` (`app/proactive/investigate.py`).
 4. **Report** — a Discord digest plus an optional Icinga passive heartbeat.
 5. **Hand off** — when a finding needs a config/docs change, open an idempotent
@@ -208,16 +209,16 @@ Without a DSN, shadow mode uses in-memory storage for local/dev canaries. Set
 in-memory state; this also prevents LangGraph checkpointing from silently using
 the in-memory saver when a Postgres checkpoint backend was requested.
 
-Guarded proactive ownership is separate:
-
-```bash
-NOC_CASESERVICE_CONTROL=1
-```
-
-With both a case service and this flag present, the proactive loop lets case
-state own investigation cooldown and report stamping instead of
-`investigations.json`. Shadow observation still records only freshly scanned raw
-hotspots, never carried-forward deep/degraded-cycle hotspots.
+When `NOC_PROACTIVE_ENABLED=1`, the CaseService runtime starts even if shadow or
+reactive/control primary flags are not set. In the application runtime, the
+proactive loop uses CaseService as its case owner: case state gates investigation
+cooldown and report stamping instead of `investigations.json`, and graph runs use
+CaseService-backed memory. The `/control/cases` surface also reads these
+CaseService cases so digest links do not point at disabled legacy routes. Fresh
+scans record only freshly scanned raw hotspots, never carried-forward
+deep/degraded-cycle hotspots. The older
+`NOC_CASESERVICE_CONTROL=1` can still force this behavior in isolated loop tests
+or custom embeddings.
 
 Reactive report enqueueing can be canaried separately:
 
@@ -226,8 +227,9 @@ NOC_CASESERVICE_REACTIVE_REPORT=1
 ```
 
 With this flag, reactive Alertmanager/Icinga observations still flow through the
-legacy investigation path, but CaseService owns the report idempotency decision
-and enqueues `report` outbox intents for firing cases that should be surfaced.
+non-primary investigation path, but CaseService owns the report idempotency
+decision and enqueues `report` outbox intents for firing cases that should be
+surfaced.
 The enqueued payload uses a bounded `reactive_case_report_v1` schema, marks
 monitor text as untrusted/not-for-model-consumption, and strips control/markdown
 delimiters from webhook-derived text.
@@ -250,7 +252,7 @@ graph context/summaries instead of legacy `IncidentMemory`, and CaseService owns
 duplicate investigation gating. The flag starts the CaseService runtime even if
 `NOC_CASESERVICE_SHADOW` is not set.
 
-The legacy control case surface can be cut over to CaseService with:
+The control case surface can be cut over to CaseService with:
 
 ```bash
 NOC_CASESERVICE_CONTROL_PRIMARY=1
@@ -260,9 +262,10 @@ With this flag, `/control/cases`, `/control/cases/{id}`, case events, comments,
 decisions, and manual investigations use CaseService as the primary case store.
 It also starts the CaseService runtime even if `NOC_CASESERVICE_SHADOW` is not
 set. This path intentionally does not fall back to legacy `IncidentMemory` for
-old or unmapped cases. `NOC_CASESERVICE_REACTIVE_PRIMARY=1` also routes the
-`/control/cases` surface to CaseService so reactive-primary cases remain
-operator-visible without legacy fallback.
+old or unmapped cases. `NOC_CASESERVICE_REACTIVE_PRIMARY=1` and
+`NOC_PROACTIVE_ENABLED=1` also route the `/control/cases` surface to CaseService
+so reactive/proactive primary cases remain operator-visible without legacy
+fallback.
 
 Legacy `IncidentMemory` reactive/control fallbacks have been removed: reactive
 webhooks require `NOC_CASESERVICE_REACTIVE_PRIMARY=1`, and control case routes
@@ -355,7 +358,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 
 - `NOC_REDIS_URL`
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
-- `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
+- `NOC_CASESERVICE_CONTROL` (deprecated for app runtime; forces proactive case-owned cooldown/report state in custom embeddings)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
 - `NOC_CASESERVICE_REACTIVE_CONTROL` (deprecated; legacy reactive-control canary flag, superseded by reactive-primary)
 - `NOC_CASESERVICE_REACTIVE_PRIMARY` (default `0`; make reactive webhooks use CaseService without legacy intake)

@@ -182,6 +182,12 @@ class CaseService:
 
         if _investigation_blocked_status(case.status):
             return False
+        if case.investigation_status == "failed":
+            last_failed = _parse_iso_time(case.last_investigated_at)
+            if last_failed is None:
+                return True
+            now = now or datetime.now(timezone.utc)
+            return (now - last_failed) >= timedelta(seconds=self.policy.investigation_failure_retry_s)
         if not case.last_investigated_at or not case.diagnosis_signature:
             return True
         if case.signal_signature and case.diagnosis_signature != case.signal_signature:

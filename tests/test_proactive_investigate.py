@@ -1,5 +1,7 @@
 import pytest
 
+from app.cases import CaseService, InMemoryCaseStore
+from app.cases.runtime import CaseServiceRuntime
 from app.config import ProactiveLoopSettings
 from app.graph.routing import supervisor_route
 from app.proactive.investigate import HeavyProbeFilteredRuntime, build_investigator
@@ -126,87 +128,113 @@ async def test_filter_delegates_call_tool():
 # --- end-to-end investigator ---------------------------------------------
 
 
-class _Intake:
-    def __init__(self, should_investigate, case, action="opened"):
-        self.should_investigate = should_investigate
-        self.case = case
-        self.action = action
-
-
 @pytest.mark.asyncio
 async def test_investigator_runs_graph_and_returns_outcome(monkeypatch):
-    from app import graph_runtime
     import app.main as main
 
+    store = InMemoryCaseStore()
+    case_service = CaseService(store)
+    case_runtime = CaseServiceRuntime(service=case_service, store=store)
     captured = {}
 
-    async def fake_intake(payload):
+    async def fake_investigate(payload, model=None, case=None, *, mcp_runtime=None, graph_memory=None):
         captured["payload"] = payload
-        return _Intake(True, {"incident_id": "INC-1"})
-
-    async def fake_investigate(payload, model=None, case=None, *, mcp_runtime=None):
         captured["case"] = case
         captured["runtime"] = mcp_runtime
+        captured["graph_memory"] = graph_memory
         return object()  # non-None synthesis == success
 
-    monkeypatch.setattr(graph_runtime, "intake_alert", fake_intake)
     monkeypatch.setattr(main, "investigate_alert", fake_investigate)
 
     investigator = build_investigator(
-        _InnerRuntime(), ProactiveLoopSettings(auto_heavy_probes=False, cost_usd_per_investigation=0.05)
+        _InnerRuntime(),
+        ProactiveLoopSettings(auto_heavy_probes=False, cost_usd_per_investigation=0.05),
+        case_service_runtime=case_runtime,
     )
     from app.proactive.models import DecisionContext
 
-    outcome = await investigator(_hotspot(), DecisionContext())
+    outcome = await investigator(_hotspot(), DecisionContext(cycle_id="cyc-1"))
     assert outcome is not None
-    assert outcome.incident_id == "INC-1"
+    assert outcome.incident_id.startswith("case_")
     assert outcome.cost_usd == 0.05  # metered so the daily dollar cap is real
     assert captured["payload"]["source"] == "proactive"
+    assert captured["case"]["source"] == "case_service"
+    assert captured["graph_memory"] is not None
     assert isinstance(captured["runtime"], HeavyProbeFilteredRuntime)
+    stored_case = await case_service.case_for_alias("source_fp", _hotspot().fingerprint())
+    assert stored_case is not None
+    assert stored_case.investigation_status == "in_progress"
 
 
 @pytest.mark.asyncio
 async def test_investigator_does_not_count_or_handoff_on_triage_failure(monkeypatch):
-    from app import graph_runtime
     import app.main as main
     import app.proactive.handoff as handoff_mod
 
-    async def fake_intake(payload):
-        return _Intake(True, {"incident_id": "INC-1"})
+    store = InMemoryCaseStore()
+    case_service = CaseService(store)
+    case_runtime = CaseServiceRuntime(service=case_service, store=store)
 
-    async def failed_investigate(payload, model=None, case=None, *, mcp_runtime=None):
+    async def failed_investigate(payload, model=None, case=None, *, mcp_runtime=None, graph_memory=None):
         return None  # investigate_alert swallows graph errors and returns None
 
     def fail_handoff(repo):  # pragma: no cover - must not be reached
         raise AssertionError("handoff must not run when triage failed")
 
-    monkeypatch.setattr(graph_runtime, "intake_alert", fake_intake)
     monkeypatch.setattr(main, "investigate_alert", failed_investigate)
     monkeypatch.setattr(handoff_mod, "handoff_from_env", fail_handoff)
 
     # handoff_enabled + warrants_change would normally trigger a handoff.
-    investigator = build_investigator(_InnerRuntime(), ProactiveLoopSettings(handoff_enabled=True))
+    investigator = build_investigator(
+        _InnerRuntime(), ProactiveLoopSettings(handoff_enabled=True), case_service_runtime=case_runtime
+    )
     from app.proactive.models import DecisionContext
 
-    outcome = await investigator(_hotspot(warrants_change=True), DecisionContext())
+    hotspot = _hotspot(warrants_change=True)
+    outcome = await investigator(hotspot, DecisionContext(cycle_id="cyc-1"))
     assert outcome is None  # not counted as an investigation, no handoff
+    case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
+    assert case is not None
+    assert case.investigation_status == "failed"
+    assert not case_service.should_investigate(case)
 
 
 @pytest.mark.asyncio
-async def test_investigator_skips_when_deduped(monkeypatch):
-    from app import graph_runtime
+async def test_investigator_skips_when_case_service_gate_blocks(monkeypatch):
     import app.main as main
+    from app.cases.proactive import observation_from_hotspot
 
-    async def fake_intake(payload):
-        return _Intake(False, None, action="suppressed_active")
+    store = InMemoryCaseStore()
+    case_service = CaseService(store)
+    case_runtime = CaseServiceRuntime(service=case_service, store=store)
+    hotspot = _hotspot()
+    observed = await case_service.observe(observation_from_hotspot(hotspot, cycle_id="cyc-1"))
+    assert observed.case is not None
+    await case_service.record_investigation_result(observed.case.case_id, diagnosis={"summary": "done"})
 
     async def fail_investigate(*a, **k):  # pragma: no cover - must not be called
-        raise AssertionError("should not investigate a deduped hotspot")
+        raise AssertionError("should not investigate a gated hotspot")
 
-    monkeypatch.setattr(graph_runtime, "intake_alert", fake_intake)
+    monkeypatch.setattr(main, "investigate_alert", fail_investigate)
+
+    investigator = build_investigator(_InnerRuntime(), ProactiveLoopSettings(), case_service_runtime=case_runtime)
+    from app.proactive.models import DecisionContext
+
+    assert await investigator(hotspot, DecisionContext(cycle_id="cyc-1")) is None
+
+
+@pytest.mark.asyncio
+async def test_investigator_skips_without_case_service_runtime(monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(main, "case_service_runtime", None)
+
+    async def fail_investigate(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("should not investigate without CaseService")
+
     monkeypatch.setattr(main, "investigate_alert", fail_investigate)
 
     investigator = build_investigator(_InnerRuntime(), ProactiveLoopSettings())
     from app.proactive.models import DecisionContext
 
-    assert await investigator(_hotspot(), DecisionContext()) is None
+    assert await investigator(_hotspot(), DecisionContext(cycle_id="cyc-1")) is None

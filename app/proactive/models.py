@@ -4,8 +4,8 @@ These are deliberately separate from ``app.graph.state.WorkflowState``: a
 ``Hotspot`` is the proactive analogue of an inbound alert, and
 :func:`hotspot_to_alert_payload` turns it into the exact dict shape the existing
 investigation graph already accepts (mirrors ``_icinga_to_alert_payload`` in
-``app/main.py``), so a proactive concern flows through dedupe → routing →
-evidence validation → drift check → reporting with no graph changes.
+``app/main.py``), so a proactive concern flows through CaseService case ownership →
+routing → evidence validation → drift check → reporting with no graph changes.
 """
 
 from __future__ import annotations
@@ -218,7 +218,7 @@ class ProactiveCycleReport(BaseModel):
 
 def hotspot_to_alert_payload(hotspot: Hotspot) -> dict[str, Any]:
     """Render a hotspot as a synthetic Alertmanager-style payload accepted by
-    ``graph_runtime.run_investigation_graph`` / ``IncidentMemory.intake_alert``.
+    ``graph_runtime.run_investigation_graph``.
 
     ``source="proactive"`` keeps proactive cases distinct from real reactive
     alerts (different fingerprint). A ``specialist_hint`` label makes routing

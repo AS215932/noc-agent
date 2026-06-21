@@ -36,7 +36,6 @@ from app.mcp_runtime import MCPRuntime
 from app.config import load_proactive_settings
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.proactive.loop import ProactiveLoop
-import app.graph_runtime as graph_runtime
 from app.graph_runtime import record_operator_decision, run_investigation_graph
 from app.incident_memory import case_display_title, case_event_from_alert
 from app.noc_state import ApprovalDecision
@@ -237,7 +236,9 @@ async def lifespan(app: FastAPI):
             raise
 
     proactive_settings = load_proactive_settings()
-    if proactive_settings.enabled:
+    if proactive_settings.enabled and case_service_runtime is None:
+        log.info("proactive_loop_disabled", reason="case-service-runtime-required")
+    elif proactive_settings.enabled:
         proactive_lock_fd = _try_acquire_proactive_lock()
         if proactive_lock_fd is None:
             log.info("proactive_loop_disabled", reason="lock-held-by-other-worker")
@@ -251,9 +252,9 @@ async def lifespan(app: FastAPI):
                     mcp_runtime,
                     settings=proactive_settings,
                     investigator=_proactive_investigator(proactive_settings),
-                    incident_memory=graph_runtime.INCIDENT_MEMORY,
                     memory=proactive_memory,
                     case_service=case_service_runtime.service if case_service_runtime is not None else None,
+                    case_service_primary=case_service_runtime is not None,
                 )
                 proactive_loop.start()
             except Exception as e:
@@ -315,7 +316,7 @@ def _proactive_investigator(settings):
     read-only probes stripped unless ``auto_heavy_probes`` is set."""
     from app.proactive.investigate import build_investigator
 
-    return build_investigator(mcp_runtime, settings)
+    return build_investigator(mcp_runtime, settings, case_service_runtime=case_service_runtime)
 
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
@@ -601,7 +602,14 @@ async def _take_ownership_ack(alert_payload: dict, case: dict | None, runtime) -
     )
 
 
-async def investigate_alert(alert_payload: dict, model=None, case: dict | None = None, *, mcp_runtime=None):
+async def investigate_alert(
+    alert_payload: dict,
+    model=None,
+    case: dict | None = None,
+    *,
+    mcp_runtime=None,
+    graph_memory=None,
+):
     runtime = mcp_runtime if mcp_runtime is not None else globals()["mcp_runtime"]
     event = (case or {}).get("latest_event") or case_event_from_alert(alert_payload)
     display_title = case_display_title(case, event)
@@ -633,7 +641,7 @@ async def investigate_alert(alert_payload: dict, model=None, case: dict | None =
 
     run_started = start_run("triage")
     try:
-        graph_memory = _case_service_graph_memory_for_case(case)
+        graph_memory = graph_memory if graph_memory is not None else _case_service_graph_memory_for_case(case)
         plan, graph_state = await run_investigation_graph(
             alert_payload,
             model=model,
@@ -932,9 +940,15 @@ def _case_service_control_primary_enabled() -> bool:
     return _env_bool("NOC_CASESERVICE_CONTROL_PRIMARY", False)
 
 
+def _case_service_proactive_primary_enabled() -> bool:
+    return _env_bool("NOC_PROACTIVE_ENABLED", False)
+
+
 def _case_service_graph_summary_routes_enabled() -> bool:
     return case_service_runtime is not None and hasattr(case_service_runtime, "store") and (
-        _case_service_control_primary_enabled() or _case_service_reactive_primary_enabled()
+        _case_service_control_primary_enabled()
+        or _case_service_reactive_primary_enabled()
+        or _case_service_proactive_primary_enabled()
     )
 
 

@@ -1,11 +1,9 @@
-"""Phase 2 bridge: turn a ranked :class:`~app.proactive.models.Hotspot` into a
-synthetic alert and drive the *existing* investigation graph on it.
+"""CaseService-backed proactive investigation bridge.
 
 A proactive concern is rendered as an Alertmanager-style payload
-(:func:`hotspot_to_alert_payload`), run through the same dedupe → routing →
-evidence-validation → drift-check → Discord-report pipeline the reactive webhook
-uses (``app.main.investigate_alert``), and the only proactive-specific twist is
-the **tool view**: heavy read-only probes are stripped unless
+(:func:`hotspot_to_alert_payload`), attached to a CaseService case, and then run
+through the same investigation/reporting pipeline the reactive webhook uses
+(``app.main.investigate_alert``). Heavy read-only probes are stripped unless
 ``auto_heavy_probes`` is set (the user's "cheap reads auto, escalate heavy"
 posture). Stripping is per-run (a wrapper around the shared runtime) so it never
 affects concurrent reactive investigations.
@@ -16,6 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 from app import log
+from app.cases.graph_memory import CaseServiceGraphMemory
+from app.cases.proactive import observation_from_hotspot
 from app.config import ProactiveLoopSettings
 from app.mcp_runtime import PROACTIVE_HEAVY_TOOLS
 from app.proactive.loop import InvestigationOutcome, Investigator
@@ -51,29 +51,44 @@ class HeavyProbeFilteredRuntime:
         return getattr(self._inner, name)
 
 
-def build_investigator(mcp_runtime: Any, settings: ProactiveLoopSettings) -> Investigator:
+def build_investigator(
+    mcp_runtime: Any,
+    settings: ProactiveLoopSettings,
+    *,
+    case_service_runtime: Any | None = None,
+) -> Investigator:
     """Build the coroutine the proactive loop calls per eligible hotspot.
 
-    Returns ``None`` for hotspots that intake de-dupes/suppresses (e.g. the same
-    hotspot was just investigated), so the loop neither double-spends nor spams.
+    Returns ``None`` for hotspots that CaseService de-dupes/suppresses (e.g. the
+    same hotspot was just investigated), so the loop neither double-spends nor
+    spams. Proactive graph runs are case-grounded: they require a CaseService
+    runtime and use :class:`CaseServiceGraphMemory` rather than legacy graph memory.
     """
 
     async def investigate(hotspot: Hotspot, decision: DecisionContext) -> InvestigationOutcome | None:
         # Lazy import avoids an import cycle: app.main imports this module's
         # builder at startup, after app.main is fully initialised.
-        from app import graph_runtime
-        from app.main import investigate_alert
+        import app.main as main
 
         payload = hotspot_to_alert_payload(hotspot)
-        intake = await graph_runtime.intake_alert(payload)
-        if not intake.should_investigate or intake.case is None:
+        runtime_owner = case_service_runtime if case_service_runtime is not None else getattr(main, "case_service_runtime", None)
+        if runtime_owner is None or not hasattr(runtime_owner, "service") or not hasattr(runtime_owner, "store"):
             log.info(
                 "proactive_investigation_skipped",
                 hotspot=hotspot.key,
-                action=intake.action,
-                reason="deduped_or_suppressed",
+                reason="case_service_runtime_unavailable",
             )
             return None
+
+        claimed = await _claim_case_service_hotspot(runtime_owner, hotspot, decision)
+        if claimed is None:
+            log.info(
+                "proactive_investigation_skipped",
+                hotspot=hotspot.key,
+                reason="case_service_gate",
+            )
+            return None
+        case, graph_memory, graph_case = claimed
 
         runtime = HeavyProbeFilteredRuntime(mcp_runtime, allow_heavy=settings.auto_heavy_probes)
         log.info(
@@ -81,12 +96,19 @@ def build_investigator(mcp_runtime: Any, settings: ProactiveLoopSettings) -> Inv
             hotspot=hotspot.key,
             severity=hotspot.severity,
             decision_id=decision.decision_id,
+            case_id=getattr(case, "case_id", ""),
             allow_heavy=settings.auto_heavy_probes,
         )
         try:
-            synthesis = await investigate_alert(payload, case=intake.case, mcp_runtime=runtime)
+            synthesis = await main.investigate_alert(
+                payload,
+                case=graph_case,
+                mcp_runtime=runtime,
+                graph_memory=graph_memory,
+            )
         except Exception as exc:  # surfaced to the loop's error list
             safe = classify_exception(exc)
+            await _record_failed_case_service_investigation(runtime_owner, case, error=safe.category)
             log_exception("proactive_investigation_graph_failed", exc, category=safe.category, hotspot=hotspot.key)
             raise
 
@@ -95,10 +117,11 @@ def build_investigator(mcp_runtime: Any, settings: ProactiveLoopSettings) -> Inv
             # failure. Do NOT count a failed run as an investigation, and do not
             # hand off on scanner evidence alone — only successful synthesis
             # counts and is eligible for a loop:candidate issue.
+            await _record_failed_case_service_investigation(runtime_owner, case, error="no_synthesis")
             log.info("proactive_investigation_unsuccessful", hotspot=hotspot.key, reason="no_synthesis")
             return None
 
-        incident_id = intake.case.get("incident_id")
+        incident_id = str(graph_case.get("incident_id") or getattr(case, "case_id", ""))
         handoff_url = await _maybe_handoff(hotspot, settings, incident_id=incident_id, decision=decision)
         # Per-run token→USD metering is not yet plumbed, so charge a conservative
         # flat estimate per investigation. This keeps the daily *dollar* budget
@@ -111,6 +134,50 @@ def build_investigator(mcp_runtime: Any, settings: ProactiveLoopSettings) -> Inv
         )
 
     return investigate
+
+
+async def _claim_case_service_hotspot(
+    case_service_runtime: Any,
+    hotspot: Hotspot,
+    decision: DecisionContext,
+) -> tuple[Any, CaseServiceGraphMemory, dict[str, Any]] | None:
+    service = case_service_runtime.service
+    graph_memory = CaseServiceGraphMemory(case_service_runtime.store)
+    cycle_id = decision.cycle_id or decision.decision_id or "proactive"
+    fingerprint = hotspot.fingerprint()
+    case = await service.case_for_alias("source_fp", fingerprint)
+    if case is None:
+        result = await service.observe(
+            observation_from_hotspot(
+                hotspot,
+                cycle_id=cycle_id,
+                source_health="healthy",
+            )
+        )
+        case = getattr(result, "case", None)
+    if case is None:
+        return None
+    claimed = await service.claim_investigation(case)
+    if claimed is None:
+        return None
+    graph_case = await graph_memory.get_case(claimed.case_id)
+    if graph_case is None:
+        raise RuntimeError(f"CaseService graph case not found after claim: {claimed.case_id}")
+    return claimed, graph_memory, graph_case
+
+
+async def _record_failed_case_service_investigation(case_service_runtime: Any, case: Any, *, error: str) -> None:
+    try:
+        await case_service_runtime.service.record_investigation_result(
+            getattr(case, "case_id", ""),
+            diagnosis={"source": "proactive_loop", "error": error},
+            recommendations=[],
+            status="failed",
+            error=error,
+        )
+    except Exception as exc:
+        safe = classify_exception(exc)
+        log_exception("proactive_investigation_failure_record_failed", exc, category=safe.category)
 
 
 async def _maybe_handoff(
