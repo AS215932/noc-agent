@@ -65,7 +65,7 @@ def test_postgres_payload_rehydrates_atomic_or_meta_projection():
 
 
 @pytest.mark.asyncio
-async def test_postgres_observation_insert_is_idempotent_on_dedup_key():
+async def test_postgres_observation_insert_refreshes_payload_on_dedup_key():
     class _Conn:
         def __init__(self):
             self.queries = []
@@ -99,6 +99,8 @@ async def test_postgres_observation_insert_is_idempotent_on_dedup_key():
 
     assert stored.dedup_key == observation.dedup_key
     assert "ON CONFLICT (dedup_key) WHERE dedup_key <> ''" in conn.queries[0]
+    assert "signal_signature = EXCLUDED.signal_signature" in conn.queries[0]
+    assert "payload = jsonb_set(EXCLUDED.payload" in conn.queries[0]
 
 
 

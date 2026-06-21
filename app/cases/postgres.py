@@ -59,7 +59,22 @@ class PostgresCaseStore:
     async def put_observation(self, observation: ObservationRecord) -> ObservationRecord:
         payload = observation.model_dump(mode="json")
         conflict_clause = (
-            "ON CONFLICT (dedup_key) WHERE dedup_key <> '' DO UPDATE SET dedup_key = observations.dedup_key"
+            """
+                ON CONFLICT (dedup_key) WHERE dedup_key <> '' DO UPDATE SET
+                    source = EXCLUDED.source,
+                    detector = EXCLUDED.detector,
+                    status = EXCLUDED.status,
+                    severity = EXCLUDED.severity,
+                    source_event_id = EXCLUDED.source_event_id,
+                    source_fingerprint = EXCLUDED.source_fingerprint,
+                    observed_at = EXCLUDED.observed_at,
+                    received_at = EXCLUDED.received_at,
+                    scan_cycle_id = EXCLUDED.scan_cycle_id,
+                    signal_signature = EXCLUDED.signal_signature,
+                    source_health = EXCLUDED.source_health,
+                    payload = jsonb_set(EXCLUDED.payload, '{observation_id}', to_jsonb(observations.observation_id)),
+                    schema_version = EXCLUDED.schema_version
+            """
             if observation.dedup_key
             else "ON CONFLICT (observation_id) DO UPDATE SET observation_id = observations.observation_id"
         )
