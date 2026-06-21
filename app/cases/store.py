@@ -173,6 +173,8 @@ class InMemoryCaseStore:
             case = self._cases.get(str(case_id or ""))
             if not isinstance(case, AtomicCaseProjection):
                 return None
+            if str(case.status or "") in {"resolved", "closed", "expired", "linked"}:
+                return None
             if (
                 case.signal_signature != expected_signal_signature
                 or case.diagnosis_signature != expected_diagnosis_signature

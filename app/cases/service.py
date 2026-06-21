@@ -180,6 +180,8 @@ class CaseService:
         if the investigation is older than the policy cooldown.
         """
 
+        if _investigation_blocked_status(case.status):
+            return False
         if not case.last_investigated_at or not case.diagnosis_signature:
             return True
         if case.signal_signature and case.diagnosis_signature != case.signal_signature:
@@ -588,6 +590,10 @@ def observation_identity_fingerprint(observation: ObservationRecord) -> str:
 
 def _investigation_signature(case: AtomicCaseProjection) -> str:
     return case.signal_signature or case.fingerprint or case.case_id
+
+
+def _investigation_blocked_status(status: str) -> bool:
+    return str(status or "") in {"resolved", "closed", "expired", "linked"}
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:

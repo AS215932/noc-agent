@@ -437,6 +437,26 @@ async def test_case_service_investigation_claim_is_atomic_for_stale_cases():
 
 
 @pytest.mark.asyncio
+async def test_case_service_rejects_stale_claim_after_case_resolved():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    firing = await service.observe(
+        ObservationRecord(source="alertmanager", source_fingerprint="alert-fp", resource="rtr1", status="firing")
+    )
+    assert firing.case is not None
+    resolved = await service.observe(
+        ObservationRecord(source="alertmanager", source_fingerprint="alert-fp", resource="rtr1", status="resolved")
+    )
+    assert resolved.case is not None
+    assert resolved.case.status == "resolved"
+
+    claimed = await service.claim_investigation(firing.case)
+
+    assert claimed is None
+    assert [event.event_type for event in await store.case_events(firing.case.case_id)].count("investigation_started") == 0
+
+
+@pytest.mark.asyncio
 async def test_case_service_first_case_creation_is_idempotent_by_alias():
     store = InMemoryCaseStore()
     service = CaseService(store)

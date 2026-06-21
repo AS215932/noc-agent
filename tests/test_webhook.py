@@ -415,6 +415,27 @@ async def test_alertmanager_webhook_reactive_primary_claims_single_concurrent_du
 
 
 @pytest.mark.asyncio
+async def test_alertmanager_webhook_reactive_primary_does_not_claim_after_same_batch_resolve(
+    monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
+):
+    _, _, store = isolated_case_service_runtime
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_PRIMARY", "1")
+    payload = deepcopy(mock_alert_payload)
+    payload["alerts"].append(deepcopy(payload["alerts"][0]))
+    payload["alerts"][1]["status"] = "resolved"
+    payload["alerts"][1]["endsAt"] = "2026-05-02T10:03:00Z"
+    background_tasks = mocker.Mock()
+
+    response = await alertmanager_webhook(AlertManagerPayload.model_validate(payload), background_tasks)
+
+    case = await store.get_case(response["incident_id"])
+    assert case is not None
+    assert case.status == "resolved"
+    assert case.investigation_status == ""
+    background_tasks.add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_alertmanager_webhook_reactive_primary_investigates_case_that_passed_gate(
     monkeypatch, mock_alert_payload, mocker, isolated_case_service_runtime
 ):
