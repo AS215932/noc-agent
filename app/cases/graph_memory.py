@@ -96,51 +96,28 @@ class CaseServiceGraphMemory:
         reason: str,
         evidence_refs: list[str] | None = None,
     ) -> dict[str, Any]:
-        child = await self._case(child_case_id)
-        parent = await self._case(parent_case_id)
-        if child is None or parent is None:
-            return {"ok": False, "error": "case_not_found"}
         refs = [_safe_string(item, limit=160) for item in list(evidence_refs or [])[:20]]
         safe_reason = _safe_string(reason, limit=500)
-        diagnosis = dict(child.last_diagnosis or {})
-        diagnosis["linked_parent_case"] = parent.case_id
-        diagnosis["link_reason"] = safe_reason
-        diagnosis["link_evidence_refs"] = refs
-        child.status = "linked"
-        child.resolution_reason = "linked_parent"
-        child.resolved_at = utc_now()
-        child.last_diagnosis = diagnosis
-        child.updated_at = utc_now()
-        child = cast(AtomicCaseProjection, await self.store.upsert_case(child))
-        moved_aliases = await self.store.reassign_aliases(child.case_id, parent.case_id)
-        await self.store.append_event(
-            CaseEvent(
-                case_id=child.case_id,
-                event_type="case_linked_to_parent",
-                actor_type="graph",
-                payload={
-                    "parent_case_id": parent.case_id,
-                    "reason": safe_reason,
-                    "evidence_refs": refs,
-                    "moved_alias_count": len(moved_aliases),
-                },
-            )
+        resolved_child_id = await self.resolve_case_identifier(child_case_id)
+        resolved_parent_id = await self.resolve_case_identifier(parent_case_id)
+        if not resolved_child_id or not resolved_parent_id:
+            return {"ok": False, "error": "case_not_found"}
+        result = await self.store.link_child_case(
+            resolved_child_id,
+            resolved_parent_id,
+            reason=safe_reason,
+            evidence_refs=refs,
+            now=utc_now(),
         )
-        await self.store.append_event(
-            CaseEvent(
-                case_id=parent.case_id,
-                event_type="linked_child_case",
-                actor_type="graph",
-                payload={
-                    "child_case_id": child.case_id,
-                    "resource_key": _safe_string(child.resource_id, limit=240),
-                    "summary": safe_reason,
-                    "evidence_refs": refs,
-                    "moved_alias_count": len(moved_aliases),
-                },
-            )
-        )
-        return {"ok": True, "child_case": _case_dict(child), "parent_case": _case_dict(parent)}
+        if result is None:
+            return {"ok": False, "error": "case_not_found"}
+        return {
+            "ok": True,
+            "child_case": _case_dict(result.child_case),
+            "parent_case": _case_dict(result.parent_case),
+            "moved_alias_count": len(result.moved_aliases),
+            "event_count": len(result.events),
+        }
 
     async def history_for(self, resource_id: str, *, window_seconds: int = 7 * 24 * 3600) -> list[dict[str, Any]]:
         now = time.time()

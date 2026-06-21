@@ -151,23 +151,47 @@ async def test_case_service_graph_memory_links_child_to_parent_case():
     )
     assert parent.case is not None
     assert child.case is not None
+    parent.case.case_number = "NOC-20260621-043"
+    await store.upsert_case(parent.case)
     assert await store.resolve_alias("source_fp", "child-fp") == child.case.case_id
     graph_memory = CaseServiceGraphMemory(store)
 
     result = await graph_memory.link_to_parent_case(
-        child.case.case_id,
-        parent.case.case_id,
+        "child-fp",
+        parent.case.case_number,
         "same rack power event",
         ["evt-1"],
     )
 
     stored_child = await store.get_case(child.case.case_id)
     parent_events = await store.case_events(parent.case.case_id)
+    child_events = await store.case_events(child.case.case_id)
+    repeated = await graph_memory.link_to_parent_case(
+        child.case.case_id,
+        parent.case.case_id,
+        "same rack power event",
+        ["evt-1"],
+    )
+
     assert result["ok"] is True
+    assert result["event_count"] == 2
+    assert repeated["ok"] is True
+    assert repeated["event_count"] == 0
     assert stored_child.status == "linked"
     assert stored_child.last_diagnosis["linked_parent_case"] == parent.case.case_id
     assert await store.resolve_alias("source_fp", "child-fp") == parent.case.case_id
     assert "linked_child_case" in [event.event_type for event in parent_events]
+    assert len(await store.case_events(parent.case.case_id)) == len(parent_events)
+    assert len(await store.case_events(child.case.case_id)) == len(child_events)
+
+
+@pytest.mark.asyncio
+async def test_case_service_graph_memory_link_rejects_missing_cases():
+    graph_memory = CaseServiceGraphMemory(InMemoryCaseStore())
+
+    result = await graph_memory.link_to_parent_case("missing-child", "missing-parent", "same event")
+
+    assert result == {"ok": False, "error": "case_not_found"}
 
 
 @pytest.mark.asyncio

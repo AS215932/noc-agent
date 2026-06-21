@@ -19,9 +19,8 @@ from app.cases.models import (
     OperatorFeedback,
     OutboxIntent,
     TraceRecord,
-    utc_now,
 )
-from app.cases.store import CaseProjection
+from app.cases.store import CaseLinkResult, CaseProjection
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
 
@@ -362,12 +361,77 @@ class PostgresCaseStore:
             )
         return str(row["case_id"]) if row else None
 
-    async def reassign_aliases(self, from_case_id: str, to_case_id: str) -> list[CaseIdentityAlias]:
-        if from_case_id == to_case_id:
-            return []
-        moved: list[CaseIdentityAlias] = []
-        now = utc_now()
+    async def link_child_case(
+        self,
+        child_case_id: str,
+        parent_case_id: str,
+        *,
+        reason: str,
+        evidence_refs: list[str],
+        now: str,
+    ) -> CaseLinkResult | None:
+        if child_case_id == parent_case_id:
+            return None
         async with self.pool.acquire() as conn, conn.transaction():
+            child_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", child_case_id)
+            parent_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", parent_case_id)
+            if not child_row or not parent_row:
+                return None
+            child = _case_from_payload(_row_payload(child_row))
+            parent = _case_from_payload(_row_payload(parent_row))
+            if not isinstance(child, AtomicCaseProjection) or not isinstance(parent, AtomicCaseProjection):
+                return None
+            child_diagnosis = dict(child.last_diagnosis or {})
+            if child.status == "linked":
+                if child_diagnosis.get("linked_parent_case") == parent.case_id:
+                    return CaseLinkResult(child_case=child, parent_case=parent, moved_aliases=[], events=[])
+                return None
+            child_diagnosis["linked_parent_case"] = parent.case_id
+            child_diagnosis["link_reason"] = reason
+            child_diagnosis["link_evidence_refs"] = list(evidence_refs)
+            child.status = "linked"
+            child.resolution_reason = "linked_parent"
+            child.resolved_at = now
+            child.last_diagnosis = child_diagnosis
+            child.updated_at = now
+            parent.updated_at = now
+            child_payload = child.model_dump(mode="json")
+            parent_payload = parent.model_dump(mode="json")
+            child_updated = await conn.fetchrow(
+                """
+                UPDATE cases SET
+                    status = $2,
+                    updated_at = $3,
+                    payload = $4::jsonb,
+                    row_version = cases.row_version + 1,
+                    schema_version = $5
+                WHERE case_id = $1
+                RETURNING payload
+                """,
+                child.case_id,
+                child.status,
+                child.updated_at,
+                json.dumps(child_payload),
+                child.schema_version,
+            )
+            parent_updated = await conn.fetchrow(
+                """
+                UPDATE cases SET
+                    updated_at = $2,
+                    payload = $3::jsonb,
+                    row_version = cases.row_version + 1,
+                    schema_version = $4
+                WHERE case_id = $1
+                RETURNING payload
+                """,
+                parent.case_id,
+                parent.updated_at,
+                json.dumps(parent_payload),
+                parent.schema_version,
+            )
+            child = cast(AtomicCaseProjection, _case_from_payload(_row_payload(child_updated)))
+            parent = cast(AtomicCaseProjection, _case_from_payload(_row_payload(parent_updated)))
+            moved_aliases: list[CaseIdentityAlias] = []
             rows = await conn.fetch(
                 """
                 SELECT alias_id, case_id, alias_type, alias_value, source, confidence, created_at, retired_at
@@ -375,7 +439,7 @@ class PostgresCaseStore:
                 WHERE case_id = $1 AND retired_at IS NULL
                 FOR UPDATE
                 """,
-                from_case_id,
+                child.case_id,
             )
             for row in rows:
                 alias = CaseIdentityAlias.model_validate(dict(row))
@@ -389,11 +453,12 @@ class PostgresCaseStore:
                     now,
                 )
                 replacement = CaseIdentityAlias(
-                    case_id=to_case_id,
+                    case_id=parent.case_id,
                     alias_type=alias.alias_type,
                     alias_value=alias.alias_value,
                     source=alias.source or "case_link",
                     confidence=alias.confidence,
+                    created_at=now,
                 )
                 inserted = await conn.fetchrow(
                     """
@@ -413,8 +478,34 @@ class PostgresCaseStore:
                     replacement.retired_at,
                 )
                 if inserted:
-                    moved.append(replacement)
-        return moved
+                    moved_aliases.append(replacement)
+            child_event = CaseEvent(
+                case_id=child.case_id,
+                event_type="case_linked_to_parent",
+                actor_type="graph",
+                occurred_at=now,
+                payload={
+                    "parent_case_id": parent.case_id,
+                    "reason": reason,
+                    "evidence_refs": list(evidence_refs),
+                    "moved_alias_count": len(moved_aliases),
+                },
+            )
+            parent_event = CaseEvent(
+                case_id=parent.case_id,
+                event_type="linked_child_case",
+                actor_type="graph",
+                occurred_at=now,
+                payload={
+                    "child_case_id": child.case_id,
+                    "resource_key": child.resource_id,
+                    "summary": reason,
+                    "evidence_refs": list(evidence_refs),
+                    "moved_alias_count": len(moved_aliases),
+                },
+            )
+            events = [await _insert_case_event(conn, child_event), await _insert_case_event(conn, parent_event)]
+            return CaseLinkResult(child_case=child, parent_case=parent, moved_aliases=moved_aliases, events=events)
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent:
         payload = intent.model_dump(mode="json")

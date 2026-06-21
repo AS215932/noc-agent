@@ -9,6 +9,7 @@ truth.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from app.cases.models import (
@@ -20,10 +21,17 @@ from app.cases.models import (
     OperatorFeedback,
     OutboxIntent,
     TraceRecord,
-    utc_now,
 )
 
 CaseProjection = AtomicCaseProjection | MetaCaseProjection
+
+
+@dataclass(frozen=True)
+class CaseLinkResult:
+    child_case: AtomicCaseProjection
+    parent_case: AtomicCaseProjection
+    moved_aliases: list[CaseIdentityAlias]
+    events: list[CaseEvent]
 
 
 @runtime_checkable
@@ -67,7 +75,15 @@ class CaseStore(Protocol):
 
     async def resolve_alias(self, alias_type: str, alias_value: str) -> str | None: ...
 
-    async def reassign_aliases(self, from_case_id: str, to_case_id: str) -> list[CaseIdentityAlias]: ...
+    async def link_child_case(
+        self,
+        child_case_id: str,
+        parent_case_id: str,
+        *,
+        reason: str,
+        evidence_refs: list[str],
+        now: str,
+    ) -> CaseLinkResult | None: ...
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
@@ -259,39 +275,109 @@ class InMemoryCaseStore:
                 return None
             return alias.case_id
 
-    async def reassign_aliases(self, from_case_id: str, to_case_id: str) -> list[CaseIdentityAlias]:
-        if from_case_id == to_case_id:
-            return []
-        moved: list[CaseIdentityAlias] = []
-        now = utc_now()
+    async def link_child_case(
+        self,
+        child_case_id: str,
+        parent_case_id: str,
+        *,
+        reason: str,
+        evidence_refs: list[str],
+        now: str,
+    ) -> CaseLinkResult | None:
+        if child_case_id == parent_case_id:
+            return None
         async with self._lock:
-            active_aliases = [
-                alias
-                for alias in self._aliases.values()
-                if alias.case_id == from_case_id and alias.retired_at is None
-            ]
-            for alias in active_aliases:
-                key = _alias_key(alias.alias_type, alias.alias_value)
-                indexed_id = self._alias_index.get(key)
-                indexed_alias = self._aliases.get(indexed_id) if indexed_id else None
-                target_already_has_alias = bool(
-                    indexed_alias and indexed_alias.case_id == to_case_id and indexed_alias.retired_at is None
-                )
-                if indexed_id == alias.alias_id:
-                    self._alias_index.pop(key, None)
-                alias.retired_at = now
-                if target_already_has_alias or key in self._alias_index:
-                    continue
-                replacement = CaseIdentityAlias(
-                    case_id=to_case_id,
-                    alias_type=alias.alias_type,
-                    alias_value=alias.alias_value,
-                    source=alias.source or "case_link",
-                    confidence=alias.confidence,
-                )
-                self._aliases[replacement.alias_id] = replacement
-                self._alias_index[key] = replacement.alias_id
-                moved.append(replacement.model_copy(deep=True))
+            child = self._cases.get(str(child_case_id or ""))
+            parent = self._cases.get(str(parent_case_id or ""))
+            if not isinstance(child, AtomicCaseProjection) or not isinstance(parent, AtomicCaseProjection):
+                return None
+            child_diagnosis = dict(child.last_diagnosis or {})
+            if child.status == "linked":
+                if child_diagnosis.get("linked_parent_case") == parent.case_id:
+                    return CaseLinkResult(
+                        child_case=child.model_copy(deep=True),
+                        parent_case=parent.model_copy(deep=True),
+                        moved_aliases=[],
+                        events=[],
+                    )
+                return None
+            linked_child = child.model_copy(deep=True)
+            linked_parent = parent.model_copy(deep=True)
+            child_diagnosis["linked_parent_case"] = parent.case_id
+            child_diagnosis["link_reason"] = reason
+            child_diagnosis["link_evidence_refs"] = list(evidence_refs)
+            linked_child.status = "linked"
+            linked_child.resolution_reason = "linked_parent"
+            linked_child.resolved_at = now
+            linked_child.last_diagnosis = child_diagnosis
+            linked_child.updated_at = now
+            linked_parent.updated_at = now
+            self._cases[linked_child.case_id] = linked_child
+            self._cases[linked_parent.case_id] = linked_parent
+            moved_aliases = self._reassign_aliases_locked(linked_child.case_id, linked_parent.case_id, now)
+            child_event = CaseEvent(
+                case_id=linked_child.case_id,
+                event_type="case_linked_to_parent",
+                actor_type="graph",
+                occurred_at=now,
+                payload={
+                    "parent_case_id": linked_parent.case_id,
+                    "reason": reason,
+                    "evidence_refs": list(evidence_refs),
+                    "moved_alias_count": len(moved_aliases),
+                },
+            )
+            parent_event = CaseEvent(
+                case_id=linked_parent.case_id,
+                event_type="linked_child_case",
+                actor_type="graph",
+                occurred_at=now,
+                payload={
+                    "child_case_id": linked_child.case_id,
+                    "resource_key": linked_child.resource_id,
+                    "summary": reason,
+                    "evidence_refs": list(evidence_refs),
+                    "moved_alias_count": len(moved_aliases),
+                },
+            )
+            stored_events = [self._store_event_locked(child_event), self._store_event_locked(parent_event)]
+            return CaseLinkResult(
+                child_case=linked_child.model_copy(deep=True),
+                parent_case=linked_parent.model_copy(deep=True),
+                moved_aliases=[alias.model_copy(deep=True) for alias in moved_aliases],
+                events=[event.model_copy(deep=True) for event in stored_events],
+            )
+
+    def _reassign_aliases_locked(self, from_case_id: str, to_case_id: str, now: str) -> list[CaseIdentityAlias]:
+        moved: list[CaseIdentityAlias] = []
+        active_aliases = [
+            alias
+            for alias in self._aliases.values()
+            if alias.case_id == from_case_id and alias.retired_at is None
+        ]
+        for alias in active_aliases:
+            key = _alias_key(alias.alias_type, alias.alias_value)
+            indexed_id = self._alias_index.get(key)
+            indexed_alias = self._aliases.get(indexed_id) if indexed_id else None
+            target_already_has_alias = bool(
+                indexed_alias and indexed_alias.case_id == to_case_id and indexed_alias.retired_at is None
+            )
+            if indexed_id == alias.alias_id:
+                self._alias_index.pop(key, None)
+            alias.retired_at = now
+            if target_already_has_alias or key in self._alias_index:
+                continue
+            replacement = CaseIdentityAlias(
+                case_id=to_case_id,
+                alias_type=alias.alias_type,
+                alias_value=alias.alias_value,
+                source=alias.source or "case_link",
+                confidence=alias.confidence,
+                created_at=now,
+            )
+            self._aliases[replacement.alias_id] = replacement
+            self._alias_index[key] = replacement.alias_id
+            moved.append(replacement)
         return moved
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent:
