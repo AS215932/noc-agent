@@ -37,8 +37,8 @@ from app.config import load_proactive_settings
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.proactive.loop import ProactiveLoop
 import app.graph_runtime as graph_runtime
-from app.graph_runtime import inject_case_event, intake_alert, pending_summaries, record_operator_decision, run_investigation_graph, summary_for
-from app.incident_memory import CaseIntakeResult, RECOVERY_COOLDOWN_SECONDS, case_display_title, case_event_from_alert
+from app.graph_runtime import record_operator_decision, run_investigation_graph
+from app.incident_memory import case_display_title, case_event_from_alert
 from app.noc_state import ApprovalDecision
 
 mcp_runtime = MCPRuntime(owner="api")
@@ -115,24 +115,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _legacy_incident_memory_enabled() -> bool:
-    return _env_bool("NOC_LEGACY_INCIDENT_MEMORY_ENABLED", True)
+def _require_case_service_reactive_primary() -> None:
+    raise HTTPException(
+        status_code=503,
+        detail="Reactive webhooks require NOC_CASESERVICE_REACTIVE_PRIMARY=1; legacy IncidentMemory intake has been removed",
+    )
 
 
-def _require_legacy_reactive_intake_enabled() -> None:
-    if not _legacy_incident_memory_enabled():
-        raise HTTPException(
-            status_code=503,
-            detail="Legacy IncidentMemory reactive intake is disabled; enable NOC_CASESERVICE_REACTIVE_PRIMARY=1",
-        )
-
-
-def _require_legacy_control_enabled() -> None:
-    if not _legacy_incident_memory_enabled():
-        raise HTTPException(
-            status_code=410,
-            detail="Legacy IncidentMemory control paths are disabled; enable CaseService primary routes",
-        )
+def _require_case_service_control_routes() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail="Control case routes require CaseService primary routes; legacy IncidentMemory control paths have been removed",
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -577,105 +571,6 @@ def _triage_fields(plan, alert_payload: dict) -> list[dict]:
     ]
 
 
-def _case_update_fields(case: dict, event: dict) -> list[dict]:
-    timeline = []
-    latest = case.get("latest_event") or event
-    if latest:
-        timeline.append(
-            " | ".join(
-                part
-                for part in [
-                    latest.get("received_at", ""),
-                    latest.get("state", ""),
-                    latest.get("summary", ""),
-                ]
-                if part
-            )
-        )
-    victims = list(case.get("downstream_victims", []))
-    victim_lines = [f"- {victim}" for victim in victims[:10]]
-    if len(victims) > 10:
-        victim_lines.append(f"- Plus {len(victims) - 10} more")
-    return [
-        {"name": "Case", "value": f"{case.get('case_number', 'NOC')} · {case.get('status', 'unknown')}"},
-        {"name": "Events", "value": str(case.get("event_count", 0)), "inline": True},
-        {"name": "Latest Event", "value": _truncate_discord("\n".join(timeline) or "No event details.")},
-        {"name": "Downstream Victims", "value": _truncate_discord("\n".join(victim_lines) or "None")},
-    ]
-
-
-def _case_update_title(action: str, case: dict, event: dict) -> str:
-    if action == "recovered":
-        return f"✅ {case.get('case_number', 'NOC')}: recovered, cooling down"
-    if action == "reopened":
-        return f"⚠️ {case.get('case_number', 'NOC')}: reopened during cooldown"
-    if action == "escalated":
-        return f"⚠️ {case.get('case_number', 'NOC')}: escalated to {event.get('state', 'UNKNOWN')}"
-    if action == "linked_parent":
-        return f"🔁 {case.get('case_number', 'NOC')}: downstream event linked"
-    return f"🔁 {case.get('case_number', 'NOC')}: duplicate event attached"
-
-
-def _case_update_description(action: str, case: dict, event: dict) -> str:
-    if action == "recovered":
-        cooldown = _format_duration(RECOVERY_COOLDOWN_SECONDS)
-        return f"Recovery event attached. The case is in recovered_pending cooldown for {cooldown}."
-    if action == "reopened":
-        return "A firing event arrived during recovered_pending cooldown, so the existing case was reopened."
-    if action == "linked_parent":
-        parent = case.get("linked_parent_case") or "parent case"
-        return f"Downstream event attached to `{parent}` instead of starting a separate investigation."
-    summary = event.get("summary") or "No output summary was provided."
-    return _truncate_discord(f"Event attached to the existing case. Latest state: `{event.get('state', 'UNKNOWN')}`.\n{summary}", DISCORD_DESCRIPTION_LIMIT)
-
-
-def _format_duration(seconds: int) -> str:
-    if seconds % 3600 == 0:
-        value = seconds // 3600
-        unit = "hour" if value == 1 else "hours"
-    elif seconds % 60 == 0:
-        value = seconds // 60
-        unit = "minute" if value == 1 else "minutes"
-    else:
-        value = seconds
-        unit = "second" if value == 1 else "seconds"
-    return f"{value} {unit}"
-
-
-def _case_color(action: str, event: dict) -> int:
-    if action == "recovered":
-        return 0x2ecc71
-    if action in {"escalated", "reopened"} or str(event.get("state", "")).upper() == "CRITICAL":
-        return 0xe74c3c
-    return 0xf39c12
-
-
-async def _handle_case_update(result: CaseIntakeResult) -> None:
-    target_case = result.parent_case if result.parent_case is not None else result.case
-    if target_case is None:
-        return
-    if result.should_inject:
-        try:
-            await inject_case_event(target_case, result.event)
-        except Exception as e:
-            safe = classify_exception(e)
-            log_exception(
-                "case_event_injection_failed",
-                e,
-                category=safe.category,
-                case_number=target_case.get("case_number"),
-                action=result.action,
-            )
-    await send_case_notification(
-        case_id=target_case["incident_id"],
-        title=_case_update_title(result.action, target_case, result.event),
-        description=_case_update_description(result.action, result.case or target_case, result.event),
-        color=_case_color(result.action, result.event),
-        fields=_case_update_fields(target_case, result.event),
-        level=Verbosity.INFO,
-    )
-
-
 async def _take_ownership_ack(alert_payload: dict, case: dict | None, runtime) -> None:
     """When an Icinga-sourced alert starts an investigation, acknowledge the
     problem so Icinga stops re-paging humans while the agent works it. The ack
@@ -890,65 +785,6 @@ def _case_service_reactive_investigation_result(shadow_results: list[object]):
     if firing_case_ids:
         log.info("case_service_reactive_investigation_suppressed", case_ids=firing_case_ids)
     return None
-
-
-def _case_service_result_has_firing_case(result: object) -> bool:
-    observation = getattr(result, "observation", None)
-    return getattr(observation, "status", "") == "firing" and getattr(result, "case", None) is not None
-
-
-def _case_service_reactive_allows_investigation(shadow_results: list[object]) -> bool:
-    """Optionally let CaseService own reactive investigation cooldown gating."""
-    if case_service_runtime is None or not (
-        _env_bool("NOC_CASESERVICE_REACTIVE_CONTROL", False) or _case_service_reactive_primary_enabled()
-    ):
-        return True
-    if _case_service_reactive_investigation_result(shadow_results) is not None:
-        return True
-    if not _case_service_reactive_primary_enabled() and not any(
-        _case_service_result_has_firing_case(result) for result in shadow_results
-    ):
-        log.warn("case_service_reactive_investigation_gate_fail_open_no_case")
-        return True
-    return False
-
-
-async def _link_case_service_results_to_legacy_case(shadow_results: list[object], legacy_case: dict | None) -> None:
-    """Best-effort alias bridge from legacy IncidentMemory ids to CaseService ids."""
-    if case_service_runtime is None or not legacy_case:
-        return
-    cases = []
-    seen: set[str] = set()
-    for result in shadow_results:
-        case = getattr(result, "case", None)
-        case_id = str(getattr(case, "case_id", "") or "")
-        if case is not None and case_id and case_id not in seen:
-            cases.append(case)
-            seen.add(case_id)
-    if not cases:
-        return
-    if len(cases) > 1:
-        log.info("case_service_legacy_alias_skipped_multi_case", count=len(cases))
-        return
-    case = cases[0]
-    try:
-        from app.cases.models import CaseIdentityAlias
-
-        aliases = []
-        case_number = str(legacy_case.get("case_number") or "").strip()
-        incident_id = str(legacy_case.get("incident_id") or "").strip()
-        if case_number:
-            aliases.append(CaseIdentityAlias(case_id=case.case_id, alias_type="legacy_case_number", alias_value=case_number))
-        if incident_id:
-            aliases.append(CaseIdentityAlias(case_id=case.case_id, alias_type="legacy_incident_id", alias_value=incident_id))
-        for alias in aliases:
-            await case_service_runtime.store.record_alias(alias)
-        if aliases:
-            log.info("case_service_legacy_alias_recorded", case_id=case.case_id, aliases=len(aliases))
-    except Exception as e:
-        safe = classify_exception(e)
-        record_case_service_shadow_failure(path="legacy_alias", category=safe.category)
-        log_exception("case_service_legacy_alias_failed", e, category=safe.category)
 
 
 async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_state: dict) -> None:
@@ -1303,42 +1139,38 @@ async def _case_service_graph_summary(case) -> dict | None:
 
 async def _control_pending_summaries() -> list[dict]:
     graph_memory = _case_service_graph_memory()
-    if graph_memory is not None:
-        return await graph_memory.list_summaries()
-    _require_legacy_control_enabled()
-    return await pending_summaries()
+    if graph_memory is None:
+        _require_case_service_control_routes()
+    return await graph_memory.list_summaries()
 
 
 async def _control_summary_for(incident_id: str) -> dict | None:
     graph_memory = _case_service_graph_memory()
-    if graph_memory is not None:
-        return await graph_memory.get_summary(incident_id)
-    _require_legacy_control_enabled()
-    return await summary_for(incident_id)
+    if graph_memory is None:
+        _require_case_service_control_routes()
+    return await graph_memory.get_summary(incident_id)
 
 
 async def _record_control_incident_decision(incident_id: str, request_body) -> dict | None:
     graph_memory = _case_service_graph_memory()
+    if graph_memory is None:
+        _require_case_service_control_routes()
+    existing = await graph_memory.get_summary(incident_id)
+    if existing is None:
+        return None
     decision_payload = request_body.model_dump(exclude={"incident_id"})
-    if graph_memory is not None:
-        existing = await graph_memory.get_summary(incident_id)
-        if existing is None:
-            return None
-        decision = ApprovalDecision(incident_id=incident_id, **decision_payload)
-        summary = await record_operator_decision(
-            incident_id,
-            decision.model_dump(),
-            mcp_runtime=mcp_runtime,
-            incident_memory=graph_memory,
-        )
-        case_id = await graph_memory.resolve_case_identifier(incident_id)
-        case = await case_service_runtime.store.get_case(case_id) if case_id else None
-        if case is not None:
-            await _apply_case_service_primary_decision_state(case, request_body, summary)
-        return summary
-    _require_legacy_control_enabled()
     decision = ApprovalDecision(incident_id=incident_id, **decision_payload)
-    return await record_operator_decision(incident_id, decision.model_dump(), mcp_runtime=mcp_runtime)
+    summary = await record_operator_decision(
+        incident_id,
+        decision.model_dump(),
+        mcp_runtime=mcp_runtime,
+        incident_memory=graph_memory,
+    )
+    case_id = await graph_memory.resolve_case_identifier(incident_id)
+    case = await case_service_runtime.store.get_case(case_id) if case_id else None
+    if case is not None:
+        await _apply_case_service_primary_decision_state(case, request_body, summary)
+    return summary
 
 
 async def _record_case_service_primary_decision(case, request_body) -> dict | None:
@@ -1675,25 +1507,7 @@ async def alertmanager_webhook(payload: AlertManagerPayload, background_tasks: B
     alert_payload["source"] = "alertmanager"
     if _case_service_reactive_primary_enabled():
         return await _case_service_reactive_primary_response(alert_payload, background_tasks, label="Alert")
-    _require_legacy_reactive_intake_enabled()
-    shadow_results = await _shadow_observe_alert_payload(alert_payload)
-    result = await intake_alert(alert_payload)
-    await _link_case_service_results_to_legacy_case(shadow_results, result.case or result.parent_case)
-    if (
-        result.should_investigate
-        and result.case is not None
-        and _case_service_reactive_allows_investigation(shadow_results)
-    ):
-        background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
-    elif result.case is not None or result.parent_case is not None:
-        background_tasks.add_task(_handle_case_update, result)
-    return {
-        "status": "accepted" if result.case or result.parent_case else "ignored",
-        "message": f"Alert {result.action}",
-        "action": result.action,
-        "case_number": (result.case or result.parent_case or {}).get("case_number"),
-        "incident_id": (result.case or result.parent_case or {}).get("incident_id"),
-    }
+    _require_case_service_reactive_primary()
 
 
 @app.post("/webhook/icinga")
@@ -1702,25 +1516,7 @@ async def icinga_webhook(payload: IcingaNotification, background_tasks: Backgrou
     alert_payload = _icinga_to_alert_payload(payload)
     if _case_service_reactive_primary_enabled():
         return await _case_service_reactive_primary_response(alert_payload, background_tasks, label="Icinga notification")
-    _require_legacy_reactive_intake_enabled()
-    shadow_results = await _shadow_observe_alert_payload(alert_payload)
-    result = await intake_alert(alert_payload)
-    await _link_case_service_results_to_legacy_case(shadow_results, result.case or result.parent_case)
-    if (
-        result.should_investigate
-        and result.case is not None
-        and _case_service_reactive_allows_investigation(shadow_results)
-    ):
-        background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
-    elif result.case is not None or result.parent_case is not None:
-        background_tasks.add_task(_handle_case_update, result)
-    return {
-        "status": "accepted" if result.case or result.parent_case else "ignored",
-        "message": f"Icinga notification {result.action}",
-        "action": result.action,
-        "case_number": (result.case or result.parent_case or {}).get("case_number"),
-        "incident_id": (result.case or result.parent_case or {}).get("incident_id"),
-    }
+    _require_case_service_reactive_primary()
 
 
 @app.post("/mail/poll", response_model=MailPollResponse)
@@ -1814,26 +1610,7 @@ async def control_cases(request: Request, token: str | None = Query(default=None
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_routes_enabled():
         return await _case_service_control_cases_response()
-    _require_legacy_control_enabled()
-    cases = await graph_runtime.INCIDENT_MEMORY.list_cases()
-    pending = {item["incident_id"] for item in await _control_pending_summaries()}
-    return {
-        "status": "ok",
-        "cases": [
-            {
-                "incident_id": case.get("incident_id"),
-                "case_number": case.get("case_number"),
-                "status": case.get("status"),
-                "severity": (case.get("latest_event") or {}).get("severity") or (case.get("latest_event") or {}).get("state"),
-                "resource_id": case.get("resource_id"),
-                "title": case.get("title"),
-                "event_count": case.get("event_count", 0),
-                "updated_at": case.get("updated_at"),
-                "pending_approval": case.get("incident_id") in pending or case.get("status") == "waiting_approval",
-            }
-            for case in cases
-        ],
-    }
+    _require_case_service_control_routes()
 
 
 @app.get("/control/cases/{case_id}")
@@ -1841,11 +1618,7 @@ async def control_case_detail(case_id: str, request: Request, token: str | None 
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_routes_enabled():
         return await _case_service_control_case_detail_response(case_id)
-    _require_legacy_control_enabled()
-    detail = await graph_runtime.INCIDENT_MEMORY.case_detail(case_id)
-    if detail is None:
-        raise HTTPException(status_code=404, detail="Case not found")
-    return {"status": "ok", **detail}
+    _require_case_service_control_routes()
 
 
 @app.get("/control/case-service/cases")
@@ -1920,11 +1693,7 @@ async def control_case_events(case_id: str, request: Request, token: str | None 
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_routes_enabled():
         return await _case_service_control_case_events_response(case_id)
-    _require_legacy_control_enabled()
-    resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
-    if not resolved:
-        raise HTTPException(status_code=404, detail="Case not found")
-    return {"status": "ok", "events": await graph_runtime.INCIDENT_MEMORY.case_events(resolved)}
+    _require_case_service_control_routes()
 
 
 @app.post("/control/cases/{case_id}/comment")
@@ -1939,18 +1708,7 @@ async def control_case_comment(
     if _case_service_control_routes_enabled():
         case = await _require_case_service_control_case(case_id)
         return await _case_service_control_comment_response(case, request_body)
-    _require_legacy_control_enabled()
-    case = await graph_runtime.INCIDENT_MEMORY.append_operator_comment(case_id, request_body.operator, request_body.comment)
-    if case is None:
-        raise HTTPException(status_code=404, detail="Case not found")
-    await _record_case_service_operator_feedback(
-        case_id,
-        operator=request_body.operator,
-        feedback_type="operator_note",
-        comment=request_body.comment,
-        payload={"source": "control_case_comment"},
-    )
-    return {"status": "ok", "case": case}
+    _require_case_service_control_routes()
 
 
 @app.post("/control/cases/{case_id}/decision")
@@ -1965,27 +1723,7 @@ async def control_case_decision(
     if _case_service_control_routes_enabled():
         case = await _require_case_service_control_case(case_id)
         return await _case_service_control_decision_response(case, request_body)
-    _require_legacy_control_enabled()
-    resolved = await graph_runtime.INCIDENT_MEMORY.resolve_case_identifier(case_id)
-    if not resolved:
-        raise HTTPException(status_code=404, detail="Case not found")
-    decision = ApprovalDecision(incident_id=resolved, **request_body.model_dump())
-    summary = await record_operator_decision(resolved, decision.model_dump(), mcp_runtime=mcp_runtime)
-    if summary is None:
-        raise HTTPException(status_code=404, detail="Incident not found")
-    await graph_runtime.INCIDENT_MEMORY.append_operator_comment(
-        resolved,
-        request_body.operator,
-        f"Decision {request_body.decision}: {request_body.comment}".strip(),
-    )
-    await _record_case_service_operator_feedback(
-        resolved,
-        operator=request_body.operator,
-        feedback_type=_feedback_type_for_decision(request_body.decision),
-        comment=request_body.comment,
-        payload={"source": "control_case_decision", "decision": request_body.decision},
-    )
-    return {"status": "ok", "incident": summary}
+    _require_case_service_control_routes()
 
 
 @app.post("/control/cases/investigate")
@@ -2012,12 +1750,7 @@ async def control_manual_investigation(
             "incident_id": case.case_id,
             "source": "case_service",
         }
-    _require_legacy_control_enabled()
-    result = await intake_alert(alert_payload)
-    if result.case is None:
-        raise HTTPException(status_code=409, detail=f"Manual investigation was not queued: {result.action}")
-    background_tasks.add_task(investigate_alert, alert_payload, case=result.case)
-    return {"status": "accepted", "case": result.case, "case_number": result.case.get("case_number"), "incident_id": result.case.get("incident_id")}
+    _require_case_service_control_routes()
 
 
 @app.post("/control/status")

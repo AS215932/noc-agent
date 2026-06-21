@@ -232,17 +232,10 @@ The enqueued payload uses a bounded `reactive_case_report_v1` schema, marks
 monitor text as untrusted/not-for-model-consumption, and strips control/markdown
 delimiters from webhook-derived text.
 
-Reactive investigation cooldown can then be canaried with:
-
-```bash
-NOC_CASESERVICE_REACTIVE_CONTROL=1
-```
-
-With this flag, legacy intake still creates/updates operator cases, but
-CaseService decides whether a firing reactive case needs another graph
-investigation. Successful graph investigations are stamped back onto CaseService
-case state so repeated identical signals can be skipped until the policy
-cooldown or a signal change.
+Reactive investigation cooldown is owned by CaseService when reactive-primary
+webhook intake is enabled. Successful graph investigations are stamped back onto
+CaseService case state so repeated identical signals can be skipped until the
+policy cooldown or a signal change.
 
 Reactive webhook intake can be cut over to CaseService with:
 
@@ -267,20 +260,14 @@ With this flag, `/control/cases`, `/control/cases/{id}`, case events, comments,
 decisions, and manual investigations use CaseService as the primary case store.
 It also starts the CaseService runtime even if `NOC_CASESERVICE_SHADOW` is not
 set. This path intentionally does not fall back to legacy `IncidentMemory` for
-old or unmapped cases; keep the flag off if preserving old/open legacy cases
-matters. `NOC_CASESERVICE_REACTIVE_PRIMARY=1` also routes the `/control/cases`
-surface to CaseService so reactive-primary cases remain operator-visible without
-legacy fallback.
+old or unmapped cases. `NOC_CASESERVICE_REACTIVE_PRIMARY=1` also routes the
+`/control/cases` surface to CaseService so reactive-primary cases remain
+operator-visible without legacy fallback.
 
-Legacy `IncidentMemory` reactive/control paths can be disabled with:
-
-```bash
-NOC_LEGACY_INCIDENT_MEMORY_ENABLED=0
-```
-
-When disabled, legacy webhook intake fails loudly unless reactive-primary is
-enabled, and legacy control routes return gone unless CaseService primary routes
-are active. See `LEGACY_DEPRECATION.md` for the removal audit.
+Legacy `IncidentMemory` reactive/control fallbacks have been removed: reactive
+webhooks require `NOC_CASESERVICE_REACTIVE_PRIMARY=1`, and control case routes
+require a CaseService primary route. See `LEGACY_DEPRECATION.md` for the removal
+audit.
 
 Outbox side effects are also opt-in:
 
@@ -308,15 +295,10 @@ network access or production credentials.
 
 `GET /health/cases` reports whether the optional runtime is disabled, healthy,
 or degraded, including backend name and pending/failed outbox counts when the
-runtime is enabled. The control plane also exposes read-only case-service canary
-views under `/control/case-service/...` for comparing projections, events,
-traces, feedback, and outbox rows against the legacy `/control/cases` surface.
-Reactive webhook intake records best-effort aliases from legacy incident IDs /
-case numbers to CaseService cases when exactly one shadow case matches, and
-operator comments/decisions are mirrored as CaseService operator feedback when
-such an alias exists. When `NOC_CASESERVICE_CONTROL_PRIMARY=1`, the legacy
-`/control/cases` surface itself reads and writes CaseService case projections
-instead of `IncidentMemory`.
+runtime is enabled. The control plane also exposes read-only CaseService views
+under `/control/case-service/...` for projections, events, traces, feedback, and
+outbox rows. Reactive-primary and control-primary routes read and write
+CaseService case projections instead of `IncidentMemory`.
 Prometheus exports `noc_agent_case_service_runtime_enabled`,
 `noc_agent_case_service_shadow_observations_total`,
 `noc_agent_case_service_shadow_failures_total`, and
@@ -375,10 +357,9 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
 - `NOC_CASESERVICE_CONTROL` (default `0`; guarded proactive case-owned cooldown/report state)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
-- `NOC_CASESERVICE_REACTIVE_CONTROL` (default `0`; gate reactive graph investigations from case state)
+- `NOC_CASESERVICE_REACTIVE_CONTROL` (deprecated; legacy reactive-control canary flag, superseded by reactive-primary)
 - `NOC_CASESERVICE_REACTIVE_PRIMARY` (default `0`; make reactive webhooks use CaseService without legacy intake)
 - `NOC_CASESERVICE_CONTROL_PRIMARY` (default `0`; make `/control/cases` use CaseService without legacy fallback)
-- `NOC_LEGACY_INCIDENT_MEMORY_ENABLED` (default `1`; set `0` to disable legacy reactive/control paths)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`
