@@ -75,6 +75,10 @@ class ProactiveLoopSettings:
     # report it via the de-dup gate instead of burning the daily investigation
     # budget — and the forced "investigated" digest post — on the same finding.
     investigation_cooldown_s: int = 21600
+    # Retry failed investigations no more often than this. Keep this aligned
+    # with the success cooldown by default; dependency outages should not page
+    # Discord every scan cycle.
+    investigation_failure_retry_s: int = 21600
     # Autonomously snooze non-urgent (LOW, not warrants_change) hotspots: mute
     # them from the digest for auto_snooze_ttl_s and best-effort ack the matching
     # Icinga WARNING problem (with an expiry so it auto-clears). Bounded per cycle.
@@ -174,6 +178,9 @@ def load_proactive_settings() -> ProactiveLoopSettings:
         investigation_cooldown_s=_env_int(
             "NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S", base.investigation_cooldown_s
         ),
+        investigation_failure_retry_s=_env_int(
+            "NOC_PROACTIVE_INVESTIGATION_FAILURE_RETRY_S", base.investigation_failure_retry_s
+        ),
         auto_snooze_enabled=_env_bool("NOC_PROACTIVE_AUTO_SNOOZE_ENABLED", base.auto_snooze_enabled),
         auto_snooze_ttl_s=_env_int("NOC_PROACTIVE_AUTO_SNOOZE_TTL_S", base.auto_snooze_ttl_s),
         auto_snooze_max_per_cycle=_env_int(
@@ -215,6 +222,9 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
         report_reassert_s=_int_value(table, "report_reassert_s", defaults.report_reassert_s, errors),
         investigation_cooldown_s=_int_value(
             table, "investigation_cooldown_s", defaults.investigation_cooldown_s, errors
+        ),
+        investigation_failure_retry_s=_int_value(
+            table, "investigation_failure_retry_s", defaults.investigation_failure_retry_s, errors
         ),
         auto_snooze_enabled=_bool_value(table, "auto_snooze_enabled", defaults.auto_snooze_enabled, errors),
         auto_snooze_ttl_s=_int_value(table, "auto_snooze_ttl_s", defaults.auto_snooze_ttl_s, errors),

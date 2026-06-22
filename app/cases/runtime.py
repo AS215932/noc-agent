@@ -64,7 +64,7 @@ async def build_case_service_runtime_from_env(*, force: bool = False) -> CaseSer
     db = load_database_settings()
     if db.require_postgres:
         db.assert_ready_for_production()
-    policy = CasePolicy(policy_version=os.getenv("NOC_CASE_POLICY_VERSION", "case_policy_v1"))
+    policy = _case_policy_from_env()
     if db.enabled:
         try:
             from app.cases.postgres import PostgresCaseStore
@@ -99,3 +99,22 @@ def _env_int(name: str, default: int) -> int:
         return int(value.strip())
     except ValueError:
         return default
+
+
+def _case_policy_from_env() -> CasePolicy:
+    defaults = CasePolicy(policy_version=os.getenv("NOC_CASE_POLICY_VERSION", "case_policy_v1"))
+    proactive_cooldown = _env_int("NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S", defaults.investigation_cooldown_s)
+    proactive_failure_retry = _env_int(
+        "NOC_PROACTIVE_INVESTIGATION_FAILURE_RETRY_S",
+        proactive_cooldown,
+    )
+    return CasePolicy(
+        policy_version=defaults.policy_version,
+        report_reassert_s=_env_int("NOC_CASE_REPORT_REASSERT_S", defaults.report_reassert_s),
+        investigation_cooldown_s=_env_int("NOC_CASE_INVESTIGATION_COOLDOWN_S", proactive_cooldown),
+        investigation_failure_retry_s=_env_int("NOC_CASE_INVESTIGATION_FAILURE_RETRY_S", proactive_failure_retry),
+        reinvestigate_stale_s=_env_int("NOC_CASE_REINVESTIGATE_STALE_S", defaults.reinvestigate_stale_s),
+        recovery_cooldown_s=_env_int("NOC_CASE_RECOVERY_COOLDOWN_S", defaults.recovery_cooldown_s),
+        suppression_default_ttl_s=_env_int("NOC_CASE_SUPPRESSION_DEFAULT_TTL_S", defaults.suppression_default_ttl_s),
+        auto_snooze_ttl_s=_env_int("NOC_CASE_AUTO_SNOOZE_TTL_S", defaults.auto_snooze_ttl_s),
+    )
