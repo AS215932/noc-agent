@@ -59,8 +59,8 @@ HandoffTransport = Literal["github_issue", "http", "queue"]
 DeliveryStatus = Literal["pending", "in_progress", "succeeded", "failed", "abandoned"]
 CallbackStatus = Literal["accepted", "duplicate", "rejected"]
 
-_TERMINAL_HANDOFF_STATUSES = frozenset({"resolved", "cancelled", "expired"})
-_VERIFIER_ONLY_STATUSES = frozenset({"verified", "resolved"})
+TERMINAL_HANDOFF_STATUSES = frozenset({"resolved", "cancelled", "expired"})
+VERIFIER_ONLY_HANDOFF_STATUSES = frozenset({"verified", "resolved"})
 _ALLOWED_HANDOFF_TRANSITIONS: dict[str, frozenset[str]] = {
     "requested": frozenset({"accepted", "blocked", "failed", "needs_human", "cancelled", "expired"}),
     "accepted": frozenset({"in_progress", "blocked", "failed", "needs_human", "cancelled", "expired"}),
@@ -208,7 +208,7 @@ def verify_loop_signature(
 
 
 def allowed_handoff_transition(current: HandoffStatus, target: HandoffStatus, *, actor_loop: LoopName = "noc") -> bool:
-    if target in _VERIFIER_ONLY_STATUSES and actor_loop != "noc":
+    if target in VERIFIER_ONLY_HANDOFF_STATUSES and actor_loop != "noc":
         return False
     if current == target:
         return True
@@ -371,7 +371,7 @@ class HandoffUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _fill_hash_and_validate_status(self) -> "HandoffUpdate":
-        if self.source_loop != "noc" and self.status in _VERIFIER_ONLY_STATUSES:
+        if self.source_loop != "noc" and self.status in VERIFIER_ONLY_HANDOFF_STATUSES:
             raise ValueError("non-NOC loops cannot set verified/resolved handoff status")
         if not self.payload_hash:
             self.payload_hash = lhp_payload_hash(

@@ -48,10 +48,11 @@ from app.cases.proactive import observation_from_hotspot
 from app.cases.replay import ReplayResult, load_observation_fixture, replay_observations
 from app.cases.runtime import CaseServiceRuntime, build_case_service_runtime_from_env, process_case_outbox_once
 from app.cases.service import CaseService, ObserveResult, observation_identity_fingerprint
-from app.cases.store import CaseStore, InMemoryCaseStore
+from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult, InMemoryCaseStore
 
 __all__ = [
     "AtomicCaseProjection",
+    "CallbackClaimResult",
     "CallbackInboxRecord",
     "CaseEvent",
     "CaseHandoff",
@@ -64,8 +65,10 @@ __all__ = [
     "CaseStore",
     "CorrelationService",
     "EvidenceRef",
+    "HandoffCreateResult",
     "HandoffTransportDelivery",
     "HandoffUpdate",
+    "HandoffUpdateResult",
     "InMemoryCaseStore",
     "KnowledgeArtifact",
     "MetaCaseProjection",

@@ -13,11 +13,22 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, cast
 
+from app.cases.lhp import (
+    CallbackInboxRecord,
+    CaseHandoff,
+    HandoffStatus,
+    HandoffTransportDelivery,
+    HandoffUpdate,
+    KnowledgeArtifact,
+    OutcomeRecord,
+    VerificationObjective,
+)
 from app.cases.models import (
     AliasType,
     AtomicCaseProjection,
     CaseEvent,
     CaseIdentityAlias,
+    CaseStatus,
     ObservationRecord,
     OperatorFeedback,
     OutboxIntent,
@@ -26,7 +37,7 @@ from app.cases.models import (
     utc_now,
 )
 from app.cases.policy import CasePolicy
-from app.cases.store import CaseStore
+from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult
 
 ObserveAction = Literal[
     "created",
@@ -361,6 +372,179 @@ class CaseService:
             )
         )
 
+    async def request_lhp_handoff(
+        self,
+        handoff: CaseHandoff,
+        *,
+        objectives: list[VerificationObjective] | None = None,
+        enqueue_delivery: bool = False,
+    ) -> HandoffCreateResult:
+        """Create one authoritative LHP handoff and optional delivery intent.
+
+        This is dormant until LHP feature flags call it. The store owns the
+        idempotency/active-handoff checks and writes case, handoff, objectives,
+        event, and outbox intent atomically.
+        """
+
+        case = await self._require_atomic_case(handoff.case_id)
+        event = CaseEvent(
+            case_id=case.case_id,
+            event_type="lhp_handoff_requested",
+            actor_type="system",
+            correlation_id=handoff.correlation_id,
+            policy_version=self.policy.policy_version,
+            payload={
+                "handoff_id": handoff.handoff_id,
+                "target_loop": handoff.target_loop,
+                "objective_key": handoff.objective_key,
+                "idempotency_key": handoff.idempotency_key,
+            },
+        )
+        outbox_intent = None
+        if enqueue_delivery:
+            outbox_intent = OutboxIntent(
+                case_id=case.case_id,
+                intent_type="engineering_handoff_requested",
+                idempotency_key=f"engineering_handoff_requested:{handoff.handoff_id}",
+                state_signature=case.signal_signature,
+                payload={"handoff_id": handoff.handoff_id, "schema_version": handoff.schema_version},
+            )
+        return await self.store.create_handoff_with_objectives(
+            handoff,
+            objectives=objectives or [],
+            case_status="handoff_requested",
+            event=event,
+            outbox_intent=outbox_intent,
+        )
+
+    async def get_lhp_handoff(self, handoff_id: str) -> CaseHandoff | None:
+        return await self.store.get_handoff(handoff_id)
+
+    async def list_lhp_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> list[CaseHandoff]:
+        return await self.store.list_handoffs(case_id=case_id, status=status)
+
+    async def record_lhp_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
+        return await self.store.record_handoff_delivery(delivery)
+
+    async def update_lhp_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
+        return await self.store.update_handoff_delivery(delivery)
+
+    async def claim_lhp_callback(self, callback: CallbackInboxRecord) -> CallbackClaimResult:
+        return await self.store.claim_callback_event(callback)
+
+    async def record_lhp_handoff_update(self, update: HandoffUpdate) -> HandoffUpdateResult:
+        event = CaseEvent(
+            case_id=update.case_id,
+            event_type="lhp_handoff_update_recorded",
+            actor_type="system" if update.source_loop == "noc" else "monitor",
+            source=update.source_loop,
+            correlation_id=update.correlation_id,
+            policy_version=self.policy.policy_version,
+            payload={
+                "handoff_id": update.handoff_id,
+                "update_id": update.update_id,
+                "update_type": update.update_type,
+                "status": update.status,
+                "external_event_id": update.external_event_id,
+            },
+        )
+        return await self.store.append_handoff_update(
+            update,
+            case_status=_case_status_for_handoff(update.status),
+            event=event,
+        )
+
+    async def upsert_lhp_verification_objective(self, objective: VerificationObjective) -> VerificationObjective:
+        event = CaseEvent(
+            case_id=objective.case_id,
+            event_type="lhp_verification_objective_upserted",
+            actor_type="system",
+            policy_version=self.policy.policy_version,
+            payload={"objective_id": objective.objective_id, "objective_key": objective.objective_key},
+        )
+        return await self.store.upsert_verification_objective(objective, event=event)
+
+    async def record_lhp_verification_result(self, objective: VerificationObjective) -> VerificationObjective:
+        event = CaseEvent(
+            case_id=objective.case_id,
+            event_type="lhp_verification_objective_updated",
+            actor_type="system",
+            policy_version=self.policy.policy_version,
+            payload={
+                "objective_id": objective.objective_id,
+                "objective_key": objective.objective_key,
+                "status": objective.status,
+                "consecutive_pass_count": objective.consecutive_pass_count,
+            },
+        )
+        return await self.store.update_verification_objective_result(objective, event=event)
+
+    async def list_due_lhp_verification_objectives(
+        self, *, now: str | None = None, limit: int = 100
+    ) -> list[VerificationObjective]:
+        return await self.store.list_due_verification_objectives(now=now or utc_now(), limit=limit)
+
+    async def list_lhp_verification_objectives(self, *, case_id: str | None = None) -> list[VerificationObjective]:
+        return await self.store.list_verification_objectives(case_id=case_id)
+
+    async def mark_lhp_handoff_verified(self, handoff_id: str) -> CaseHandoff:
+        handoff = await self.store.get_handoff(handoff_id)
+        if handoff is None:
+            raise KeyError(f"handoff not found: {handoff_id}")
+        now = utc_now()
+        event = CaseEvent(
+            case_id=handoff.case_id,
+            event_type="lhp_handoff_verified",
+            actor_type="system",
+            occurred_at=now,
+            policy_version=self.policy.policy_version,
+            payload={"handoff_id": handoff_id},
+        )
+        return await self.store.mark_handoff_verified(handoff_id, now=now, event=event)
+
+    async def record_lhp_knowledge_artifact(self, artifact: KnowledgeArtifact) -> KnowledgeArtifact:
+        event = CaseEvent(
+            case_id=artifact.case_id,
+            event_type="lhp_knowledge_artifact_recorded",
+            actor_type="system",
+            source="knowledge",
+            policy_version=self.policy.policy_version,
+            payload={
+                "artifact_id": artifact.artifact_id,
+                "artifact_type": artifact.artifact_type,
+                "review_status": artifact.review_status,
+            },
+        )
+        return await self.store.record_knowledge_artifact(artifact, event=event)
+
+    async def list_lhp_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]:
+        return await self.store.list_knowledge_artifacts(case_id=case_id)
+
+    async def record_lhp_outcome(self, outcome: OutcomeRecord) -> OutcomeRecord:
+        event = CaseEvent(
+            case_id=outcome.work_item_id,
+            event_type="lhp_outcome_recorded",
+            actor_type="system",
+            policy_version=self.policy.policy_version,
+            payload={"outcome_id": outcome.outcome_id, "case_type": outcome.case_type},
+        )
+        return await self.store.record_outcome(outcome, event=event)
+
+    async def resolve_lhp_case_with_outcome(self, case_id: str, *, outcome: OutcomeRecord, handoff_id: str = "") -> AtomicCaseProjection:
+        now = utc_now()
+        event = CaseEvent(
+            case_id=case_id,
+            event_type="lhp_case_resolved_with_outcome",
+            actor_type="system",
+            occurred_at=now,
+            policy_version=self.policy.policy_version,
+            payload={"outcome_id": outcome.outcome_id, "handoff_id": handoff_id},
+        )
+        return await self.store.resolve_case_with_outcome(case_id, handoff_id=handoff_id, outcome=outcome, now=now, event=event)
+
+    async def list_lhp_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]:
+        return await self.store.list_outcomes(case_id=case_id)
+
     async def record_trace(self, trace: TraceRecord) -> TraceRecord:
         stored = await self.store.record_trace(trace)
         if stored.case_id:
@@ -600,6 +784,22 @@ def _investigation_signature(case: AtomicCaseProjection) -> str:
 
 def _investigation_blocked_status(status: str) -> bool:
     return str(status or "") in {"resolved", "closed", "expired", "linked"}
+
+
+def _case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
+    if status in {"accepted", "in_progress", "change_planned"}:
+        return "handoff_in_progress"
+    if status == "implemented":
+        return "verification_pending"
+    if status == "blocked":
+        return "blocked"
+    if status == "failed":
+        return "failed"
+    if status == "needs_human":
+        return "needs_human"
+    if status in {"verified", "resolved"}:
+        return "verification_pending"
+    return "handoff_requested"
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:

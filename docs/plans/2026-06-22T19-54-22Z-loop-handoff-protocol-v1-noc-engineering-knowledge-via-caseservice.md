@@ -776,13 +776,14 @@ Complete when:
 - Existing health endpoints remain healthy.
 
 
+
 <!-- pi-plan-progress:start -->
 ## Progress
 
 Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` pending.
 
 - [x] 1. Add LHP-v1 feature flags, config, safety helpers, schemas... _(done)_
-- [ ] 2. Add CaseService handoff, callback, verification, knowledg... _(pending)_
+- [x] 2. Add CaseService handoff, callback, verification, knowledg... _(done)_
 - [ ] 3. Modify NOC proactive disk handling to create/update cases... _(pending)_
 - [ ] 4. Add GitHub Engineering handoff delivery and Engineering L... _(pending)_
 - [ ] 5. Add the dedicated NOC verification scheduler. _(pending)_
