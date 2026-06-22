@@ -259,6 +259,33 @@ async def test_verification_objectives_and_knowledge_artifacts_are_case_scoped()
 
 
 @pytest.mark.asyncio
+async def test_knowledge_context_request_is_idempotent_outbox_intent():
+    service, case = await _service_with_case()
+
+    first = await service.request_lhp_knowledge_context(
+        case.case_id,
+        handoff_id="handoff_disk_1",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        payload={"case_type": "proactive_disk_condition"},
+    )
+    second = await service.request_lhp_knowledge_context(
+        case.case_id,
+        handoff_id="handoff_disk_1",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        payload={"case_type": "proactive_disk_condition"},
+    )
+
+    assert first.outbox_id == second.outbox_id
+    assert first.intent_type == "knowledge_context_requested"
+    assert first.payload["case_type"] == "proactive_disk_condition"
+    events = await service.store.case_events(case.case_id)
+    assert [event.event_type for event in events] == [
+        "lhp_knowledge_context_requested",
+        "lhp_knowledge_context_requested",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_due_verification_objective_list_is_bounded():
     service, case = await _service_with_case()
     for index in range(505):
