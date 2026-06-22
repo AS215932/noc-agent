@@ -49,6 +49,7 @@ from app.cases.replay import ReplayResult, load_observation_fixture, replay_obse
 from app.cases.runtime import CaseServiceRuntime, build_case_service_runtime_from_env, process_case_outbox_once
 from app.cases.service import CaseService, ObserveResult, observation_identity_fingerprint
 from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult, InMemoryCaseStore
+from app.cases.verifier import CaseVerifier, VerificationCheckResult, VerificationRunReport
 
 __all__ = [
     "AtomicCaseProjection",
@@ -63,6 +64,7 @@ __all__ = [
     "CaseServiceRuntime",
     "CaseStatus",
     "CaseStore",
+    "CaseVerifier",
     "CorrelationService",
     "EvidenceRef",
     "HandoffCreateResult",
@@ -87,7 +89,9 @@ __all__ = [
     "Severity",
     "SourceHealth",
     "TraceRecord",
+    "VerificationCheckResult",
     "VerificationObjective",
+    "VerificationRunReport",
     "allowed_handoff_transition",
     "assert_lhp_payload_size",
     "build_case_service_runtime_from_env",

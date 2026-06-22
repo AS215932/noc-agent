@@ -51,6 +51,7 @@ proactive_loop = None
 proactive_lock_fd = None
 case_service_runtime = None
 case_outbox_task = None
+case_verifier_task = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 PROACTIVE_LOCK_PATH = os.getenv("PROACTIVE_LOCK_PATH", "/var/lib/noc-agent/proactive-instance.lock")
 
@@ -189,6 +190,7 @@ async def lifespan(app: FastAPI):
     global proactive_lock_fd
     global case_service_runtime
     global case_outbox_task
+    global case_verifier_task
     log.info("startup_begin")
 
     mcp_runtime = MCPRuntime(owner="api")
@@ -237,6 +239,21 @@ async def lifespan(app: FastAPI):
         if os.getenv("NOC_REQUIRE_POSTGRES", "").strip().lower() in {"1", "true", "yes", "on"}:
             raise
 
+    lhp_settings = load_loop_handoff_settings()
+    if case_service_runtime is not None and lhp_settings.enabled and lhp_settings.case_verification_enabled:
+        try:
+            from app.cases.verifier import CaseVerifier, verifier_loop
+
+            verifier = CaseVerifier(case_service_runtime.service, settings=lhp_settings)
+            case_verifier_task = asyncio.create_task(
+                verifier_loop(verifier, interval_s=lhp_settings.case_verification_interval_s)
+            )
+        except Exception as e:
+            safe = classify_exception(e)
+            log_exception("lhp_verifier_start_failed", e, category=safe.category)
+            case_verifier_task = None
+            raise
+
     proactive_settings = load_proactive_settings()
     if proactive_settings.enabled and case_service_runtime is None:
         log.info("proactive_loop_disabled", reason="case-service-runtime-required")
@@ -281,6 +298,11 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await case_outbox_task
         case_outbox_task = None
+    if case_verifier_task:
+        case_verifier_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await case_verifier_task
+        case_verifier_task = None
     if case_service_runtime is not None:
         backend = type(case_service_runtime.store).__name__
         await case_service_runtime.close()
@@ -2182,6 +2204,7 @@ async def health_cases(response: Response):
             "backend": type(store).__name__,
             "error": safe_health_error(e),
         }
+    lhp_settings = load_loop_handoff_settings()
     return {
         "status": "ok",
         "enabled": True,
@@ -2192,6 +2215,10 @@ async def health_cases(response: Response):
             "running": case_outbox_task is not None and not case_outbox_task.done(),
         },
         "outbox": {"pending": len(pending), "failed": len(failed)},
+        "verifier": {
+            "enabled": lhp_settings.enabled and lhp_settings.case_verification_enabled,
+            "running": case_verifier_task is not None and not case_verifier_task.done(),
+        },
     }
 
 
