@@ -19,7 +19,7 @@ class CasePolicy(BaseModel):
     policy_version: str = "case_policy_v1"
     report_reassert_s: int = Field(default=3600, ge=1)
     investigation_cooldown_s: int = Field(default=21600, ge=0)
-    investigation_failure_retry_s: int = Field(default=300, ge=0)
+    investigation_failure_retry_s: int = Field(default=21600, ge=0)
     reinvestigate_stale_s: int = Field(default=21600, ge=0)
     recovery_cooldown_s: int = Field(default=600, ge=0)
     suppression_default_ttl_s: int = Field(default=86400, ge=0)
@@ -47,6 +47,13 @@ class CasePolicy(BaseModel):
             report_reassert_s=int(getattr(settings, "report_reassert_s", cls.model_fields["report_reassert_s"].default)),
             investigation_cooldown_s=int(
                 getattr(settings, "investigation_cooldown_s", cls.model_fields["investigation_cooldown_s"].default)
+            ),
+            investigation_failure_retry_s=int(
+                getattr(
+                    settings,
+                    "investigation_failure_retry_s",
+                    getattr(settings, "investigation_cooldown_s", cls.model_fields["investigation_failure_retry_s"].default),
+                )
             ),
             reinvestigate_stale_s=int(
                 getattr(settings, "investigation_cooldown_s", cls.model_fields["reinvestigate_stale_s"].default)

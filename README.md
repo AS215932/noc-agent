@@ -171,6 +171,8 @@ Proactive config (in-code defaults are conservative; the deployment env enables 
 - `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_DAY` (default `12`)
 - `NOC_PROACTIVE_MAX_COST_USD_PER_DAY` (default `10`)
 - `NOC_PROACTIVE_COST_USD_PER_INVESTIGATION` (default `0.05`; flat estimate charged to the daily $ cap until per-run token→USD metering lands — the count cap is the primary budget)
+- `NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S` (default `21600`, six hours): minimum interval before the same successfully investigated hotspot fingerprint is re-investigated
+- `NOC_PROACTIVE_INVESTIGATION_FAILURE_RETRY_S` / `NOC_CASE_INVESTIGATION_FAILURE_RETRY_S` (default `21600`, six hours): minimum interval before retrying a failed CaseService-grounded investigation; dependency failures must not re-page every scan cycle
 - `NOC_PROACTIVE_AUTO_HEAVY_PROBES` (default `0`; propose heavy probes instead of auto-running)
 - `NOC_PROACTIVE_HANDOFF_ENABLED` (default `0`) + `NOC_PROACTIVE_HANDOFF_REPO` (default `AS215932/network-operations`)
 - `NOC_PROACTIVE_SEVERITY_FLOOR` (default `MEDIUM`)
