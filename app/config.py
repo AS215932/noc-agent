@@ -15,6 +15,7 @@ DEFAULT_CONFIG_PATHS = (
     Path("/etc/noc-agent/config.toml"),
     Path(__file__).resolve().parent.parent / "config" / "noc-agent.toml",
 )
+LHP_ENGINEERING_SECRET_ENV = "NOC_LHP_ENGINEERING_SECRET"
 
 load_dotenv()
 
@@ -99,10 +100,40 @@ class ProactiveLoopSettings:
 
 
 @dataclass(frozen=True)
+class LoopHandoffSettings:
+    """Dormant LHP-v1 cross-loop coordination settings.
+
+    All behavior-changing switches default off. The shared secret value is not
+    stored here; only whether its env var is configured is surfaced.
+    """
+
+    enabled: bool = False
+    engineering_handoff_delivery_enabled: bool = False
+    engineering_handoff_transport: str = "github_issue"
+    engineering_handoff_repo: str = "AS215932/network-operations"
+    knowledge_context_enabled: bool = False
+    knowledge_export_sqlite: str = "/opt/noc-knowledge/exports/knowledge.sqlite"
+    knowledge_export_manifest: str = "/opt/noc-knowledge/exports/manifest.json"
+    knowledge_context_max_artifacts: int = 10
+    knowledge_context_max_tokens_equivalent: int = 3000
+    knowledge_context_timeout_s: int = 20
+    knowledge_candidate_dir: str = "/var/lib/noc-agent/knowledge-candidates"
+    case_verification_enabled: bool = False
+    case_verification_dry_run: bool = True
+    case_auto_resolve_enabled: bool = False
+    case_verification_interval_s: int = 120
+    case_verification_required_consecutive_passes: int = 3
+    disk_alert_handoff_enabled: bool = False
+    callback_max_bytes: int = 65536
+    engineering_secret_configured: bool = False
+
+
+@dataclass(frozen=True)
 class NocAgentSettings:
     model: ModelSettings = field(default_factory=ModelSettings)
     providers: ProviderSettings = field(default_factory=ProviderSettings)
     proactive: ProactiveLoopSettings = field(default_factory=ProactiveLoopSettings)
+    loop_handoff: LoopHandoffSettings = field(default_factory=LoopHandoffSettings)
     source_path: str | None = None
     load_errors: list[str] = field(default_factory=list)
 
@@ -145,8 +176,51 @@ def load_settings() -> NocAgentSettings:
             google=_google_settings(_provider_table(data, "google"), errors),
         ),
         proactive=_proactive_settings(data.get("proactive", {}), errors),
+        loop_handoff=_loop_handoff_settings(data.get("loop_handoff", {}), errors),
         source_path=str(source) if source else None,
         load_errors=errors,
+    )
+
+
+def load_loop_handoff_settings() -> LoopHandoffSettings:
+    """LHP-v1 settings with ``NOC_*`` environment overrides applied.
+
+    The returned object deliberately exposes only whether the Engineering Loop
+    shared secret is configured, not the secret value itself.
+    """
+
+    base = load_settings().loop_handoff
+    transport = _env_str("NOC_ENGINEERING_HANDOFF_TRANSPORT", base.engineering_handoff_transport)
+    if transport not in {"github_issue", "http", "queue"}:
+        transport = base.engineering_handoff_transport
+    return LoopHandoffSettings(
+        enabled=_env_bool("NOC_LHP_ENABLED", base.enabled),
+        engineering_handoff_delivery_enabled=_env_bool(
+            "NOC_ENGINEERING_HANDOFF_DELIVERY_ENABLED", base.engineering_handoff_delivery_enabled
+        ),
+        engineering_handoff_transport=transport,
+        engineering_handoff_repo=_env_str("NOC_ENGINEERING_HANDOFF_REPO", base.engineering_handoff_repo),
+        knowledge_context_enabled=_env_bool("NOC_KNOWLEDGE_CONTEXT_ENABLED", base.knowledge_context_enabled),
+        knowledge_export_sqlite=_env_str("NOC_KNOWLEDGE_EXPORT_SQLITE", base.knowledge_export_sqlite),
+        knowledge_export_manifest=_env_str("NOC_KNOWLEDGE_EXPORT_MANIFEST", base.knowledge_export_manifest),
+        knowledge_context_max_artifacts=_env_int(
+            "NOC_KNOWLEDGE_CONTEXT_MAX_ARTIFACTS", base.knowledge_context_max_artifacts
+        ),
+        knowledge_context_max_tokens_equivalent=_env_int(
+            "NOC_KNOWLEDGE_CONTEXT_MAX_TOKENS_EQUIVALENT", base.knowledge_context_max_tokens_equivalent
+        ),
+        knowledge_context_timeout_s=_env_int("NOC_KNOWLEDGE_CONTEXT_TIMEOUT_S", base.knowledge_context_timeout_s),
+        knowledge_candidate_dir=_env_str("NOC_KNOWLEDGE_CANDIDATE_DIR", base.knowledge_candidate_dir),
+        case_verification_enabled=_env_bool("NOC_CASE_VERIFICATION_ENABLED", base.case_verification_enabled),
+        case_verification_dry_run=_env_bool("NOC_CASE_VERIFICATION_DRY_RUN", base.case_verification_dry_run),
+        case_auto_resolve_enabled=_env_bool("NOC_CASE_AUTO_RESOLVE_ENABLED", base.case_auto_resolve_enabled),
+        case_verification_interval_s=_env_int("NOC_CASE_VERIFICATION_INTERVAL_S", base.case_verification_interval_s),
+        case_verification_required_consecutive_passes=_env_int(
+            "NOC_CASE_VERIFICATION_REQUIRED_CONSECUTIVE_PASSES", base.case_verification_required_consecutive_passes
+        ),
+        disk_alert_handoff_enabled=_env_bool("NOC_DISK_ALERT_HANDOFF_ENABLED", base.disk_alert_handoff_enabled),
+        callback_max_bytes=_env_int("NOC_LHP_CALLBACK_MAX_BYTES", base.callback_max_bytes),
+        engineering_secret_configured=bool(os.getenv(LHP_ENGINEERING_SECRET_ENV, "").strip()),
     )
 
 
@@ -175,17 +249,13 @@ def load_proactive_settings() -> ProactiveLoopSettings:
             "NOC_PROACTIVE_COST_USD_PER_INVESTIGATION", base.cost_usd_per_investigation
         ),
         report_reassert_s=_env_int("NOC_PROACTIVE_REPORT_REASSERT_S", base.report_reassert_s),
-        investigation_cooldown_s=_env_int(
-            "NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S", base.investigation_cooldown_s
-        ),
+        investigation_cooldown_s=_env_int("NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S", base.investigation_cooldown_s),
         investigation_failure_retry_s=_env_int(
             "NOC_PROACTIVE_INVESTIGATION_FAILURE_RETRY_S", base.investigation_failure_retry_s
         ),
         auto_snooze_enabled=_env_bool("NOC_PROACTIVE_AUTO_SNOOZE_ENABLED", base.auto_snooze_enabled),
         auto_snooze_ttl_s=_env_int("NOC_PROACTIVE_AUTO_SNOOZE_TTL_S", base.auto_snooze_ttl_s),
-        auto_snooze_max_per_cycle=_env_int(
-            "NOC_PROACTIVE_AUTO_SNOOZE_MAX_PER_CYCLE", base.auto_snooze_max_per_cycle
-        ),
+        auto_snooze_max_per_cycle=_env_int("NOC_PROACTIVE_AUTO_SNOOZE_MAX_PER_CYCLE", base.auto_snooze_max_per_cycle),
         auto_snooze_icinga_ack=_env_bool("NOC_PROACTIVE_AUTO_SNOOZE_ICINGA_ACK", base.auto_snooze_icinga_ack),
         auto_heavy_probes=_env_bool("NOC_PROACTIVE_AUTO_HEAVY_PROBES", base.auto_heavy_probes),
         handoff_enabled=_env_bool("NOC_PROACTIVE_HANDOFF_ENABLED", base.handoff_enabled),
@@ -195,6 +265,71 @@ def load_proactive_settings() -> ProactiveLoopSettings:
         memory_dir=_env_str("NOC_PROACTIVE_MEMORY_DIR", base.memory_dir),
         state_dir=_env_str("NOC_PROACTIVE_STATE_DIR", base.state_dir),
         ruleset_version=_env_str("NOC_PROACTIVE_RULESET_VERSION", base.ruleset_version),
+    )
+
+
+def _loop_handoff_settings(table: Any, errors: list[str]) -> LoopHandoffSettings:
+    if not isinstance(table, dict):
+        if table not in ({}, None):
+            errors.append("[loop_handoff] must be a TOML table")
+        return LoopHandoffSettings()
+    defaults = LoopHandoffSettings()
+    transport = _str_value(table, "engineering_handoff_transport", defaults.engineering_handoff_transport, errors)
+    if transport not in {"github_issue", "http", "queue"}:
+        errors.append("[loop_handoff].engineering_handoff_transport must be one of: github_issue, http, queue")
+        transport = defaults.engineering_handoff_transport
+    return LoopHandoffSettings(
+        enabled=_bool_value(table, "enabled", defaults.enabled, errors),
+        engineering_handoff_delivery_enabled=_bool_value(
+            table, "engineering_handoff_delivery_enabled", defaults.engineering_handoff_delivery_enabled, errors
+        ),
+        engineering_handoff_transport=transport,
+        engineering_handoff_repo=_str_value(
+            table, "engineering_handoff_repo", defaults.engineering_handoff_repo, errors
+        ),
+        knowledge_context_enabled=_bool_value(
+            table, "knowledge_context_enabled", defaults.knowledge_context_enabled, errors
+        ),
+        knowledge_export_sqlite=_str_value(table, "knowledge_export_sqlite", defaults.knowledge_export_sqlite, errors),
+        knowledge_export_manifest=_str_value(
+            table, "knowledge_export_manifest", defaults.knowledge_export_manifest, errors
+        ),
+        knowledge_context_max_artifacts=_int_value(
+            table, "knowledge_context_max_artifacts", defaults.knowledge_context_max_artifacts, errors
+        ),
+        knowledge_context_max_tokens_equivalent=_int_value(
+            table,
+            "knowledge_context_max_tokens_equivalent",
+            defaults.knowledge_context_max_tokens_equivalent,
+            errors,
+        ),
+        knowledge_context_timeout_s=_int_value(
+            table, "knowledge_context_timeout_s", defaults.knowledge_context_timeout_s, errors
+        ),
+        knowledge_candidate_dir=_str_value(table, "knowledge_candidate_dir", defaults.knowledge_candidate_dir, errors),
+        case_verification_enabled=_bool_value(
+            table, "case_verification_enabled", defaults.case_verification_enabled, errors
+        ),
+        case_verification_dry_run=_bool_value(
+            table, "case_verification_dry_run", defaults.case_verification_dry_run, errors
+        ),
+        case_auto_resolve_enabled=_bool_value(
+            table, "case_auto_resolve_enabled", defaults.case_auto_resolve_enabled, errors
+        ),
+        case_verification_interval_s=_int_value(
+            table, "case_verification_interval_s", defaults.case_verification_interval_s, errors
+        ),
+        case_verification_required_consecutive_passes=_int_value(
+            table,
+            "case_verification_required_consecutive_passes",
+            defaults.case_verification_required_consecutive_passes,
+            errors,
+        ),
+        disk_alert_handoff_enabled=_bool_value(
+            table, "disk_alert_handoff_enabled", defaults.disk_alert_handoff_enabled, errors
+        ),
+        callback_max_bytes=_int_value(table, "callback_max_bytes", defaults.callback_max_bytes, errors),
+        engineering_secret_configured=False,
     )
 
 
@@ -231,9 +366,7 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
         auto_snooze_max_per_cycle=_int_value(
             table, "auto_snooze_max_per_cycle", defaults.auto_snooze_max_per_cycle, errors
         ),
-        auto_snooze_icinga_ack=_bool_value(
-            table, "auto_snooze_icinga_ack", defaults.auto_snooze_icinga_ack, errors
-        ),
+        auto_snooze_icinga_ack=_bool_value(table, "auto_snooze_icinga_ack", defaults.auto_snooze_icinga_ack, errors),
         auto_heavy_probes=_bool_value(table, "auto_heavy_probes", defaults.auto_heavy_probes, errors),
         handoff_enabled=_bool_value(table, "handoff_enabled", defaults.handoff_enabled, errors),
         handoff_repo=_str_value(table, "handoff_repo", defaults.handoff_repo, errors),
@@ -313,9 +446,7 @@ def _openrouter_settings(table: dict[str, Any], errors: list[str]) -> OpenRouter
             table, "credit_probe_cache_seconds", defaults.credit_probe_cache_seconds, errors
         ),
         warn_remaining_usd=_float_value(table, "warn_remaining_usd", defaults.warn_remaining_usd, errors),
-        critical_remaining_usd=_float_value(
-            table, "critical_remaining_usd", defaults.critical_remaining_usd, errors
-        ),
+        critical_remaining_usd=_float_value(table, "critical_remaining_usd", defaults.critical_remaining_usd, errors),
     )
 
 
