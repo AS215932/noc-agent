@@ -10,17 +10,31 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
+from app.cases.lhp import (
+    CallbackInboxRecord,
+    CaseHandoff,
+    HandoffStatus,
+    HandoffTransportDelivery,
+    HandoffUpdate,
+    KnowledgeArtifact,
+    OutcomeRecord,
+    VERIFIER_ONLY_HANDOFF_STATUSES,
+    VerificationObjective,
+    lhp_payload_hash,
+    require_handoff_transition,
+)
 from app.cases.models import (
     AtomicCaseProjection,
     CaseEvent,
     CaseIdentityAlias,
+    CaseStatus,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
     OutboxIntent,
     TraceRecord,
 )
-from app.cases.store import CaseLinkResult, CaseProjection
+from app.cases.store import CallbackClaimResult, CaseLinkResult, CaseProjection, HandoffCreateResult, HandoffUpdateResult
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
 
@@ -582,6 +596,410 @@ class PostgresCaseStore:
                 rows = await conn.fetch("SELECT payload FROM side_effect_outbox ORDER BY created_at ASC")
         return [OutboxIntent.model_validate(_row_payload(row)) for row in rows]
 
+    async def create_handoff_with_objectives(
+        self,
+        handoff: CaseHandoff,
+        *,
+        objectives: list[VerificationObjective],
+        case_status: CaseStatus | None = None,
+        event: CaseEvent | None = None,
+        outbox_intent: OutboxIntent | None = None,
+    ) -> HandoffCreateResult:
+        lock_key = _advisory_lock_key(
+            "handoff",
+            {
+                "case_id": handoff.case_id,
+                "target_loop": handoff.target_loop,
+                "objective_key": handoff.objective_key,
+            },
+        )
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
+            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", handoff.case_id)
+            if not case_row:
+                raise KeyError(f"atomic case not found: {handoff.case_id}")
+            case = _case_from_payload(_row_payload(case_row))
+            if not isinstance(case, AtomicCaseProjection):
+                raise KeyError(f"atomic case not found: {handoff.case_id}")
+            existing_row = await conn.fetchrow(
+                """
+                SELECT payload FROM case_handoffs
+                WHERE idempotency_key = $1
+                   OR (case_id = $2 AND target_loop = $3 AND objective_key = $4
+                       AND status NOT IN ('resolved', 'cancelled', 'expired'))
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                handoff.idempotency_key,
+                handoff.case_id,
+                handoff.target_loop,
+                handoff.objective_key,
+            )
+            if existing_row:
+                existing = CaseHandoff.model_validate(_row_payload(existing_row))
+                objective_rows = await conn.fetch(
+                    "SELECT payload FROM verification_objectives WHERE handoff_id = $1 ORDER BY created_at, objective_id",
+                    existing.handoff_id,
+                )
+                return HandoffCreateResult(
+                    handoff=existing,
+                    objectives=[VerificationObjective.model_validate(_row_payload(row)) for row in objective_rows],
+                    case=case,
+                    event=None,
+                    outbox_intent=None,
+                    created=False,
+                )
+            stored_handoff = await _insert_case_handoff(conn, handoff)
+            stored_objectives = []
+            for objective in objectives:
+                if objective.case_id != stored_handoff.case_id:
+                    raise ValueError("verification objective case_id must match handoff case_id")
+                if objective.handoff_id and objective.handoff_id != stored_handoff.handoff_id:
+                    raise ValueError("verification objective handoff_id must match handoff_id")
+                if not objective.handoff_id:
+                    objective = objective.model_copy(update={"handoff_id": stored_handoff.handoff_id})
+                stored_objectives.append(await _upsert_verification_objective(conn, objective))
+            updated_case = case.model_copy(deep=True)
+            if case_status is not None:
+                updated_case.status = case_status
+            updated_case.handoff_status = stored_handoff.status
+            updated_case.last_handoff_at = stored_handoff.updated_at or stored_handoff.created_at
+            updated_case.updated_at = stored_handoff.updated_at or stored_handoff.created_at
+            await _update_case_projection(conn, updated_case)
+            stored_event = await _insert_case_event(conn, event) if event is not None else None
+            stored_outbox = await _insert_outbox_intent(conn, outbox_intent) if outbox_intent is not None else None
+            return HandoffCreateResult(
+                handoff=stored_handoff,
+                objectives=stored_objectives,
+                case=updated_case,
+                event=stored_event,
+                outbox_intent=stored_outbox,
+                created=True,
+            )
+
+    async def get_handoff(self, handoff_id: str) -> CaseHandoff | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1", handoff_id)
+        return CaseHandoff.model_validate(_row_payload(row)) if row else None
+
+    async def list_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> list[CaseHandoff]:
+        async with self.pool.acquire() as conn:
+            if case_id is not None and status is not None:
+                rows = await conn.fetch(
+                    "SELECT payload FROM case_handoffs WHERE case_id = $1 AND status = $2 ORDER BY updated_at DESC",
+                    case_id,
+                    status,
+                )
+            elif case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM case_handoffs WHERE case_id = $1 ORDER BY updated_at DESC", case_id)
+            elif status is not None:
+                rows = await conn.fetch("SELECT payload FROM case_handoffs WHERE status = $1 ORDER BY updated_at DESC", status)
+            else:
+                rows = await conn.fetch("SELECT payload FROM case_handoffs ORDER BY updated_at DESC")
+        return [CaseHandoff.model_validate(_row_payload(row)) for row in rows]
+
+    async def record_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
+        return await _record_handoff_delivery(self.pool, delivery, upsert=True)
+
+    async def update_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
+        return await _record_handoff_delivery(self.pool, delivery, upsert=False)
+
+    async def append_handoff_update(
+        self,
+        update: HandoffUpdate,
+        *,
+        handoff_status: str | None = None,
+        case_status: CaseStatus | None = None,
+        event: CaseEvent | None = None,
+    ) -> HandoffUpdateResult:
+        lock_key = _advisory_lock_key(
+            "handoff-update", {"source_loop": update.source_loop, "external_event_id": update.external_event_id}
+        )
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
+            existing_row = await conn.fetchrow(
+                """
+                SELECT payload FROM handoff_updates
+                WHERE source_loop = $1 AND external_event_id = $2
+                FOR UPDATE
+                """,
+                update.source_loop,
+                update.external_event_id,
+            )
+            if existing_row:
+                existing_update = HandoffUpdate.model_validate(_row_payload(existing_row))
+                handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1", existing_update.handoff_id)
+                if not handoff_row:
+                    raise KeyError(f"handoff not found: {existing_update.handoff_id}")
+                handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
+                case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1", handoff.case_id)
+                case = _case_from_payload(_row_payload(case_row)) if case_row else None
+                if not isinstance(case, AtomicCaseProjection):
+                    raise KeyError(f"atomic case not found: {handoff.case_id}")
+                return HandoffUpdateResult(existing_update, handoff, case, None, False)
+            handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", update.handoff_id)
+            if not handoff_row:
+                raise KeyError(f"handoff not found: {update.handoff_id}")
+            handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
+            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", handoff.case_id)
+            case = _case_from_payload(_row_payload(case_row)) if case_row else None
+            if not isinstance(case, AtomicCaseProjection):
+                raise KeyError(f"atomic case not found: {handoff.case_id}")
+            target_status = cast(HandoffStatus, handoff_status or update.status)
+            if target_status in VERIFIER_ONLY_HANDOFF_STATUSES:
+                raise ValueError("verified/resolved require the dedicated NOC verifier path")
+            require_handoff_transition(handoff.status, target_status, actor_loop=update.source_loop)
+            stored_update = await _insert_handoff_update(conn, update)
+            updated_handoff = handoff.model_copy(deep=True)
+            updated_handoff.status = target_status
+            updated_handoff.updated_at = stored_update.created_at
+            updated_handoff = await _update_case_handoff(conn, updated_handoff)
+            updated_case = case.model_copy(deep=True)
+            if case_status is not None:
+                updated_case.status = case_status
+            updated_case.handoff_status = updated_handoff.status
+            updated_case.last_handoff_at = stored_update.created_at
+            updated_case.updated_at = stored_update.created_at
+            await _update_case_projection(conn, updated_case)
+            stored_event = await _insert_case_event(conn, event) if event is not None else None
+            return HandoffUpdateResult(stored_update, updated_handoff, updated_case, stored_event, True)
+
+    async def claim_callback_event(self, callback: CallbackInboxRecord) -> CallbackClaimResult:
+        lock_key = _advisory_lock_key(
+            "callback", {"source_loop": callback.source_loop, "external_event_id": callback.external_event_id}
+        )
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
+            row = await conn.fetchrow(
+                """
+                INSERT INTO callback_inbox (
+                    callback_id, source_loop, external_event_id, payload_hash, case_id,
+                    handoff_id, status, received_at, result_payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+                ON CONFLICT (source_loop, external_event_id) DO NOTHING
+                RETURNING result_payload AS payload
+                """,
+                callback.callback_id,
+                callback.source_loop,
+                callback.external_event_id,
+                callback.payload_hash,
+                callback.case_id or None,
+                callback.handoff_id or None,
+                callback.status,
+                callback.received_at,
+                json.dumps(callback.model_dump(mode="json")),
+                callback.schema_version,
+            )
+            if row:
+                return CallbackClaimResult(CallbackInboxRecord.model_validate(_row_payload(row)), True)
+            existing = await conn.fetchrow(
+                "SELECT result_payload AS payload FROM callback_inbox WHERE source_loop = $1 AND external_event_id = $2",
+                callback.source_loop,
+                callback.external_event_id,
+            )
+            if not existing:
+                raise RuntimeError("callback conflict row missing after insert conflict")
+            return CallbackClaimResult(CallbackInboxRecord.model_validate(_row_payload(existing)), False)
+
+    async def upsert_verification_objective(
+        self, objective: VerificationObjective, *, event: CaseEvent | None = None
+    ) -> VerificationObjective:
+        async with self.pool.acquire() as conn, conn.transaction():
+            stored = await _upsert_verification_objective(conn, objective)
+            if event is not None:
+                await _insert_case_event(conn, event)
+            return stored
+
+    async def update_verification_objective_result(
+        self, objective: VerificationObjective, *, event: CaseEvent | None = None
+    ) -> VerificationObjective:
+        payload = objective.model_dump(mode="json")
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE verification_objectives SET
+                    status = $2,
+                    required_status = $3,
+                    required = $4,
+                    required_consecutive_passes = $5,
+                    consecutive_pass_count = $6,
+                    last_checked_at = $7,
+                    next_check_at = $8,
+                    evidence_ref = $9,
+                    failure_reason = $10,
+                    updated_at = $11,
+                    payload = $12::jsonb,
+                    schema_version = $13
+                WHERE objective_id = $1
+                RETURNING payload
+                """,
+                objective.objective_id,
+                objective.status,
+                objective.required_status,
+                objective.required,
+                objective.required_consecutive_passes,
+                objective.consecutive_pass_count,
+                objective.last_checked_at,
+                objective.next_check_at,
+                objective.evidence_ref,
+                objective.failure_reason,
+                objective.updated_at,
+                json.dumps(payload),
+                objective.schema_version,
+            )
+            if not row:
+                raise KeyError(f"verification objective not found: {objective.objective_id}")
+            if event is not None:
+                await _insert_case_event(conn, event)
+        return VerificationObjective.model_validate(_row_payload(row))
+
+    async def list_due_verification_objectives(self, *, now: str, limit: int = 100) -> list[VerificationObjective]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT payload FROM verification_objectives
+                WHERE status NOT IN ('pass', 'skipped')
+                  AND (next_check_at = '' OR next_check_at <= $1)
+                ORDER BY next_check_at ASC, created_at ASC, objective_id ASC
+                LIMIT $2
+                """,
+                now,
+                _bounded_limit(limit),
+            )
+        return [VerificationObjective.model_validate(_row_payload(row)) for row in rows]
+
+    async def list_verification_objectives(self, *, case_id: str | None = None) -> list[VerificationObjective]:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM verification_objectives WHERE case_id = $1 ORDER BY created_at", case_id)
+            else:
+                rows = await conn.fetch("SELECT payload FROM verification_objectives ORDER BY created_at")
+        return [VerificationObjective.model_validate(_row_payload(row)) for row in rows]
+
+    async def mark_handoff_verified(self, handoff_id: str, *, now: str, event: CaseEvent | None = None) -> CaseHandoff:
+        async with self.pool.acquire() as conn, conn.transaction():
+            handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id)
+            if not handoff_row:
+                raise KeyError(f"handoff not found: {handoff_id}")
+            handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
+            require_handoff_transition(handoff.status, "verified", actor_loop="noc")
+            updated_handoff = handoff.model_copy(deep=True)
+            updated_handoff.status = "verified"
+            updated_handoff.updated_at = now
+            updated_handoff = await _update_case_handoff(conn, updated_handoff)
+            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", updated_handoff.case_id)
+            case = _case_from_payload(_row_payload(case_row)) if case_row else None
+            if not isinstance(case, AtomicCaseProjection):
+                raise KeyError(f"atomic case not found: {updated_handoff.case_id}")
+            case.status = "verification_pending"
+            case.handoff_status = updated_handoff.status
+            case.last_handoff_at = now
+            case.updated_at = now
+            await _update_case_projection(conn, case)
+            if event is not None:
+                await _insert_case_event(conn, event)
+            return updated_handoff
+
+    async def resolve_case_with_outcome(
+        self,
+        case_id: str,
+        *,
+        handoff_id: str = "",
+        outcome: OutcomeRecord,
+        now: str,
+        event: CaseEvent | None = None,
+    ) -> AtomicCaseProjection:
+        async with self.pool.acquire() as conn, conn.transaction():
+            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", case_id)
+            case = _case_from_payload(_row_payload(case_row)) if case_row else None
+            if not isinstance(case, AtomicCaseProjection):
+                raise KeyError(f"atomic case not found: {case_id}")
+            if outcome.work_item_id != case.case_id:
+                raise ValueError("outcome work_item_id must match case_id")
+            if handoff_id:
+                handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id)
+                if not handoff_row:
+                    raise KeyError(f"handoff not found: {handoff_id}")
+                handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
+                require_handoff_transition(handoff.status, "resolved", actor_loop="noc")
+                handoff.status = "resolved"
+                handoff.updated_at = now
+                await _update_case_handoff(conn, handoff)
+            await _insert_outcome(conn, outcome)
+            case.status = "resolved"
+            case.resolved_at = now
+            case.resolution_reason = "lhp_outcome_verified"
+            case.updated_at = now
+            await _update_case_projection(conn, case)
+            if event is not None:
+                await _insert_case_event(conn, event)
+            return case
+
+    async def record_knowledge_artifact(
+        self, artifact: KnowledgeArtifact, *, event: CaseEvent | None = None
+    ) -> KnowledgeArtifact:
+        payload = artifact.model_dump(mode="json")
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO knowledge_artifacts (
+                    artifact_id, case_id, handoff_id, artifact_type, scope, status,
+                    review_status, version, content_hash, created_by, created_at,
+                    payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)
+                ON CONFLICT (case_id, artifact_type, version) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    review_status = EXCLUDED.review_status,
+                    content_hash = EXCLUDED.content_hash,
+                    payload = EXCLUDED.payload || jsonb_build_object(
+                        'artifact_id', knowledge_artifacts.artifact_id,
+                        'created_at', knowledge_artifacts.created_at
+                    ),
+                    schema_version = EXCLUDED.schema_version
+                RETURNING payload
+                """,
+                artifact.artifact_id,
+                artifact.case_id,
+                artifact.handoff_id or None,
+                artifact.artifact_type,
+                artifact.scope,
+                artifact.status,
+                artifact.review_status,
+                artifact.version,
+                artifact.content_hash,
+                artifact.created_by,
+                artifact.created_at,
+                json.dumps(payload),
+                artifact.schema_version,
+            )
+            if event is not None:
+                await _insert_case_event(conn, event)
+        return KnowledgeArtifact.model_validate(_row_payload(row))
+
+    async def list_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM knowledge_artifacts WHERE case_id = $1 ORDER BY created_at", case_id)
+            else:
+                rows = await conn.fetch("SELECT payload FROM knowledge_artifacts ORDER BY created_at")
+        return [KnowledgeArtifact.model_validate(_row_payload(row)) for row in rows]
+
+    async def record_outcome(self, outcome: OutcomeRecord, *, event: CaseEvent | None = None) -> OutcomeRecord:
+        async with self.pool.acquire() as conn, conn.transaction():
+            stored = await _insert_outcome(conn, outcome)
+            if event is not None:
+                await _insert_case_event(conn, event)
+            return stored
+
+    async def list_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                rows = await conn.fetch("SELECT payload FROM outcome_records WHERE work_item_id = $1 ORDER BY created_at", case_id)
+            else:
+                rows = await conn.fetch("SELECT payload FROM outcome_records ORDER BY created_at")
+        return [OutcomeRecord.model_validate(_row_payload(row)) for row in rows]
+
     async def record_trace(self, trace: TraceRecord) -> TraceRecord:
         payload = trace.model_dump(mode="json")
         async with self.pool.acquire() as conn:
@@ -686,6 +1104,304 @@ async def _insert_case_event(conn: Any, event: CaseEvent) -> CaseEvent:
 
 
 
+async def _insert_outbox_intent(conn: Any, intent: OutboxIntent) -> OutboxIntent:
+    payload = intent.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO side_effect_outbox (
+            outbox_id, intent_type, case_id, meta_case_id, idempotency_key,
+            state_signature, status, attempts, next_attempt_at, created_at,
+            completed_at, external_id, external_url, error, payload, schema_version
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16)
+        ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = side_effect_outbox.idempotency_key
+        RETURNING payload
+        """,
+        intent.outbox_id,
+        intent.intent_type,
+        intent.case_id,
+        intent.meta_case_id,
+        intent.idempotency_key,
+        intent.state_signature,
+        intent.status,
+        intent.attempts,
+        intent.next_attempt_at,
+        intent.created_at,
+        intent.completed_at,
+        intent.external_id,
+        intent.external_url,
+        intent.error,
+        json.dumps(payload),
+        intent.schema_version,
+    )
+    return OutboxIntent.model_validate(_row_payload(row))
+
+
+async def _update_case_projection(conn: Any, case: AtomicCaseProjection) -> AtomicCaseProjection:
+    payload = case.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        UPDATE cases SET
+            status = $2,
+            fingerprint = $3,
+            updated_at = $4,
+            payload = $5::jsonb,
+            row_version = cases.row_version + 1,
+            schema_version = $6
+        WHERE case_id = $1
+        RETURNING payload
+        """,
+        case.case_id,
+        case.status,
+        case.fingerprint,
+        case.updated_at,
+        json.dumps(payload),
+        case.schema_version,
+    )
+    if not row:
+        raise KeyError(f"case not found: {case.case_id}")
+    return cast(AtomicCaseProjection, _case_from_payload(_row_payload(row)))
+
+
+async def _insert_case_handoff(conn: Any, handoff: CaseHandoff) -> CaseHandoff:
+    payload = handoff.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO case_handoffs (
+            handoff_id, case_id, source_loop, target_loop, objective_key, objective,
+            knowledge_scope, status, owner, verifier, idempotency_key, fingerprint,
+            correlation_id, trace_id, created_at, updated_at, expires_at, payload, schema_version
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19)
+        RETURNING payload
+        """,
+        handoff.handoff_id,
+        handoff.case_id,
+        handoff.source_loop,
+        handoff.target_loop,
+        handoff.objective_key,
+        handoff.objective,
+        handoff.knowledge_scope,
+        handoff.status,
+        handoff.owner,
+        handoff.verifier,
+        handoff.idempotency_key,
+        handoff.fingerprint,
+        handoff.correlation_id,
+        handoff.trace_id,
+        handoff.created_at,
+        handoff.updated_at,
+        handoff.expires_at,
+        json.dumps(payload),
+        handoff.schema_version,
+    )
+    return CaseHandoff.model_validate(_row_payload(row))
+
+
+async def _update_case_handoff(conn: Any, handoff: CaseHandoff) -> CaseHandoff:
+    payload = handoff.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        UPDATE case_handoffs SET
+            status = $2,
+            owner = $3,
+            verifier = $4,
+            correlation_id = $5,
+            trace_id = $6,
+            updated_at = $7,
+            expires_at = $8,
+            payload = $9::jsonb,
+            schema_version = $10
+        WHERE handoff_id = $1
+        RETURNING payload
+        """,
+        handoff.handoff_id,
+        handoff.status,
+        handoff.owner,
+        handoff.verifier,
+        handoff.correlation_id,
+        handoff.trace_id,
+        handoff.updated_at,
+        handoff.expires_at,
+        json.dumps(payload),
+        handoff.schema_version,
+    )
+    if not row:
+        raise KeyError(f"handoff not found: {handoff.handoff_id}")
+    return CaseHandoff.model_validate(_row_payload(row))
+
+
+async def _insert_handoff_update(conn: Any, update: HandoffUpdate) -> HandoffUpdate:
+    payload = update.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO handoff_updates (
+            update_id, handoff_id, case_id, source_loop, update_type, status,
+            external_event_id, correlation_id, trace_id, payload_hash, created_at,
+            payload, schema_version
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)
+        RETURNING payload
+        """,
+        update.update_id,
+        update.handoff_id,
+        update.case_id,
+        update.source_loop,
+        update.update_type,
+        update.status,
+        update.external_event_id,
+        update.correlation_id,
+        update.trace_id,
+        update.payload_hash,
+        update.created_at,
+        json.dumps(payload),
+        update.schema_version,
+    )
+    return HandoffUpdate.model_validate(_row_payload(row))
+
+
+async def _upsert_verification_objective(conn: Any, objective: VerificationObjective) -> VerificationObjective:
+    payload = objective.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO verification_objectives (
+            objective_id, case_id, handoff_id, objective_key, objective_type, name,
+            status, required_status, required, required_consecutive_passes,
+            consecutive_pass_count, last_checked_at, next_check_at, evidence_ref,
+            failure_reason, created_at, updated_at, payload, schema_version
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19)
+        ON CONFLICT (case_id, objective_key) DO UPDATE SET
+            handoff_id = EXCLUDED.handoff_id,
+            objective_type = EXCLUDED.objective_type,
+            name = EXCLUDED.name,
+            status = EXCLUDED.status,
+            required_status = EXCLUDED.required_status,
+            required = EXCLUDED.required,
+            required_consecutive_passes = EXCLUDED.required_consecutive_passes,
+            consecutive_pass_count = EXCLUDED.consecutive_pass_count,
+            last_checked_at = EXCLUDED.last_checked_at,
+            next_check_at = EXCLUDED.next_check_at,
+            evidence_ref = EXCLUDED.evidence_ref,
+            failure_reason = EXCLUDED.failure_reason,
+            updated_at = EXCLUDED.updated_at,
+            payload = EXCLUDED.payload || jsonb_build_object(
+                'objective_id', verification_objectives.objective_id,
+                'created_at', verification_objectives.created_at
+            ),
+            schema_version = EXCLUDED.schema_version
+        RETURNING payload
+        """,
+        objective.objective_id,
+        objective.case_id,
+        objective.handoff_id or None,
+        objective.objective_key,
+        objective.objective_type,
+        objective.name,
+        objective.status,
+        objective.required_status,
+        objective.required,
+        objective.required_consecutive_passes,
+        objective.consecutive_pass_count,
+        objective.last_checked_at,
+        objective.next_check_at,
+        objective.evidence_ref,
+        objective.failure_reason,
+        objective.created_at,
+        objective.updated_at,
+        json.dumps(payload),
+        objective.schema_version,
+    )
+    return VerificationObjective.model_validate(_row_payload(row))
+
+
+async def _record_handoff_delivery(pool: Any, delivery: HandoffTransportDelivery, *, upsert: bool) -> HandoffTransportDelivery:
+    payload = delivery.model_dump(mode="json")
+    async with pool.acquire() as conn:
+        if upsert:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO handoff_transport_deliveries (
+                    delivery_id, handoff_id, case_id, transport, status, idempotency_key,
+                    external_id, external_url, attempts, max_attempts, next_attempt_at,
+                    last_error, payload_hash, created_at, updated_at, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17)
+                ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = handoff_transport_deliveries.idempotency_key
+                RETURNING payload
+                """,
+                delivery.delivery_id,
+                delivery.handoff_id,
+                delivery.case_id,
+                delivery.transport,
+                delivery.status,
+                delivery.idempotency_key,
+                delivery.external_id,
+                delivery.external_url,
+                delivery.attempts,
+                delivery.max_attempts,
+                delivery.next_attempt_at,
+                delivery.last_error,
+                delivery.payload_hash,
+                delivery.created_at,
+                delivery.updated_at,
+                json.dumps(payload),
+                delivery.schema_version,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE handoff_transport_deliveries SET
+                    status = $2,
+                    external_id = $3,
+                    external_url = $4,
+                    attempts = $5,
+                    max_attempts = $6,
+                    next_attempt_at = $7,
+                    last_error = $8,
+                    payload_hash = $9,
+                    updated_at = $10,
+                    payload = $11::jsonb,
+                    schema_version = $12
+                WHERE delivery_id = $1
+                RETURNING payload
+                """,
+                delivery.delivery_id,
+                delivery.status,
+                delivery.external_id,
+                delivery.external_url,
+                delivery.attempts,
+                delivery.max_attempts,
+                delivery.next_attempt_at,
+                delivery.last_error,
+                delivery.payload_hash,
+                delivery.updated_at,
+                json.dumps(payload),
+                delivery.schema_version,
+            )
+    if not row:
+        raise KeyError(f"handoff delivery not found: {delivery.delivery_id}")
+    return HandoffTransportDelivery.model_validate(_row_payload(row))
+
+
+async def _insert_outcome(conn: Any, outcome: OutcomeRecord) -> OutcomeRecord:
+    payload = outcome.model_dump(mode="json")
+    row = await conn.fetchrow(
+        """
+        INSERT INTO outcome_records (
+            outcome_id, work_item_type, work_item_id, case_type, fingerprint,
+            created_at, payload, schema_version
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
+        ON CONFLICT (outcome_id) DO UPDATE SET outcome_id = outcome_records.outcome_id
+        RETURNING payload
+        """,
+        outcome.outcome_id,
+        outcome.work_item_type,
+        outcome.work_item_id,
+        outcome.case_type,
+        outcome.fingerprint,
+        outcome.created_at,
+        json.dumps(payload),
+        outcome.schema_version,
+    )
+    return OutcomeRecord.model_validate(_row_payload(row))
+
+
 def _load_asyncpg() -> Any:
     try:
         import asyncpg  # type: ignore[import-not-found]
@@ -710,3 +1426,13 @@ def _case_from_payload(payload: dict[str, Any]) -> CaseProjection:
     if kind == "meta":
         return MetaCaseProjection.model_validate(payload)
     return AtomicCaseProjection.model_validate(payload)
+
+
+def _advisory_lock_key(scope: str, payload: dict[str, Any]) -> str:
+    return f"{scope}:{lhp_payload_hash(payload)[:32]}"
+
+
+def _bounded_limit(limit: int, *, default: int = 100, maximum: int = 500) -> int:
+    if limit <= 0:
+        return default
+    return min(limit, maximum)
