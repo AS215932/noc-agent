@@ -1,11 +1,12 @@
 import hashlib
 import hmac
 import json
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
 
-from app.cases import CaseService, InMemoryCaseStore, ObservationRecord
+from app.cases import CaseHandoff, CaseService, HandoffUpdate, InMemoryCaseStore, KnowledgeArtifact, ObservationRecord, VerificationObjective
 from app.cases.graph_memory import CaseServiceGraphMemory
 import app.main as main_module
 from app.main import (
@@ -23,14 +24,44 @@ from app.main import (
     control_cases,
     control_manual_investigation,
     decide_incident,
+    engineering_lhp_handoff_fetch,
+    engineering_lhp_handoff_update,
     incident_status,
     pending_incidents,
     signed_resume,
 )
+from app.cases.lhp import build_loop_signature
 
 
 def _request(token: str = "secret"):
     return type("Request", (), {"headers": {"x-noc-control-token": token}})()
+
+
+class _Url:
+    def __init__(self, path: str):
+        self.path = path
+
+
+class _LoopRequest:
+    def __init__(self, *, method: str, path: str, body: dict | None = None, secret: str = "shared"):
+        self.method = method
+        self.url = _Url(path)
+        self._body = json.dumps(body or {}, sort_keys=True, separators=(",", ":")).encode()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        self.headers = {
+            "x-noc-loop-identity": "engineering",
+            "x-noc-loop-timestamp": timestamp,
+            "x-noc-loop-signature": build_loop_signature(
+                secret=secret,
+                method=method,
+                path=path,
+                timestamp=timestamp,
+                body=body or {},
+            ),
+        }
+
+    async def body(self) -> bytes:
+        return self._body
 
 
 @pytest.mark.asyncio
@@ -87,6 +118,123 @@ async def test_signed_resume_uses_hmac(monkeypatch):
     response = await signed_resume(request, signature)
 
     assert response["incident"]["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
+    monkeypatch.setenv("NOC_LHP_ENABLED", "1")
+    monkeypatch.setenv("NOC_LHP_ENGINEERING_SECRET", "shared")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing"))
+    assert created.case is not None
+    handoff = CaseHandoff(
+        handoff_id="handoff_disk_1",
+        case_id=created.case.case_id,
+        target_loop="engineering",
+        objective="resolve low root filesystem condition",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        idempotency_key="case_1:engineering:resolve-low-root-filesystem-condition-v1:v1",
+    )
+    await service.request_lhp_handoff(
+        handoff,
+        objectives=[
+            VerificationObjective(
+                case_id=created.case.case_id,
+                handoff_id=handoff.handoff_id,
+                objective_key=f"objective_{index}",
+                objective_type="health_endpoint",
+                name=f"objective {index}",
+            )
+            for index in range(25)
+        ],
+    )
+    for index in range(12):
+        await service.record_lhp_knowledge_artifact(
+            KnowledgeArtifact(
+                case_id=created.case.case_id,
+                handoff_id=handoff.handoff_id,
+                artifact_type="context_pack",
+                version=index + 1,
+                summary=f"artifact {index}",
+            )
+        )
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+
+    fetched = await engineering_lhp_handoff_fetch(
+        handoff.handoff_id,
+        _LoopRequest(method="GET", path=f"/loop-handoff/v1/engineering/handoffs/{handoff.handoff_id}"),
+    )
+    assert fetched["handoff"]["handoff_id"] == handoff.handoff_id
+    assert fetched["schema_version"] == "lhp.v1"
+    assert fetched["payload_hash"]
+    assert len(fetched["verification_objectives"]) == 20
+    assert len(fetched["knowledge_artifacts"]) == 10
+
+    callback_body = HandoffUpdate(
+        case_id=created.case.case_id,
+        handoff_id=handoff.handoff_id,
+        source_loop="engineering",
+        update_type="accepted",
+        status="accepted",
+        external_event_id="eng_evt_1",
+        correlation_id=handoff.correlation_id,
+    ).model_dump(mode="json")
+    response = await engineering_lhp_handoff_update(
+        _LoopRequest(method="POST", path="/webhook/engineering-loop/handoff-update", body=callback_body)
+    )
+    duplicate = await engineering_lhp_handoff_update(
+        _LoopRequest(method="POST", path="/webhook/engineering-loop/handoff-update", body=callback_body)
+    )
+
+    assert response["status"] == "accepted"
+    assert response["created"] is True
+    assert duplicate["status"] == "accepted"
+    stored = await service.get_lhp_handoff(handoff.handoff_id)
+    assert stored is not None and stored.status == "accepted"
+
+    bad_body = HandoffUpdate(
+        case_id=created.case.case_id,
+        handoff_id=handoff.handoff_id,
+        source_loop="engineering",
+        update_type="implemented",
+        status="blocked",
+        external_event_id="eng_evt_bad_1",
+        correlation_id=handoff.correlation_id,
+    ).model_dump(mode="json")
+    bad_body["status"] = "verified"
+    with pytest.raises(HTTPException) as bad_exc:
+        await engineering_lhp_handoff_update(
+            _LoopRequest(method="POST", path="/webhook/engineering-loop/handoff-update", body=bad_body)
+        )
+    assert bad_exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_engineering_lhp_fetch_rejects_bad_signature(monkeypatch):
+    monkeypatch.setenv("NOC_LHP_ENABLED", "1")
+    monkeypatch.setenv("NOC_LHP_ENGINEERING_SECRET", "shared")
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = CaseService(InMemoryCaseStore())
+    runtime.store = runtime.service.store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request = _LoopRequest(method="GET", path="/loop-handoff/v1/engineering/handoffs/handoff_1", secret="wrong")
+
+    with pytest.raises(HTTPException) as exc:
+        await engineering_lhp_handoff_fetch("handoff_1", request)
+
+    assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio

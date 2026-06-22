@@ -1,7 +1,7 @@
 import pytest
 
-from app.cases import CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor
-from app.cases.handlers import build_default_outbox_handlers, build_handoff_handler, build_report_handler
+from app.cases import CaseHandoff, CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor, VerificationObjective
+from app.cases.handlers import build_default_outbox_handlers, build_engineering_lhp_handoff_handler, build_handoff_handler, build_report_handler
 from app.proactive.handoff import GitHubHandoff
 
 
@@ -22,6 +22,7 @@ class FakeGitHub:
                 "html_url": "https://github.com/AS215932/network-operations/issues/202",
                 "body": json["body"],
                 "title": json["title"],
+                "labels": json.get("labels", []),
             }
             self.created.append(issue)
             self.search_returns_existing = True
@@ -119,6 +120,78 @@ async def test_handoff_handler_creates_issue_and_records_case_result():
 
 
 @pytest.mark.asyncio
+async def test_engineering_lhp_handoff_handler_creates_candidate_issue_and_delivery_record():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(
+            source="proactive",
+            rule_id="disk_fill",
+            resource="rtr:/",
+            status="firing",
+            severity="HIGH",
+            annotations={"summary": "root disk low"},
+            signal_snapshot={"summary": "root disk low"},
+        )
+    )
+    assert created.case is not None
+    handoff = CaseHandoff(
+        handoff_id="handoff_disk_1",
+        case_id=created.case.case_id,
+        target_loop="engineering",
+        objective="resolve low root filesystem condition",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        idempotency_key=f"{created.case.case_id}:engineering:resolve-low-root-filesystem-condition-v1:v1",
+        case_type="proactive_disk_condition",
+        fingerprint=created.case.fingerprint,
+        resource={"host": "rtr", "filesystem": "/"},
+        constraints=["do_not_make_suppression_permanent_without_separate_approval"],
+        acceptance_criteria=["monitoring alert clears"],
+    )
+    await service.request_lhp_handoff(
+        handoff,
+        objectives=[
+            VerificationObjective(
+                case_id=created.case.case_id,
+                handoff_id=handoff.handoff_id,
+                objective_key="disk_clear",
+                objective_type="monitoring_alert_clear",
+                name="disk clear",
+            )
+        ],
+        enqueue_delivery=True,
+    )
+    fake = FakeGitHub()
+    gh = GitHubHandoff(repo="AS215932/network-operations", token="t", requester=fake.request)
+
+    report = await OutboxProcessor(
+        store,
+        {
+            "engineering_handoff_requested": build_engineering_lhp_handoff_handler(
+                service,
+                handoff_client=gh,
+                control_public_url="https://noc.example",
+            )
+        },
+    ).process_pending()
+
+    assert report.processed == 1
+    assert report.succeeded == 1
+    assert len(fake.created) == 1
+    issue = fake.created[0]
+    assert "loop:candidate" in issue["labels"]
+    assert "loop:approved" not in issue["labels"]
+    assert {"noc", "engineering-handoff", "monitoring", "disk"}.issubset(set(issue["labels"]))
+    assert "noc-lhp-handoff-id:handoff_disk_1" in issue["body"]
+    assert f"noc-case-id:{created.case.case_id}" in issue["body"]
+    assert "loop:approved" in issue["body"]
+    deliveries = getattr(store, "_handoff_deliveries")
+    delivery = next(iter(deliveries.values()))
+    assert delivery.status == "succeeded"
+    assert delivery.external_url.endswith("/issues/202")
+
+
+@pytest.mark.asyncio
 async def test_handoff_handler_reuses_existing_case_issue():
     store = InMemoryCaseStore()
     service = CaseService(store)
@@ -160,3 +233,11 @@ async def test_default_handlers_include_knowledge_candidate_and_handoff_only_whe
         "knowledge_candidate",
         "handoff",
     }
+    assert set(
+        build_default_outbox_handlers(
+            service,
+            knowledge_candidate_dir=tmp_path,
+            handoff_client=handoff,
+            engineering_handoff_client=handoff,
+        )
+    ) == {"report", "knowledge_candidate", "handoff", "engineering_handoff_requested"}

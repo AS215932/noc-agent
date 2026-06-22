@@ -9,6 +9,7 @@ from app.cases.outbox import OutboxProcessReport, OutboxProcessor
 from app.cases.policy import CasePolicy
 from app.cases.service import CaseService
 from app.cases.store import CaseStore, InMemoryCaseStore
+from app.config import load_loop_handoff_settings
 from app.db.config import load_database_settings
 
 
@@ -28,11 +29,14 @@ class CaseServiceRuntime:
 async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | None = None) -> OutboxProcessReport:
     from app.cases.handlers import build_default_outbox_handlers
 
+    lhp = load_loop_handoff_settings()
+    engineering_repo = lhp.engineering_handoff_repo if lhp.enabled and lhp.engineering_handoff_delivery_enabled else ""
     handlers = build_default_outbox_handlers(
         runtime.service,
         knowledge_candidate_dir=_env_str("NOC_KNOWLEDGE_CANDIDATE_DIR", ""),
         control_public_url=_env_str("NOC_CONTROL_PUBLIC_URL", ""),
         handoff_repo=_env_str("NOC_CASE_HANDOFF_REPO", _env_str("NOC_PROACTIVE_HANDOFF_REPO", "")),
+        engineering_handoff_repo=engineering_repo,
     )
     processor = OutboxProcessor(
         runtime.store,
