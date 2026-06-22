@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from copy import deepcopy
+from datetime import datetime, timezone
 from html import escape
 from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
@@ -33,8 +34,9 @@ from app.model_metrics import (
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
-from app.config import load_proactive_settings
+from app.config import LHP_ENGINEERING_SECRET_ENV, load_loop_handoff_settings, load_proactive_settings
 from app.cases.graph_memory import CaseServiceGraphMemory
+from app.cases.lhp import CallbackInboxRecord, HandoffUpdate, assert_lhp_payload_size, lhp_payload_hash, verify_loop_signature
 from app.proactive.loop import ProactiveLoop
 from app.alert_utils import case_display_title, case_event_from_alert
 from app.graph_runtime import record_operator_decision, run_investigation_graph
@@ -1878,6 +1880,78 @@ def _case_service_case_summary(case) -> dict:
     }
 
 
+@app.get("/loop-handoff/v1/engineering/handoffs/{handoff_id}")
+async def engineering_lhp_handoff_fetch(handoff_id: str, request: Request):
+    runtime = _require_case_service_runtime()
+    _require_lhp_loop_request(request, body={})
+    handoff = await runtime.service.get_lhp_handoff(handoff_id)
+    if handoff is None or handoff.target_loop != "engineering":
+        raise HTTPException(status_code=404, detail="LHP handoff not found")
+    case = await runtime.store.get_case(handoff.case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="LHP case not found")
+    objectives = await runtime.service.list_lhp_verification_objectives(case_id=handoff.case_id)
+    artifacts = await runtime.service.list_lhp_knowledge_artifacts(case_id=handoff.case_id)
+    payload = {
+        "schema_version": "lhp.v1",
+        "handoff": handoff.model_dump(mode="json"),
+        "case": _case_service_case_summary(case),
+        "verification_objectives": [
+            item.model_dump(mode="json") for item in objectives if item.handoff_id == handoff.handoff_id
+        ][:20],
+        "knowledge_artifacts": [
+            item.model_dump(mode="json") for item in artifacts if item.handoff_id in {"", handoff.handoff_id}
+        ][:10],
+    }
+    assert_lhp_payload_size(payload, max_bytes=load_loop_handoff_settings().callback_max_bytes)
+    return {**payload, "payload_hash": lhp_payload_hash(payload)}
+
+
+@app.post("/webhook/engineering-loop/handoff-update")
+async def engineering_lhp_handoff_update(request: Request):
+    runtime = _require_case_service_runtime()
+    settings = load_loop_handoff_settings()
+    raw = await request.body()
+    if len(raw) > max(0, settings.callback_max_bytes):
+        raise HTTPException(status_code=413, detail="LHP callback payload too large")
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Invalid JSON callback payload") from exc
+    assert_lhp_payload_size(body, max_bytes=settings.callback_max_bytes)
+    _require_lhp_loop_request(request, body=body)
+    if body.get("schema_version") != "lhp.v1":
+        raise HTTPException(status_code=422, detail="schema_version must be lhp.v1")
+    try:
+        update = HandoffUpdate.model_validate(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid LHP callback payload") from exc
+    if update.source_loop != "engineering":
+        raise HTTPException(status_code=422, detail="source_loop must be engineering")
+    try:
+        result = await runtime.service.record_lhp_handoff_update(update)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid LHP handoff transition") from exc
+    callback = CallbackInboxRecord(
+        source_loop="engineering",
+        external_event_id=update.external_event_id,
+        payload_hash=lhp_payload_hash(body),
+        case_id=update.case_id,
+        handoff_id=update.handoff_id,
+        result_payload={
+            "status": "accepted",
+            "update_id": result.update.update_id,
+            "handoff_status": result.handoff.status,
+            "case_status": result.case.status,
+            "created": result.created,
+        },
+    )
+    claim = await runtime.service.claim_lhp_callback(callback)
+    if not claim.created:
+        return claim.callback.result_payload
+    return callback.result_payload
+
+
 @app.post("/control/proactive/pause")
 async def control_proactive_pause(
     request: Request,
@@ -2183,6 +2257,44 @@ def _require_control_request(request: Request, token: str | None = None, header_
     bearer = auth.removeprefix("Bearer ").strip() if auth.lower().startswith("bearer ") else ""
     header_value = header_value if isinstance(header_value, str) else None
     _require_control_token(header_value or request.headers.get("x-noc-control-token") or bearer or token)
+
+
+def _require_lhp_loop_request(request: Request, *, body: dict) -> None:
+    settings = load_loop_handoff_settings()
+    if not settings.enabled:
+        raise HTTPException(status_code=404, detail="LHP is not enabled")
+    secret = os.getenv(LHP_ENGINEERING_SECRET_ENV, "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="LHP Engineering shared secret is not configured")
+    identity = request.headers.get("x-noc-loop-identity", "").strip()
+    if identity != "engineering":
+        raise HTTPException(status_code=401, detail="Invalid loop identity")
+    timestamp = request.headers.get("x-noc-loop-timestamp", "").strip()
+    if not _lhp_timestamp_fresh(timestamp):
+        raise HTTPException(status_code=401, detail="Invalid loop timestamp")
+    signature = request.headers.get("x-noc-loop-signature")
+    if not verify_loop_signature(
+        secret=secret,
+        method=request.method,
+        path=request.url.path,
+        timestamp=timestamp,
+        body=body,
+        signature=signature,
+    ):
+        raise HTTPException(status_code=401, detail="Invalid loop signature")
+
+
+def _lhp_timestamp_fresh(value: str, *, max_skew_s: int = 300) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = abs((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
+    return delta <= max_skew_s
 
 
 def _manual_investigation_payload(prompt: str, source: str, operator: str) -> dict:

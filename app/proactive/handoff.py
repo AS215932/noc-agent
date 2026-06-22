@@ -112,6 +112,7 @@ class GitHubHandoff:
         body: str,
         refresh_comment: str,
         log_prefix: str = "handoff",
+        labels: list[str] | None = None,
     ) -> str | None:
         """Open or refresh a loop:candidate issue from a pre-rendered body."""
         if not self._authed or not self.repo:
@@ -122,7 +123,7 @@ class GitHubHandoff:
                 await self._comment(int(existing["number"]), refresh_comment)
                 log.info(f"{log_prefix}_refreshed", repo=self.repo, number=existing.get("number"))
                 return existing.get("html_url")
-            url = await self._create_issue_from_body(title=title, body=body)
+            url = await self._create_issue_from_body(title=title, body=body, labels=labels)
             log.info(f"{log_prefix}_created", repo=self.repo, url=url)
             return url
         except Exception as exc:  # handoff failure must not break a cycle
@@ -140,8 +141,8 @@ class GitHubHandoff:
                 return item
         return None
 
-    async def _create_issue_from_body(self, *, title: str, body: str) -> str | None:
-        payload = {"title": title[:240], "body": body, "labels": CANDIDATE_LABELS}
+    async def _create_issue_from_body(self, *, title: str, body: str, labels: list[str] | None = None) -> str | None:
+        payload = {"title": title[:240], "body": body, "labels": labels or CANDIDATE_LABELS}
         status, body = await self._request("POST", f"/repos/{self.repo}/issues", json=payload)
         if status not in (200, 201) or not isinstance(body, dict):
             log.warn("handoff_create_rejected", repo=self.repo, status=status)

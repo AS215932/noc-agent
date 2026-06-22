@@ -5,7 +5,7 @@ CaseService-backed proactive, reactive-primary, and control-primary paths.
 """
 
 from app.cases.correlation import CorrelationService, MetaCaseResult, event_fingerprint_from_parts
-from app.cases.handlers import build_default_outbox_handlers, build_handoff_handler, build_report_handler
+from app.cases.handlers import build_default_outbox_handlers, build_engineering_lhp_handoff_handler, build_handoff_handler, build_report_handler
 from app.cases.lhp import (
     CallbackInboxRecord,
     CaseHandoff,
@@ -92,6 +92,7 @@ __all__ = [
     "assert_lhp_payload_size",
     "build_case_service_runtime_from_env",
     "build_default_outbox_handlers",
+    "build_engineering_lhp_handoff_handler",
     "build_handoff_handler",
     "build_loop_signature",
     "build_report_handler",
