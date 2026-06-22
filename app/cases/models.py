@@ -26,6 +26,16 @@ CaseKind = Literal["atomic", "meta"]
 ObservationStatus = Literal["firing", "clean", "resolved", "unknown"]
 SourceHealth = Literal["healthy", "degraded", "unknown", "failed"]
 CaseStatus = Literal[
+    # LHP-v1 shared operational ledger statuses
+    "open",
+    "triaged",
+    "context_requested",
+    "handoff_requested",
+    "handoff_in_progress",
+    "verification_pending",
+    "blocked",
+    "failed",
+    "needs_human",
     # existing reactive atomic statuses
     "investigating",
     "waiting_approval",
@@ -60,6 +70,17 @@ OutboxIntentType = Literal[
     "knowledge_candidate",
     "issue_comment",
     "discord_update",
+    # LHP-v1 cross-loop event intents (dormant until handlers are wired)
+    "engineering_handoff_requested",
+    "engineering_handoff_updated",
+    "engineering_handoff_verified",
+    "engineering_handoff_resolved",
+    "knowledge_context_requested",
+    "knowledge_artifact_proposed",
+    "verification_objective_created",
+    "verification_objective_updated",
+    "verification_passed",
+    "verification_failed",
 ]
 OutboxStatus = Literal["pending", "in_progress", "succeeded", "failed", "abandoned"]
 TraceType = Literal[

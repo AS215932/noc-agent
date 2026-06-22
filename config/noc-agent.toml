@@ -18,3 +18,26 @@ enabled = true
 api_key_env = "GOOGLE_API_KEY"
 gemini_api_key_env = "GEMINI_API_KEY"
 quota_project_id_env = "GEMINI_QUOTA_PROJECT_ID"
+
+[loop_handoff]
+# Loop Handoff Protocol v1 is dormant by default. Flip these via environment
+# during staged rollout; keep delivery, verification, and auto-resolution off
+# until their implementation tranches are deployed.
+enabled = false
+engineering_handoff_delivery_enabled = false
+engineering_handoff_transport = "github_issue"
+engineering_handoff_repo = "AS215932/network-operations"
+knowledge_context_enabled = false
+knowledge_export_sqlite = "/opt/noc-knowledge/exports/knowledge.sqlite"
+knowledge_export_manifest = "/opt/noc-knowledge/exports/manifest.json"
+knowledge_context_max_artifacts = 10
+knowledge_context_max_tokens_equivalent = 3000
+knowledge_context_timeout_s = 20
+knowledge_candidate_dir = "/var/lib/noc-agent/knowledge-candidates"
+case_verification_enabled = false
+case_verification_dry_run = true
+case_auto_resolve_enabled = false
+case_verification_interval_s = 120
+case_verification_required_consecutive_passes = 3
+disk_alert_handoff_enabled = false
+callback_max_bytes = 65536

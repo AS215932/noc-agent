@@ -46,12 +46,25 @@ def test_case_schema_contains_authoritative_tables_and_uniqueness_guards():
         "meta_case_correlation_evidence",
         "traces",
         "operator_feedback",
+        "case_handoffs",
+        "handoff_updates",
+        "verification_objectives",
+        "knowledge_artifacts",
+        "outcome_records",
+        "callback_inbox",
+        "handoff_transport_deliveries",
     ):
         assert f"create table if not exists {table}" in sql
     assert "case_identity_aliases_active_unique_idx" in sql
     assert "cases_active_atomic_fingerprint_idx" in sql
     assert "side_effect_outbox" in sql and "idempotency_key text not null unique" in sql
-    assert len(SCHEMA_STATEMENTS) >= 10
+    assert "case_handoffs_active_unique_idx" in sql
+    assert "handoff_updates_external_event_unique_idx" in sql
+    assert "max_attempts integer not null default 10" in sql
+    assert "unique(source_loop, external_event_id)" in sql
+    assert "unique(case_id, objective_key)" in sql
+    assert "unique(case_id, artifact_type, version)" in sql
+    assert len(SCHEMA_STATEMENTS) >= 40
 
 
 def test_postgres_payload_rehydrates_atomic_or_meta_projection():
@@ -101,7 +114,6 @@ async def test_postgres_observation_insert_refreshes_payload_on_dedup_key():
     assert "ON CONFLICT (dedup_key) WHERE dedup_key <> ''" in conn.queries[0]
     assert "signal_signature = EXCLUDED.signal_signature" in conn.queries[0]
     assert "payload = jsonb_set(EXCLUDED.payload" in conn.queries[0]
-
 
 
 def test_postgres_store_reports_missing_asyncpg_as_optional_dependency():
