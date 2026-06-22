@@ -22,6 +22,7 @@ from app.cases.lhp import (
     KnowledgeArtifact,
     OutcomeRecord,
     VerificationObjective,
+    sanitize_lhp_payload,
 )
 from app.cases.models import (
     AliasType,
@@ -431,6 +432,44 @@ class CaseService:
 
     async def claim_lhp_callback(self, callback: CallbackInboxRecord) -> CallbackClaimResult:
         return await self.store.claim_callback_event(callback)
+
+    async def request_lhp_knowledge_context(
+        self,
+        case_id: str,
+        *,
+        handoff_id: str = "",
+        objective_key: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> OutboxIntent:
+        case = await self._require_atomic_case(case_id)
+        safe_payload = sanitize_lhp_payload(payload or {})
+        if not isinstance(safe_payload, dict):
+            safe_payload = {"value": safe_payload}
+        safe_payload["untrusted_evidence"] = True
+        intent = await self.store.enqueue_outbox(
+            OutboxIntent(
+                case_id=case.case_id,
+                intent_type="knowledge_context_requested",
+                idempotency_key=f"knowledge_context_requested:{case.case_id}:{handoff_id or objective_key or 'case'}",
+                state_signature=case.signal_signature,
+                payload={
+                    "case_id": case.case_id,
+                    "handoff_id": handoff_id,
+                    "objective_key": objective_key,
+                    **safe_payload,
+                },
+            )
+        )
+        await self.store.append_event(
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="lhp_knowledge_context_requested",
+                actor_type="system",
+                policy_version=self.policy.policy_version,
+                payload={"handoff_id": handoff_id, "objective_key": objective_key, "outbox_id": intent.outbox_id},
+            )
+        )
+        return intent
 
     async def record_lhp_handoff_update(self, update: HandoffUpdate) -> HandoffUpdateResult:
         event = CaseEvent(

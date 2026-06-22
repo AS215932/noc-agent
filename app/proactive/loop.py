@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app import log
-from app.cases.models import SourceHealth
-from app.config import ProactiveLoopSettings, load_proactive_settings
+from app.cases.models import AtomicCaseProjection, SourceHealth
+from app.config import LoopHandoffSettings, ProactiveLoopSettings, load_loop_handoff_settings, load_proactive_settings
 from app.discord import Verbosity, send_discord_notification
 from app.icinga_ack import acknowledge_icinga
 from app.proactive.governance import GateDecision, build_decision_context, evaluate_gate
@@ -81,6 +81,7 @@ class ProactiveLoop:
         suppressions: Any | None = None,
         case_service: Any | None = None,
         case_service_primary: bool | None = None,
+        loop_handoff_settings: LoopHandoffSettings | None = None,
     ):
         self.mcp_runtime = mcp_runtime
         self.settings = settings or load_proactive_settings()
@@ -89,6 +90,7 @@ class ProactiveLoop:
         self._model_chain = model_chain or _default_model_chain
         self.memory = memory
         self.case_service = case_service
+        self.loop_handoff_settings = loop_handoff_settings or load_loop_handoff_settings()
         env_case_service_control = os.getenv("NOC_CASESERVICE_CONTROL", "").strip().lower() in {
             "1",
             "true",
@@ -541,6 +543,13 @@ class ProactiveLoop:
                     status=observation.status,
                     action=str(getattr(result, "action", "unknown")),
                 )
+                case = getattr(result, "case", None)
+                if isinstance(case, AtomicCaseProjection):
+                    await self._maybe_request_disk_lhp_handoff(
+                        hotspot,
+                        case=case,
+                        cycle_id=cycle_id,
+                    )
             log.info("proactive_case_shadow_observed", count=len(raw), source_health=source_health)
         except Exception as exc:
             safe = classify_exception(exc)
@@ -548,6 +557,59 @@ class ProactiveLoop:
             log_exception("proactive_case_shadow_observe_failed", exc, category=safe.category)
             if self.case_service_control:
                 raise
+
+    async def _maybe_request_disk_lhp_handoff(self, hotspot: Hotspot, *, case: Any, cycle_id: str) -> None:
+        settings = self.loop_handoff_settings
+        if not (settings.enabled and settings.disk_alert_handoff_enabled):
+            return
+        service = self.case_service
+        if service is None:
+            return
+        from app.proactive.lhp import build_disk_handoff_request, is_disk_handoff_hotspot
+
+        if not is_disk_handoff_hotspot(hotspot):
+            return
+        request = build_disk_handoff_request(
+            hotspot,
+            case,
+            cycle_id=cycle_id,
+            required_consecutive_passes=settings.case_verification_required_consecutive_passes,
+            suppression_entry=self._suppression_entry_for_hotspot(hotspot),
+            knowledge_context_enabled=settings.knowledge_context_enabled,
+        )
+        result = await service.request_lhp_handoff(
+            request.handoff,
+            objectives=request.objectives,
+            enqueue_delivery=settings.engineering_handoff_delivery_enabled,
+        )
+        if settings.knowledge_context_enabled:
+            await service.request_lhp_knowledge_context(
+                case.case_id,
+                handoff_id=result.handoff.handoff_id,
+                objective_key=request.handoff.objective_key,
+                payload=request.knowledge_payload,
+            )
+        log.info(
+            "proactive_disk_lhp_handoff_requested",
+            case_id=case.case_id,
+            handoff_id=result.handoff.handoff_id,
+            created=result.created,
+            delivery_enqueued=bool(result.outbox_intent),
+            knowledge_context_requested=settings.knowledge_context_enabled,
+        )
+
+    def _suppression_entry_for_hotspot(self, hotspot: Hotspot) -> dict[str, Any] | None:
+        if self.suppressions is None:
+            return None
+        try:
+            active = self.suppressions.active()
+        except Exception:
+            return None
+        fingerprint = hotspot.fingerprint()
+        for ack_id, entry in active.items():
+            if fingerprint.startswith(str(ack_id)):
+                return entry
+        return None
 
     def _merge_with_carried(
         self, raw: list[Hotspot], *, do_deep: bool, degraded: bool

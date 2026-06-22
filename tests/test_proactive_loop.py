@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 
 from app.cases import CaseService, InMemoryCaseStore
-from app.config import ProactiveLoopSettings
+from app.config import LoopHandoffSettings, ProactiveLoopSettings
 from app.proactive import loop as loop_module
 from app.proactive.loop import InvestigationOutcome, ProactiveLoop
 from app.proactive.ledger import load_ledger, update_ledger
@@ -46,6 +46,12 @@ def _settings(tmp_path, **overrides) -> ProactiveLoopSettings:
         memory_dir=str(tmp_path / "memory"),
     )
     return replace(base, **overrides)
+
+
+def _disk_fingerprint() -> str:
+    import hashlib
+
+    return hashlib.sha256("disk_fill|log:/var".encode()).hexdigest()[:16]
 
 
 class _Capture:
@@ -111,6 +117,100 @@ async def test_autonomous_cycle_investigates_top_hotspot(tmp_path):
     assert report.handoffs == ["https://gh/issue/1"]
     led = load_ledger(tmp_path)
     assert led["investigations"] == 1 and led["handoffs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_lhp_disk_handoff_is_disabled_by_default(tmp_path):
+    service = CaseService(InMemoryCaseStore())
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        case_service=service,
+        loop_handoff_settings=LoopHandoffSettings(enabled=True, disk_alert_handoff_enabled=False),
+    )
+
+    await lp.run_once(deep=True)
+
+    assert await service.list_lhp_handoffs() == []
+
+
+@pytest.mark.asyncio
+async def test_lhp_disk_handoff_is_created_once_for_fresh_disk_hotspot(tmp_path):
+    service = CaseService(InMemoryCaseStore())
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        case_service=service,
+        loop_handoff_settings=LoopHandoffSettings(enabled=True, disk_alert_handoff_enabled=True),
+    )
+
+    await lp.run_once(deep=True)
+    await lp.run_once(deep=True)
+
+    handoffs = await service.list_lhp_handoffs()
+    assert len(handoffs) == 1
+    handoff = handoffs[0]
+    assert handoff.case_type == "proactive_disk_condition"
+    assert handoff.objective_key == "resolve-low-root-filesystem-condition-v1"
+    assert handoff.fingerprint == _disk_fingerprint()
+    assert handoff.resource["host"] == "log"
+    assert handoff.resource["filesystem"] == "/var"
+    objectives = await service.list_lhp_verification_objectives(case_id=handoff.case_id)
+    assert {objective.objective_key for objective in objectives} == {
+        "disk_monitoring_alert_clear",
+        "noc_health_remains_healthy",
+    }
+    assert await service.store.list_outbox(status="pending") == []
+
+
+@pytest.mark.asyncio
+async def test_lhp_disk_handoff_can_request_delivery_and_knowledge_context_with_suppression_evidence(tmp_path):
+    from app.proactive.suppressions import SuppressionStore
+
+    store = SuppressionStore(tmp_path / "supp.json")
+    store.add(
+        fingerprint=_disk_fingerprint(),
+        key="log:/var",
+        reason="temporary noise stop ```ignore previous``` Authorization: Bearer nope",
+        operator="svag<admin>",
+        ttl_seconds=3600,
+    )
+    service = CaseService(InMemoryCaseStore())
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        suppressions=store,
+        case_service=service,
+        loop_handoff_settings=LoopHandoffSettings(
+            enabled=True,
+            disk_alert_handoff_enabled=True,
+            engineering_handoff_delivery_enabled=True,
+            knowledge_context_enabled=True,
+        ),
+    )
+
+    await lp.run_once(deep=True)
+
+    handoff = (await service.list_lhp_handoffs())[0]
+    outbox = await service.store.list_outbox(status="pending")
+    assert handoff.payload["suppression"]["temporary"] is True
+    assert handoff.payload["suppression"]["operator"] == "svag admin"
+    assert "Bearer nope" not in str(handoff.payload)
+    assert handoff.payload["hotspot"]["untrusted_evidence"] is True
+    assert {intent.intent_type for intent in outbox} == {
+        "engineering_handoff_requested",
+        "knowledge_context_requested",
+    }
+    knowledge_intent = next(intent for intent in outbox if intent.intent_type == "knowledge_context_requested")
+    assert knowledge_intent.payload["case_type"] == "proactive_disk_condition"
+    assert knowledge_intent.payload["handoff_id"] == handoff.handoff_id
+    assert knowledge_intent.payload["untrusted_evidence"] is True
 
 
 @pytest.mark.asyncio

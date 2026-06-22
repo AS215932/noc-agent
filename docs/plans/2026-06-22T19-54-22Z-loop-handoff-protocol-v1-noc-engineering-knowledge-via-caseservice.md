@@ -784,7 +784,7 @@ Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` p
 
 - [x] 1. Add LHP-v1 feature flags, config, safety helpers, schemas... _(done)_
 - [x] 2. Add CaseService handoff, callback, verification, knowledg... _(done)_
-- [ ] 3. Modify NOC proactive disk handling to create/update cases... _(pending)_
+- [x] 3. Modify NOC proactive disk handling to create/update cases... _(done)_
 - [ ] 4. Add GitHub Engineering handoff delivery and Engineering L... _(pending)_
 - [ ] 5. Add the dedicated NOC verification scheduler. _(pending)_
 - [ ] 6. Add Knowledge pre-context and post-resolution artifact pr... _(pending)_
