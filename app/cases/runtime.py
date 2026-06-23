@@ -37,6 +37,7 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
         control_public_url=_env_str("NOC_CONTROL_PUBLIC_URL", ""),
         handoff_repo=_env_str("NOC_CASE_HANDOFF_REPO", _env_str("NOC_PROACTIVE_HANDOFF_REPO", "")),
         engineering_handoff_repo=engineering_repo,
+        loop_handoff_settings=lhp,
     )
     processor = OutboxProcessor(
         runtime.store,

@@ -2,6 +2,7 @@ import pytest
 
 from app.cases import CaseHandoff, CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor, VerificationObjective
 from app.cases.handlers import build_default_outbox_handlers, build_engineering_lhp_handoff_handler, build_handoff_handler, build_report_handler
+from app.config import LoopHandoffSettings
 from app.proactive.handoff import GitHubHandoff
 
 
@@ -241,3 +242,9 @@ async def test_default_handlers_include_knowledge_candidate_and_handoff_only_whe
             engineering_handoff_client=handoff,
         )
     ) == {"report", "knowledge_candidate", "handoff", "engineering_handoff_requested"}
+    assert set(
+        build_default_outbox_handlers(
+            service,
+            loop_handoff_settings=LoopHandoffSettings(enabled=True, knowledge_context_enabled=True, knowledge_candidate_dir=str(tmp_path)),
+        )
+    ) == {"report", "knowledge_context_requested", "knowledge_artifact_proposed"}

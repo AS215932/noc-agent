@@ -779,6 +779,7 @@ Complete when:
 
 
 
+
 <!-- pi-plan-progress:start -->
 ## Progress
 
@@ -789,7 +790,7 @@ Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` p
 - [x] 3. Modify NOC proactive disk handling to create/update cases... _(done)_
 - [x] 4. Add GitHub Engineering handoff delivery and Engineering L... _(done)_
 - [x] 5. Add the dedicated NOC verification scheduler. _(done)_
-- [ ] 6. Add Knowledge pre-context and post-resolution artifact pr... _(pending)_
+- [x] 6. Add Knowledge pre-context and post-resolution artifact pr... _(done)_
 - [ ] 7. Add production rollout config for NOC, Engineering Loop, ... _(pending)_
 - [ ] 8. Add evals, tests, metrics, docs, and rollout validation. _(pending)_
 
