@@ -133,6 +133,7 @@ async def test_verifier_can_auto_resolve_when_enabled():
             case_verification_enabled=True,
             case_verification_dry_run=False,
             case_auto_resolve_enabled=True,
+            knowledge_context_enabled=True,
         ),
         checker=checker,
     )
@@ -140,12 +141,15 @@ async def test_verifier_can_auto_resolve_when_enabled():
     case = await service.store.get_case(handoff.case_id)
     stored = await service.get_lhp_handoff(handoff.handoff_id)
     outcomes = await service.list_lhp_outcomes(case_id=handoff.case_id)
+    outbox = await service.store.list_outbox()
 
     assert report.verified_handoffs == 1
     assert report.resolved_cases == 1
     assert case is not None and getattr(case, "status") == "resolved"
     assert stored is not None and stored.status == "resolved"
     assert len(outcomes) == 1
+    assert [intent.intent_type for intent in outbox] == ["knowledge_artifact_proposed"]
+    assert outbox[0].payload["outcome_id"] == outcomes[0].outcome_id
 
 
 @pytest.mark.asyncio

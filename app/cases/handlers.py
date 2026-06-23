@@ -9,7 +9,9 @@ from app.cases.lhp import HandoffTransportDelivery, lhp_payload_hash, sanitize_l
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.service import CaseService
+from app.config import LoopHandoffSettings
 from app.discord import Verbosity, send_case_notification
+from app.knowledge.lhp import build_lhp_knowledge_artifact_handler, build_lhp_knowledge_context_handler
 from app.knowledge.outbox import build_knowledge_candidate_handler
 from app.proactive.handoff import GitHubHandoff, handoff_from_env
 
@@ -23,6 +25,7 @@ def build_default_outbox_handlers(
     handoff_client: GitHubHandoff | None = None,
     engineering_handoff_repo: str = "",
     engineering_handoff_client: GitHubHandoff | None = None,
+    loop_handoff_settings: LoopHandoffSettings | None = None,
 ) -> dict[str, OutboxHandler]:
     """Build handlers that are safe to enable behind the outbox worker flag.
 
@@ -37,6 +40,15 @@ def build_default_outbox_handlers(
     }
     if knowledge_candidate_dir:
         handlers["knowledge_candidate"] = build_knowledge_candidate_handler(case_service.store, knowledge_candidate_dir)
+    if loop_handoff_settings and loop_handoff_settings.enabled and loop_handoff_settings.knowledge_context_enabled:
+        handlers["knowledge_context_requested"] = build_lhp_knowledge_context_handler(
+            case_service,
+            settings=loop_handoff_settings,
+        )
+        handlers["knowledge_artifact_proposed"] = build_lhp_knowledge_artifact_handler(
+            case_service,
+            settings=loop_handoff_settings,
+        )
     if handoff_client is None and handoff_repo:
         handoff_client = handoff_from_env(handoff_repo)
     if handoff_client is not None:

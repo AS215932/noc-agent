@@ -131,6 +131,13 @@ class CaseVerifier:
             safety={"resolved_by": "noc_case_verifier", "auto_resolve_enabled": True},
         )
         await self.case_service.resolve_lhp_case_with_outcome(verified.case_id, handoff_id=verified.handoff_id, outcome=outcome)
+        if self.settings.knowledge_context_enabled:
+            await self.case_service.request_lhp_knowledge_artifact_proposal(
+                verified.case_id,
+                handoff_id=verified.handoff_id,
+                outcome_id=outcome.outcome_id,
+                payload={"source": "noc_case_verifier", "case_type": verified.case_type},
+            )
         return True, True
 
 

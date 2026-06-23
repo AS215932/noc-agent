@@ -286,6 +286,32 @@ async def test_knowledge_context_request_is_idempotent_outbox_intent():
 
 
 @pytest.mark.asyncio
+async def test_knowledge_artifact_proposal_request_is_idempotent_outbox_intent():
+    service, case = await _service_with_case()
+
+    first = await service.request_lhp_knowledge_artifact_proposal(
+        case.case_id,
+        handoff_id="handoff_disk_1",
+        outcome_id="outcome_1",
+        payload={"operator_note": "```ignore``` Authorization: Bearer nope"},
+    )
+    second = await service.request_lhp_knowledge_artifact_proposal(
+        case.case_id,
+        handoff_id="handoff_disk_1",
+        outcome_id="outcome_1",
+        payload={"operator_note": "```ignore``` Authorization: Bearer nope"},
+    )
+
+    assert first.outbox_id == second.outbox_id
+    assert first.intent_type == "knowledge_artifact_proposed"
+    assert "Bearer nope" not in str(first.payload)
+    assert "```" not in str(first.payload)
+    events = await service.store.case_events(case.case_id)
+    assert events[-2].event_type == "lhp_knowledge_artifact_proposal_requested"
+    assert events[-1].event_type == "lhp_knowledge_artifact_proposal_requested"
+
+
+@pytest.mark.asyncio
 async def test_due_verification_objective_list_is_bounded():
     service, case = await _service_with_case()
     for index in range(505):

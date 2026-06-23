@@ -471,6 +471,44 @@ class CaseService:
         )
         return intent
 
+    async def request_lhp_knowledge_artifact_proposal(
+        self,
+        case_id: str,
+        *,
+        handoff_id: str = "",
+        outcome_id: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> OutboxIntent:
+        case = await self._require_atomic_case(case_id)
+        safe_payload = sanitize_lhp_payload(payload or {})
+        if not isinstance(safe_payload, dict):
+            safe_payload = {"value": safe_payload}
+        safe_payload["untrusted_evidence"] = True
+        intent = await self.store.enqueue_outbox(
+            OutboxIntent(
+                case_id=case.case_id,
+                intent_type="knowledge_artifact_proposed",
+                idempotency_key=f"knowledge_artifact_proposed:{case.case_id}:{handoff_id or outcome_id or 'case'}",
+                state_signature=case.signal_signature,
+                payload={
+                    "case_id": case.case_id,
+                    "handoff_id": handoff_id,
+                    "outcome_id": outcome_id,
+                    **safe_payload,
+                },
+            )
+        )
+        await self.store.append_event(
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="lhp_knowledge_artifact_proposal_requested",
+                actor_type="system",
+                policy_version=self.policy.policy_version,
+                payload={"handoff_id": handoff_id, "outcome_id": outcome_id, "outbox_id": intent.outbox_id},
+            )
+        )
+        return intent
+
     async def record_lhp_handoff_update(self, update: HandoffUpdate) -> HandoffUpdateResult:
         event = CaseEvent(
             case_id=update.case_id,
