@@ -3,6 +3,12 @@ from app.model_metrics import (
     record_case_service_outbox_processed,
     record_case_service_shadow_failure,
     record_case_service_shadow_observation,
+    record_lhp_case_resolved,
+    record_lhp_handoff_request,
+    record_lhp_handoff_update,
+    record_lhp_handoff_verified,
+    record_lhp_knowledge_event,
+    record_lhp_verification_result,
     set_case_service_runtime_enabled,
 )
 
@@ -26,3 +32,33 @@ def test_case_service_metrics_are_exported():
     assert 'noc_agent_case_service_outbox_processed_total{intent_type="report_case",outcome="succeeded"}' in text
 
     set_case_service_runtime_enabled(False, backend="UnitBackend")
+
+
+def test_lhp_metrics_are_exported():
+    record_lhp_handoff_request(target_loop="engineering", case_type="proactive_disk_condition", outcome="created")
+    record_lhp_handoff_update(
+        source_loop="engineering",
+        update_type="implemented",
+        status="implemented",
+        outcome="created",
+    )
+    record_lhp_verification_result(objective_type="prometheus_query", status="pass")
+    record_lhp_handoff_verified(target_loop="engineering")
+    record_lhp_case_resolved(case_type="proactive_disk_condition")
+    record_lhp_knowledge_event(kind="artifact_proposed", outcome="enqueued")
+
+    body, _ = metrics_response()
+    text = body.decode()
+
+    assert (
+        'noc_agent_lhp_handoff_requests_total{case_type="proactive_disk_condition",outcome="created",'
+        'target_loop="engineering"}' in text
+    )
+    assert (
+        'noc_agent_lhp_handoff_updates_total{outcome="created",source_loop="engineering",status="implemented",'
+        'update_type="implemented"}' in text
+    )
+    assert 'noc_agent_lhp_verification_results_total{objective_type="prometheus_query",status="pass"}' in text
+    assert 'noc_agent_lhp_handoffs_verified_total{target_loop="engineering"}' in text
+    assert 'noc_agent_lhp_cases_resolved_total{case_type="proactive_disk_condition"}' in text
+    assert 'noc_agent_lhp_knowledge_events_total{kind="artifact_proposed",outcome="enqueued"}' in text

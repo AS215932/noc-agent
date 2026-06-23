@@ -87,6 +87,36 @@ CASE_SERVICE_OUTBOX_PROCESSED = Counter(
     "Case-service side-effect outbox processing outcomes.",
     ["intent_type", "outcome"],
 )
+LHP_HANDOFF_REQUESTS = Counter(
+    "noc_agent_lhp_handoff_requests_total",
+    "LHP-v1 handoff request outcomes recorded through CaseService.",
+    ["target_loop", "case_type", "outcome"],
+)
+LHP_HANDOFF_UPDATES = Counter(
+    "noc_agent_lhp_handoff_updates_total",
+    "LHP-v1 handoff update outcomes recorded through CaseService.",
+    ["source_loop", "update_type", "status", "outcome"],
+)
+LHP_VERIFICATION_RESULTS = Counter(
+    "noc_agent_lhp_verification_results_total",
+    "LHP-v1 verification objective results recorded by the NOC verifier.",
+    ["objective_type", "status"],
+)
+LHP_HANDOFFS_VERIFIED = Counter(
+    "noc_agent_lhp_handoffs_verified_total",
+    "LHP-v1 handoffs marked verified by the NOC verifier.",
+    ["target_loop"],
+)
+LHP_CASES_RESOLVED = Counter(
+    "noc_agent_lhp_cases_resolved_total",
+    "LHP-v1 cases resolved with outcome records by CaseService.",
+    ["case_type"],
+)
+LHP_KNOWLEDGE_EVENTS = Counter(
+    "noc_agent_lhp_knowledge_events_total",
+    "LHP-v1 Knowledge context/artifact events requested or recorded through CaseService.",
+    ["kind", "outcome"],
+)
 
 _fallback_failures: ContextVar[list[str]] = ContextVar("fallback_failures", default=[])
 _case_service_runtime_backend: str | None = None
@@ -225,6 +255,39 @@ def record_case_service_shadow_failure(*, path: str, category: str) -> None:
 
 def record_case_service_outbox_processed(*, intent_type: str, outcome: str) -> None:
     CASE_SERVICE_OUTBOX_PROCESSED.labels(intent_type=_metric_label(intent_type), outcome=_metric_label(outcome)).inc()
+
+
+def record_lhp_handoff_request(*, target_loop: str, case_type: str, outcome: str) -> None:
+    LHP_HANDOFF_REQUESTS.labels(
+        target_loop=_metric_label(target_loop),
+        case_type=_metric_label(case_type),
+        outcome=_metric_label(outcome),
+    ).inc()
+
+
+def record_lhp_handoff_update(*, source_loop: str, update_type: str, status: str, outcome: str) -> None:
+    LHP_HANDOFF_UPDATES.labels(
+        source_loop=_metric_label(source_loop),
+        update_type=_metric_label(update_type),
+        status=_metric_label(status),
+        outcome=_metric_label(outcome),
+    ).inc()
+
+
+def record_lhp_verification_result(*, objective_type: str, status: str) -> None:
+    LHP_VERIFICATION_RESULTS.labels(objective_type=_metric_label(objective_type), status=_metric_label(status)).inc()
+
+
+def record_lhp_handoff_verified(*, target_loop: str) -> None:
+    LHP_HANDOFFS_VERIFIED.labels(target_loop=_metric_label(target_loop)).inc()
+
+
+def record_lhp_case_resolved(*, case_type: str) -> None:
+    LHP_CASES_RESOLVED.labels(case_type=_metric_label(case_type)).inc()
+
+
+def record_lhp_knowledge_event(*, kind: str, outcome: str) -> None:
+    LHP_KNOWLEDGE_EVENTS.labels(kind=_metric_label(kind), outcome=_metric_label(outcome)).inc()
 
 
 def selected_model_name(result: Any) -> str:

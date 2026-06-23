@@ -39,6 +39,14 @@ from app.cases.models import (
 )
 from app.cases.policy import CasePolicy
 from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult
+from app.model_metrics import (
+    record_lhp_case_resolved,
+    record_lhp_handoff_request,
+    record_lhp_handoff_update,
+    record_lhp_handoff_verified,
+    record_lhp_knowledge_event,
+    record_lhp_verification_result,
+)
 
 ObserveAction = Literal[
     "created",
@@ -410,13 +418,19 @@ class CaseService:
                 state_signature=case.signal_signature,
                 payload={"handoff_id": handoff.handoff_id, "schema_version": handoff.schema_version},
             )
-        return await self.store.create_handoff_with_objectives(
+        result = await self.store.create_handoff_with_objectives(
             handoff,
             objectives=objectives or [],
             case_status="handoff_requested",
             event=event,
             outbox_intent=outbox_intent,
         )
+        record_lhp_handoff_request(
+            target_loop=handoff.target_loop,
+            case_type=handoff.case_type,
+            outcome="created" if result.created else "deduplicated",
+        )
+        return result
 
     async def get_lhp_handoff(self, handoff_id: str) -> CaseHandoff | None:
         return await self.store.get_handoff(handoff_id)
@@ -469,6 +483,7 @@ class CaseService:
                 payload={"handoff_id": handoff_id, "objective_key": objective_key, "outbox_id": intent.outbox_id},
             )
         )
+        record_lhp_knowledge_event(kind="context_requested", outcome="enqueued")
         return intent
 
     async def request_lhp_knowledge_artifact_proposal(
@@ -507,6 +522,7 @@ class CaseService:
                 payload={"handoff_id": handoff_id, "outcome_id": outcome_id, "outbox_id": intent.outbox_id},
             )
         )
+        record_lhp_knowledge_event(kind="artifact_proposed", outcome="enqueued")
         return intent
 
     async def record_lhp_handoff_update(self, update: HandoffUpdate) -> HandoffUpdateResult:
@@ -525,11 +541,18 @@ class CaseService:
                 "external_event_id": update.external_event_id,
             },
         )
-        return await self.store.append_handoff_update(
+        result = await self.store.append_handoff_update(
             update,
             case_status=_case_status_for_handoff(update.status),
             event=event,
         )
+        record_lhp_handoff_update(
+            source_loop=update.source_loop,
+            update_type=update.update_type,
+            status=update.status,
+            outcome="created" if result.created else "deduplicated",
+        )
+        return result
 
     async def upsert_lhp_verification_objective(self, objective: VerificationObjective) -> VerificationObjective:
         event = CaseEvent(
@@ -554,7 +577,9 @@ class CaseService:
                 "consecutive_pass_count": objective.consecutive_pass_count,
             },
         )
-        return await self.store.update_verification_objective_result(objective, event=event)
+        updated = await self.store.update_verification_objective_result(objective, event=event)
+        record_lhp_verification_result(objective_type=updated.objective_type, status=updated.status)
+        return updated
 
     async def list_due_lhp_verification_objectives(
         self, *, now: str | None = None, limit: int = 100
@@ -577,7 +602,9 @@ class CaseService:
             policy_version=self.policy.policy_version,
             payload={"handoff_id": handoff_id},
         )
-        return await self.store.mark_handoff_verified(handoff_id, now=now, event=event)
+        verified = await self.store.mark_handoff_verified(handoff_id, now=now, event=event)
+        record_lhp_handoff_verified(target_loop=verified.target_loop)
+        return verified
 
     async def record_lhp_knowledge_artifact(self, artifact: KnowledgeArtifact) -> KnowledgeArtifact:
         event = CaseEvent(
@@ -592,7 +619,9 @@ class CaseService:
                 "review_status": artifact.review_status,
             },
         )
-        return await self.store.record_knowledge_artifact(artifact, event=event)
+        recorded = await self.store.record_knowledge_artifact(artifact, event=event)
+        record_lhp_knowledge_event(kind=recorded.artifact_type, outcome=recorded.review_status)
+        return recorded
 
     async def list_lhp_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]:
         return await self.store.list_knowledge_artifacts(case_id=case_id)
@@ -617,7 +646,9 @@ class CaseService:
             policy_version=self.policy.policy_version,
             payload={"outcome_id": outcome.outcome_id, "handoff_id": handoff_id},
         )
-        return await self.store.resolve_case_with_outcome(case_id, handoff_id=handoff_id, outcome=outcome, now=now, event=event)
+        resolved = await self.store.resolve_case_with_outcome(case_id, handoff_id=handoff_id, outcome=outcome, now=now, event=event)
+        record_lhp_case_resolved(case_type=outcome.case_type)
+        return resolved
 
     async def list_lhp_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]:
         return await self.store.list_outcomes(case_id=case_id)

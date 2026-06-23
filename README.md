@@ -378,6 +378,8 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
   - `NOC_CASE_VERIFICATION_INTERVAL_S` / `NOC_CASE_VERIFICATION_REQUIRED_CONSECUTIVE_PASSES`
   - `NOC_DISK_ALERT_HANDOFF_ENABLED`
   - `NOC_LHP_CALLBACK_MAX_BYTES` / `NOC_LHP_ENGINEERING_SECRET` (secret value is not exposed through settings)
+  - rollout validation/eval documentation: `docs/lhp-v1-rollout-validation.md` and `evals/lhp_v1/`
+  - LHP metrics: `noc_agent_lhp_*` counters on `GET /metrics`
 - `NOC_DATABASE_URL` / `DATABASE_URL` (optional Postgres case/checkpoint backend DSN)
 - `NOC_REQUIRE_POSTGRES` (default `0`; fail loud if Postgres is required but unavailable)
 - `NOC_DATABASE_POOL_MIN_SIZE` / `NOC_DATABASE_POOL_MAX_SIZE`

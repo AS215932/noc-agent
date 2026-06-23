@@ -781,6 +781,8 @@ Complete when:
 
 
 
+
+
 <!-- pi-plan-progress:start -->
 ## Progress
 
@@ -793,6 +795,6 @@ Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` p
 - [x] 5. Add the dedicated NOC verification scheduler. _(done)_
 - [x] 6. Add Knowledge pre-context and post-resolution artifact pr... _(done)_
 - [x] 7. Add production rollout config for NOC, Engineering Loop, ... _(done)_
-- [>] 8. Add evals, tests, metrics, docs, and rollout validation. _(deferred: follow-up after production apply and live LHP smoke validation)_
+- [x] 8. Add evals, tests, metrics, docs, and rollout validation. _(done)_
 
 <!-- pi-plan-progress:end -->
