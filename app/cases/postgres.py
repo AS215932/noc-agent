@@ -304,10 +304,19 @@ class PostgresCaseStore:
             row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1", case_id)
         return _case_from_payload(_row_payload(row)) if row else None
 
-    async def list_cases(self, *, kind: str | None = None, limit: int = 100) -> list[CaseProjection]:
+    async def list_cases(self, *, kind: str | None = None, status: str | None = None, limit: int = 100) -> list[CaseProjection]:
         async with self.pool.acquire() as conn:
-            if kind:
+            if kind and status:
+                rows = await conn.fetch(
+                    "SELECT payload FROM cases WHERE kind = $1 AND status = $2 ORDER BY updated_at DESC LIMIT $3",
+                    kind,
+                    status,
+                    limit,
+                )
+            elif kind:
                 rows = await conn.fetch("SELECT payload FROM cases WHERE kind = $1 ORDER BY updated_at DESC LIMIT $2", kind, limit)
+            elif status:
+                rows = await conn.fetch("SELECT payload FROM cases WHERE status = $1 ORDER BY updated_at DESC LIMIT $2", status, limit)
             else:
                 rows = await conn.fetch("SELECT payload FROM cases ORDER BY updated_at DESC LIMIT $1", limit)
         return [_case_from_payload(_row_payload(row)) for row in rows]
@@ -973,6 +982,35 @@ class PostgresCaseStore:
                 json.dumps(payload),
                 artifact.schema_version,
             )
+            if event is not None:
+                await _insert_case_event(conn, event)
+        return KnowledgeArtifact.model_validate(_row_payload(row))
+
+    async def update_knowledge_artifact(
+        self, artifact: KnowledgeArtifact, *, event: CaseEvent | None = None
+    ) -> KnowledgeArtifact:
+        payload = artifact.model_dump(mode="json")
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE knowledge_artifacts SET
+                    status = $2,
+                    review_status = $3,
+                    content_hash = $4,
+                    payload = $5::jsonb,
+                    schema_version = $6
+                WHERE artifact_id = $1
+                RETURNING payload
+                """,
+                artifact.artifact_id,
+                artifact.status,
+                artifact.review_status,
+                artifact.content_hash,
+                json.dumps(payload),
+                artifact.schema_version,
+            )
+            if row is None:
+                raise KeyError(f"knowledge artifact not found: {artifact.artifact_id}")
             if event is not None:
                 await _insert_case_event(conn, event)
         return KnowledgeArtifact.model_validate(_row_payload(row))
