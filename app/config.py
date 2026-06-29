@@ -16,6 +16,7 @@ DEFAULT_CONFIG_PATHS = (
     Path(__file__).resolve().parent.parent / "config" / "noc-agent.toml",
 )
 LHP_ENGINEERING_SECRET_ENV = "NOC_LHP_ENGINEERING_SECRET"
+LOOP_CONSOLE_SECRET_ENV = "NOC_LOOP_CONSOLE_SECRET"
 
 load_dotenv()
 

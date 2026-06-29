@@ -103,7 +103,7 @@ class CaseStore(Protocol):
 
     async def get_case(self, case_id: str) -> CaseProjection | None: ...
 
-    async def list_cases(self, *, kind: str | None = None, limit: int = 100) -> list[CaseProjection]: ...
+    async def list_cases(self, *, kind: str | None = None, status: str | None = None, limit: int = 100) -> list[CaseProjection]: ...
 
     async def append_event(self, event: CaseEvent) -> CaseEvent: ...
 
@@ -183,6 +183,10 @@ class CaseStore(Protocol):
     ) -> AtomicCaseProjection: ...
 
     async def record_knowledge_artifact(
+        self, artifact: KnowledgeArtifact, *, event: CaseEvent | None = None
+    ) -> KnowledgeArtifact: ...
+
+    async def update_knowledge_artifact(
         self, artifact: KnowledgeArtifact, *, event: CaseEvent | None = None
     ) -> KnowledgeArtifact: ...
 
@@ -331,11 +335,13 @@ class InMemoryCaseStore:
             case = self._cases.get(str(case_id or ""))
             return case.model_copy(deep=True) if case else None
 
-    async def list_cases(self, *, kind: str | None = None, limit: int = 100) -> list[CaseProjection]:
+    async def list_cases(self, *, kind: str | None = None, status: str | None = None, limit: int = 100) -> list[CaseProjection]:
         async with self._lock:
             cases = list(self._cases.values())
             if kind:
                 cases = [case for case in cases if case.kind == kind]
+            if status:
+                cases = [case for case in cases if str(getattr(case, "status", "")) == status]
             cases.sort(key=lambda case: getattr(case, "updated_at", getattr(case, "opened_at", "")), reverse=True)
             return [case.model_copy(deep=True) for case in cases[: max(0, limit)]]
 
@@ -788,6 +794,20 @@ class InMemoryCaseStore:
             stored = artifact.model_copy(deep=True)
             self._knowledge_artifacts[stored.artifact_id] = stored
             self._knowledge_artifact_index[key] = stored.artifact_id
+            if event is not None:
+                self._store_event_locked(event)
+            return stored.model_copy(deep=True)
+
+    async def update_knowledge_artifact(
+        self, artifact: KnowledgeArtifact, *, event: CaseEvent | None = None
+    ) -> KnowledgeArtifact:
+        async with self._lock:
+            if artifact.artifact_id not in self._knowledge_artifacts:
+                raise KeyError(f"knowledge artifact not found: {artifact.artifact_id}")
+            self._require_atomic_case_locked(artifact.case_id)
+            stored = artifact.model_copy(deep=True)
+            self._knowledge_artifacts[stored.artifact_id] = stored
+            self._knowledge_artifact_index[(stored.case_id, stored.artifact_type, stored.version)] = stored.artifact_id
             if event is not None:
                 self._store_event_locked(event)
             return stored.model_copy(deep=True)

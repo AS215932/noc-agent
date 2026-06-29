@@ -34,7 +34,7 @@ from app.model_metrics import (
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
-from app.config import LHP_ENGINEERING_SECRET_ENV, load_loop_handoff_settings, load_proactive_settings
+from app.config import LOOP_CONSOLE_SECRET_ENV, LHP_ENGINEERING_SECRET_ENV, load_loop_handoff_settings, load_proactive_settings
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.cases.lhp import CallbackInboxRecord, HandoffUpdate, assert_lhp_payload_size, lhp_payload_hash, verify_loop_signature
 from app.proactive.loop import ProactiveLoop
@@ -888,25 +888,27 @@ async def _write_case_service_operator_feedback(
     comment: str = "",
     payload: dict | None = None,
     submitted_identifier: str = "",
+    feedback_id: str = "",
 ):
     from app.cases.models import OperatorFeedback
 
     rendered_comment = _safe_monitor_text(comment, limit=1000)
-    feedback = await case_service_runtime.service.record_operator_feedback(
-        OperatorFeedback(
-            case_id=case.case_id,
-            actor_id=_safe_monitor_token(operator or "unknown", limit=120),
-            actor_role="operator",
-            feedback_type=feedback_type,
-            payload={
-                **_safe_case_service_feedback_payload(payload or {}),
-                "comment": rendered_comment,
-                "submitted_identifier": _safe_monitor_token(submitted_identifier or case.case_id, limit=128),
-                "untrusted_operator_text": True,
-                "model_consumption_allowed": False,
-            },
-        )
-    )
+    feedback_payload = {
+        "case_id": case.case_id,
+        "actor_id": _safe_monitor_token(operator or "unknown", limit=120),
+        "actor_role": "operator",
+        "feedback_type": feedback_type,
+        "payload": {
+            **_safe_case_service_feedback_payload(payload or {}),
+            "comment": rendered_comment,
+            "submitted_identifier": _safe_monitor_token(submitted_identifier or case.case_id, limit=128),
+            "untrusted_operator_text": True,
+            "model_consumption_allowed": False,
+        },
+    }
+    if feedback_id:
+        feedback_payload["feedback_id"] = feedback_id
+    feedback = await case_service_runtime.service.record_operator_feedback(OperatorFeedback(**feedback_payload))
     log.info("case_service_operator_feedback_recorded", case_id=case.case_id, feedback_type=feedback_type)
     return feedback
 
@@ -1376,7 +1378,7 @@ async def _case_service_control_decision_response(case, request_body) -> dict[st
     return {"status": "ok", "incident": summary or _case_service_control_summary(updated)}
 
 
-async def _apply_case_service_primary_decision_state(case, request_body, graph_summary: dict | None):
+async def _apply_case_service_primary_decision_state(case, request_body, graph_summary: dict | None, event_id: str = ""):
     if request_body.decision not in {"approved", "rejected"}:
         return case
     if getattr(case, "kind", "") != "atomic":
@@ -1400,18 +1402,19 @@ async def _apply_case_service_primary_decision_state(case, request_body, graph_s
     diagnosis["decision_status"] = _safe_monitor_token(summary_status, limit=64)
     case.last_diagnosis = diagnosis
     case = await case_service_runtime.store.upsert_case(case)
-    await case_service_runtime.store.append_event(
-        CaseEvent(
-            case_id=case.case_id,
-            event_type="operator_decision_recorded",
-            actor_type="operator",
-            actor_id=_safe_monitor_token(request_body.operator, limit=120),
-            payload={
-                "decision": _safe_monitor_token(request_body.decision, limit=32),
-                "summary_status": _safe_monitor_token(summary_status, limit=64),
-            },
-        )
-    )
+    event_payload = {
+        "case_id": case.case_id,
+        "event_type": "operator_decision_recorded",
+        "actor_type": "operator",
+        "actor_id": _safe_monitor_token(request_body.operator, limit=120),
+        "payload": {
+            "decision": _safe_monitor_token(request_body.decision, limit=32),
+            "summary_status": _safe_monitor_token(summary_status, limit=64),
+        },
+    }
+    if event_id:
+        event_payload["event_id"] = event_id
+    await case_service_runtime.store.append_event(CaseEvent(**event_payload))
     return case
 
 
@@ -1586,6 +1589,53 @@ class FastStatusRequest(BaseModel):
     target: str
     qualifiers: dict[str, str] = Field(default_factory=dict)
 
+
+class LoopConsoleBaseRequest(BaseModel):
+    actor_id: str = "observatory"
+    idempotency_key: str
+    payload: dict[str, object] = Field(default_factory=dict)
+
+
+class LoopConsoleFeedbackRequest(LoopConsoleBaseRequest):
+    feedback_type: str = "operator_note"
+    comment: str = ""
+
+
+class LoopConsoleAckRequest(LoopConsoleBaseRequest):
+    pass
+
+
+class LoopConsoleSuppressRequest(LoopConsoleBaseRequest):
+    reason: str
+    ttl_seconds: int | None = Field(default=None, ge=0)
+
+
+class LoopConsoleDecisionRequest(LoopConsoleBaseRequest):
+    decision: str = Field(pattern="^(approved|rejected|acknowledged)$")
+    comment: str = ""
+
+
+class LoopConsoleKnowledgeContextRequest(LoopConsoleBaseRequest):
+    handoff_id: str = ""
+    objective_key: str = ""
+
+
+class LoopConsoleKnowledgeArtifactProposalRequest(LoopConsoleBaseRequest):
+    handoff_id: str = ""
+    outcome_id: str = ""
+
+
+class LoopConsoleKnowledgeArtifactReviewRequest(LoopConsoleBaseRequest):
+    review_status: str = Field(pattern="^(pending|approved|rejected|superseded|deprecated|published)$")
+    comment: str = ""
+
+
+class LoopConsoleVerificationResultRequest(LoopConsoleBaseRequest):
+    status: str = Field(pattern="^(pending|pass|fail|unknown|skipped)$")
+    evidence_ref: str = ""
+    failure_reason: str = ""
+
+
 @app.post("/task", response_model=MailPollResponse)
 async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
     """Run an arbitrary task on the NOC Triage agent (e.g. 'Draft email to LocIX')."""
@@ -1717,6 +1767,325 @@ async def control_case_service_outbox(
         "status": "ok",
         "backend": type(runtime.store).__name__,
         "outbox": [row.model_dump(mode="json") for row in rows],
+    }
+
+
+@app.get("/loop-console/v1/health")
+async def loop_console_health(request: Request):
+    _require_loop_console_request(request, body={})
+    if case_service_runtime is None:
+        return {"status": "disabled", "enabled": False}
+    return {
+        "status": "ok",
+        "enabled": True,
+        "backend": type(case_service_runtime.store).__name__,
+        "schema_version": "loop-console.v1",
+    }
+
+
+@app.get("/loop-console/v1/cases")
+async def loop_console_cases(
+    request: Request,
+    kind: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    safe_kind = _validated_case_service_kind(kind)
+    cases = await runtime.store.list_cases(kind=safe_kind, status=status_filter, limit=limit)
+    return {
+        "status": "ok",
+        "schema_version": "loop-console.v1",
+        "cases": [_case_service_case_summary(case) for case in cases],
+    }
+
+
+@app.get("/loop-console/v1/cases/{case_id}")
+async def loop_console_case_detail(case_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    case = await _loop_console_case(case_id)
+    canonical_case_id = case.case_id
+    events = await runtime.store.case_events(canonical_case_id)
+    traces = await runtime.store.list_traces(case_id=canonical_case_id)
+    feedback = await runtime.store.list_feedback(case_id=canonical_case_id)
+    handoffs = await runtime.service.list_lhp_handoffs(case_id=canonical_case_id)
+    objectives = await runtime.service.list_lhp_verification_objectives(case_id=canonical_case_id)
+    artifacts = await runtime.service.list_lhp_knowledge_artifacts(case_id=canonical_case_id)
+    outcomes = await runtime.service.list_lhp_outcomes(case_id=canonical_case_id)
+    return {
+        "status": "ok",
+        "schema_version": "loop-console.v1",
+        "case": case.model_dump(mode="json"),
+        "summary": _case_service_case_summary(case),
+        "timeline": _case_service_control_timeline(events, feedback),
+        "events": [event.model_dump(mode="json") for event in events],
+        "traces": [trace.model_dump(mode="json") for trace in traces],
+        "feedback": [item.model_dump(mode="json") for item in feedback],
+        "handoffs": [item.model_dump(mode="json") for item in handoffs],
+        "verification_objectives": [item.model_dump(mode="json") for item in objectives],
+        "knowledge_artifacts": [item.model_dump(mode="json") for item in artifacts],
+        "outcomes": [item.model_dump(mode="json") for item in outcomes],
+    }
+
+
+@app.get("/loop-console/v1/cases/{case_id}/timeline")
+async def loop_console_case_timeline(case_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    case = await _loop_console_case(case_id)
+    events = await runtime.store.case_events(case.case_id)
+    feedback = await runtime.store.list_feedback(case_id=case.case_id)
+    return {"status": "ok", "case_id": case.case_id, "timeline": _case_service_control_timeline(events, feedback)}
+
+
+@app.get("/loop-console/v1/cases/{case_id}/handoffs")
+async def loop_console_case_handoffs(case_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    case = await _loop_console_case(case_id)
+    rows = await runtime.service.list_lhp_handoffs(case_id=case.case_id)
+    return {"status": "ok", "case_id": case.case_id, "handoffs": [row.model_dump(mode="json") for row in rows]}
+
+
+@app.get("/loop-console/v1/cases/{case_id}/verification-objectives")
+async def loop_console_case_verification_objectives(case_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    case = await _loop_console_case(case_id)
+    rows = await runtime.service.list_lhp_verification_objectives(case_id=case.case_id)
+    return {
+        "status": "ok",
+        "case_id": case.case_id,
+        "verification_objectives": [row.model_dump(mode="json") for row in rows],
+    }
+
+
+@app.get("/loop-console/v1/cases/{case_id}/knowledge-artifacts")
+async def loop_console_case_knowledge_artifacts(case_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    case = await _loop_console_case(case_id)
+    rows = await runtime.service.list_lhp_knowledge_artifacts(case_id=case.case_id)
+    return {"status": "ok", "case_id": case.case_id, "knowledge_artifacts": [row.model_dump(mode="json") for row in rows]}
+
+
+@app.get("/loop-console/v1/cases/{case_id}/outcomes")
+async def loop_console_case_outcomes(case_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    case = await _loop_console_case(case_id)
+    rows = await runtime.service.list_lhp_outcomes(case_id=case.case_id)
+    return {"status": "ok", "case_id": case.case_id, "outcomes": [row.model_dump(mode="json") for row in rows]}
+
+
+@app.get("/loop-console/v1/outbox")
+async def loop_console_outbox(
+    request: Request,
+    outbox_status: str | None = Query(default=None, alias="status"),
+):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    safe_status = _validated_case_service_outbox_status(outbox_status)
+    rows = await runtime.store.list_outbox(status=safe_status)
+    return {"status": "ok", "outbox": [row.model_dump(mode="json") for row in rows]}
+
+
+@app.post("/loop-console/v1/cases/{case_id}/feedback")
+async def loop_console_case_feedback(case_id: str, request_body: LoopConsoleFeedbackRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    case = await _loop_console_atomic_case(case_id)
+    feedback_id = _loop_console_feedback_id("feedback", request_body.idempotency_key, case.case_id)
+    try:
+        feedback = await _write_case_service_operator_feedback(
+            case,
+            operator=request_body.actor_id,
+            feedback_type=request_body.feedback_type,
+            comment=request_body.comment,
+            payload={"source": "loop_console", **dict(request_body.payload)},
+            submitted_identifier=case_id,
+            feedback_id=feedback_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid feedback payload") from exc
+    return {"status": "ok", "case_id": case.case_id, "feedback": feedback.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/cases/{case_id}/ack")
+async def loop_console_case_ack(case_id: str, request_body: LoopConsoleAckRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    case = await _loop_console_atomic_case(case_id)
+    event_id = _loop_console_action_id("ack", request_body.idempotency_key, case.case_id)
+    if await _loop_console_has_event(case.case_id, event_id):
+        updated = case
+    else:
+        updated = await case_service_runtime.service.ack(
+            case.case_id,
+            operator=_safe_monitor_token(request_body.actor_id, limit=120),
+            event_id=event_id,
+        )
+    return {"status": "ok", "case": updated.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/cases/{case_id}/suppress")
+async def loop_console_case_suppress(case_id: str, request_body: LoopConsoleSuppressRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    case = await _loop_console_atomic_case(case_id)
+    event_id = _loop_console_action_id("suppress", request_body.idempotency_key, case.case_id)
+    if await _loop_console_has_event(case.case_id, event_id):
+        updated = case
+    else:
+        updated = await case_service_runtime.service.suppress(
+            case.case_id,
+            reason=_safe_monitor_text(request_body.reason, limit=800),
+            source="operator",
+            operator=_safe_monitor_token(request_body.actor_id, limit=120),
+            ttl_seconds=request_body.ttl_seconds,
+            event_id=event_id,
+        )
+    return {"status": "ok", "case": updated.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/cases/{case_id}/decision")
+async def loop_console_case_decision(case_id: str, request_body: LoopConsoleDecisionRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    case = await _loop_console_atomic_case(case_id)
+    event_id = _loop_console_action_id("decision", request_body.idempotency_key, case.case_id)
+    local = LocalDecisionRequest(
+        decision=request_body.decision,
+        operator=request_body.actor_id,
+        comment=request_body.comment,
+    )
+    if await _loop_console_has_event(case.case_id, event_id):
+        updated = case
+        summary = _case_service_control_summary(case)
+    elif request_body.decision == "acknowledged":
+        updated = await case_service_runtime.service.ack(
+            case.case_id,
+            operator=_safe_monitor_token(request_body.actor_id, limit=120),
+            event_id=event_id,
+        )
+        summary = _case_service_control_summary(updated)
+    else:
+        summary = await _record_case_service_primary_decision(case, local)
+        updated = await _apply_case_service_primary_decision_state(case, local, summary, event_id=event_id)
+    feedback_id = _loop_console_feedback_id("decision", request_body.idempotency_key, updated.case_id)
+    await _write_case_service_operator_feedback(
+        updated,
+        operator=request_body.actor_id,
+        feedback_type=_feedback_type_for_decision(request_body.decision),
+        comment=request_body.comment,
+        payload={"source": "loop_console", "decision": request_body.decision},
+        submitted_identifier=case_id,
+        feedback_id=feedback_id,
+    )
+    return {"status": "ok", "case": updated.model_dump(mode="json"), "summary": summary}
+
+
+@app.post("/loop-console/v1/cases/{case_id}/knowledge-context-requests")
+async def loop_console_knowledge_context_request(case_id: str, request_body: LoopConsoleKnowledgeContextRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    case = await _loop_console_atomic_case(case_id)
+    intent = await case_service_runtime.service.request_lhp_knowledge_context(
+        case.case_id,
+        handoff_id=request_body.handoff_id,
+        objective_key=request_body.objective_key,
+        payload={"source": "loop_console", "actor_id": request_body.actor_id, **dict(request_body.payload)},
+    )
+    return {"status": "ok", "outbox": intent.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/cases/{case_id}/knowledge-artifact-proposals")
+async def loop_console_knowledge_artifact_proposal(case_id: str, request_body: LoopConsoleKnowledgeArtifactProposalRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    case = await _loop_console_atomic_case(case_id)
+    intent = await case_service_runtime.service.request_lhp_knowledge_artifact_proposal(
+        case.case_id,
+        handoff_id=request_body.handoff_id,
+        outcome_id=request_body.outcome_id,
+        payload={"source": "loop_console", "actor_id": request_body.actor_id, **dict(request_body.payload)},
+    )
+    return {"status": "ok", "outbox": intent.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/knowledge-artifacts/{artifact_id}/review")
+async def loop_console_knowledge_artifact_review(artifact_id: str, request_body: LoopConsoleKnowledgeArtifactReviewRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    event_id = _loop_console_action_id("knowledge_artifact_review", request_body.idempotency_key, artifact_id)
+    try:
+        artifact = await case_service_runtime.service.review_lhp_knowledge_artifact(
+            artifact_id,
+            review_status=request_body.review_status,
+            actor_id=_safe_monitor_token(request_body.actor_id, limit=120),
+            comment=_safe_monitor_text(request_body.comment, limit=800),
+            event_id=event_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Knowledge artifact not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid review status") from exc
+    return {"status": "ok", "artifact": artifact.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/verification-objectives/{objective_id}/result")
+async def loop_console_verification_result(objective_id: str, request_body: LoopConsoleVerificationResultRequest, request: Request):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    runtime = _require_case_service_runtime()
+    objectives = await runtime.service.list_lhp_verification_objectives()
+    objective = next((item for item in objectives if item.objective_id == objective_id), None)
+    if objective is None:
+        raise HTTPException(status_code=404, detail="Verification objective not found")
+    event_id = _loop_console_action_id("verification_result", request_body.idempotency_key, objective_id)
+    if not await _loop_console_has_event(objective.case_id, event_id):
+        objective.evidence_ref = _safe_monitor_token(request_body.evidence_ref, limit=180) if request_body.evidence_ref else ""
+        objective.failure_reason = _safe_monitor_text(request_body.failure_reason, limit=800)
+        if request_body.status == "pass":
+            objective.consecutive_pass_count += 1
+            objective.status = "pass" if objective.consecutive_pass_count >= objective.required_consecutive_passes else "pending"
+        else:
+            objective.consecutive_pass_count = 0
+            objective.status = request_body.status
+        objective.payload.update({"source": "loop_console", "actor_id": request_body.actor_id, **dict(request_body.payload)})
+        objective = await runtime.service.record_lhp_verification_result(objective, event_id=event_id)
+    return {"status": "ok", "verification_objective": objective.model_dump(mode="json")}
+
+
+@app.post("/loop-console/v1/handoffs/{handoff_id}/updates")
+async def loop_console_handoff_update(handoff_id: str, request: Request):
+    raw = await request.body()
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Invalid JSON callback payload") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Handoff update payload must be an object")
+    assert_lhp_payload_size(body, max_bytes=load_loop_handoff_settings().callback_max_bytes)
+    _require_loop_console_request(request, body=body)
+    try:
+        request_body = HandoffUpdate.model_validate(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid LHP handoff update payload") from exc
+    if request_body.handoff_id != handoff_id:
+        raise HTTPException(status_code=422, detail="handoff_id path/body mismatch")
+    try:
+        result = await case_service_runtime.service.record_lhp_handoff_update(request_body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid LHP handoff transition") from exc
+    return {
+        "status": "ok",
+        "created": result.created,
+        "handoff": result.handoff.model_dump(mode="json"),
+        "case": result.case.model_dump(mode="json"),
+        "update": result.update.model_dump(mode="json"),
     }
 
 
@@ -2284,6 +2653,64 @@ def _require_control_request(request: Request, token: str | None = None, header_
     bearer = auth.removeprefix("Bearer ").strip() if auth.lower().startswith("bearer ") else ""
     header_value = header_value if isinstance(header_value, str) else None
     _require_control_token(header_value or request.headers.get("x-noc-control-token") or bearer or token)
+
+
+def _loop_console_action_id(action: str, idempotency_key: str, target_id: str) -> str:
+    digest = hashlib.sha256(f"{action}:{target_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:16]
+    return f"evt_loop_console_{digest}"
+
+
+def _loop_console_feedback_id(action: str, idempotency_key: str, target_id: str) -> str:
+    digest = hashlib.sha256(f"{action}:{target_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:16]
+    return f"fb_loop_console_{digest}"
+
+
+async def _loop_console_has_event(case_id: str, event_id: str) -> bool:
+    runtime = _require_case_service_runtime()
+    return any(event.event_id == event_id for event in await runtime.store.case_events(case_id))
+
+
+def _require_loop_console_request(request: Request, *, body: dict) -> None:
+    secret = os.getenv(LOOP_CONSOLE_SECRET_ENV, "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Loop Console shared secret is not configured")
+    identity = request.headers.get("x-noc-loop-identity", "").strip()
+    if identity != "observatory":
+        raise HTTPException(status_code=401, detail="Invalid loop console identity")
+    timestamp = request.headers.get("x-noc-loop-timestamp", "").strip()
+    if not _lhp_timestamp_fresh(timestamp):
+        raise HTTPException(status_code=401, detail="Invalid loop console timestamp")
+    signature = request.headers.get("x-noc-loop-signature")
+    if not verify_loop_signature(
+        secret=secret,
+        method=request.method,
+        path=request.url.path,
+        timestamp=timestamp,
+        body=body,
+        signature=signature,
+    ):
+        raise HTTPException(status_code=401, detail="Invalid loop console signature")
+
+
+def _loop_console_signed_body(model: BaseModel) -> dict:
+    body = model.model_dump(mode="json")
+    assert_lhp_payload_size(body, max_bytes=load_loop_handoff_settings().callback_max_bytes)
+    return body
+
+
+async def _loop_console_case(case_id: str):
+    _require_case_service_runtime()
+    case = await _case_service_case_for_identifier(case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return case
+
+
+async def _loop_console_atomic_case(case_id: str):
+    case = await _loop_console_case(case_id)
+    if getattr(case, "kind", "") != "atomic":
+        raise HTTPException(status_code=409, detail="Loop Console action requires an atomic case")
+    return case
 
 
 def _require_lhp_loop_request(request: Request, *, body: dict) -> None:

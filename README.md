@@ -386,6 +386,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_DATABASE_COMMAND_TIMEOUT_S` / `NOC_DATABASE_STATEMENT_TIMEOUT_MS` / `NOC_DATABASE_LOCK_TIMEOUT_MS`
 - `HYRULE_MCP_URL`
 - `NOC_CONTROL_TOKEN`
+- `NOC_LOOP_CONSOLE_SECRET` (HMAC secret for internal `/loop-console/v1/*` CaseService API calls)
 - `NOC_APPROVAL_SIGNING_SECRET` (also accepts `HYRULE_MCP_ACTION_SIGNING_SECRET`)
 - `NOC_ENABLE_APPROVED_EXECUTION` (default `0`; master switch for any execution)
 - `NOC_ENABLE_NOOP_ROLLBACK_GUARDS` (default `0`; route execution through inert no-op guards)

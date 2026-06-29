@@ -277,7 +277,7 @@ class CaseService:
         )
         return case
 
-    async def ack(self, case_id: str, *, operator: str) -> AtomicCaseProjection:
+    async def ack(self, case_id: str, *, operator: str, event_id: str = "") -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)
         now = utc_now()
         case.acknowledged_by = operator
@@ -285,16 +285,17 @@ class CaseService:
         case.updated_at = now
         case.policy_version = self.policy.policy_version
         case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
-        await self.store.append_event(
-            CaseEvent(
-                case_id=case.case_id,
-                event_type="case_acknowledged",
-                actor_type="operator",
-                actor_id=operator,
-                policy_version=self.policy.policy_version,
-                payload={},
-            )
-        )
+        event_payload: dict[str, Any] = {
+            "case_id": case.case_id,
+            "event_type": "case_acknowledged",
+            "actor_type": "operator",
+            "actor_id": operator,
+            "policy_version": self.policy.policy_version,
+            "payload": {},
+        }
+        if event_id:
+            event_payload["event_id"] = event_id
+        await self.store.append_event(CaseEvent(**event_payload))
         return case
 
     async def suppress(
@@ -305,6 +306,7 @@ class CaseService:
         source: Literal["operator", "agent"],
         operator: str = "",
         ttl_seconds: int | None = None,
+        event_id: str = "",
     ) -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)
         now = datetime.now(timezone.utc)
@@ -317,16 +319,17 @@ class CaseService:
         case.updated_at = now.isoformat()
         case.policy_version = self.policy.policy_version
         case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
-        await self.store.append_event(
-            CaseEvent(
-                case_id=case.case_id,
-                event_type="case_suppressed",
-                actor_type="operator" if source == "operator" else "system",
-                actor_id=operator,
-                policy_version=self.policy.policy_version,
-                payload={"reason": reason, "source": source, "suppressed_until": case.suppressed_until},
-            )
-        )
+        event_payload: dict[str, Any] = {
+            "case_id": case.case_id,
+            "event_type": "case_suppressed",
+            "actor_type": "operator" if source == "operator" else "system",
+            "actor_id": operator,
+            "policy_version": self.policy.policy_version,
+            "payload": {"reason": reason, "source": source, "suppressed_until": case.suppressed_until},
+        }
+        if event_id:
+            event_payload["event_id"] = event_id
+        await self.store.append_event(CaseEvent(**event_payload))
         return case
 
     async def expire_suppression(self, case_id: str, *, now: datetime | None = None) -> AtomicCaseProjection:
@@ -564,19 +567,24 @@ class CaseService:
         )
         return await self.store.upsert_verification_objective(objective, event=event)
 
-    async def record_lhp_verification_result(self, objective: VerificationObjective) -> VerificationObjective:
-        event = CaseEvent(
-            case_id=objective.case_id,
-            event_type="lhp_verification_objective_updated",
-            actor_type="system",
-            policy_version=self.policy.policy_version,
-            payload={
+    async def record_lhp_verification_result(
+        self, objective: VerificationObjective, *, event_id: str = ""
+    ) -> VerificationObjective:
+        event_payload: dict[str, Any] = {
+            "case_id": objective.case_id,
+            "event_type": "lhp_verification_objective_updated",
+            "actor_type": "system",
+            "policy_version": self.policy.policy_version,
+            "payload": {
                 "objective_id": objective.objective_id,
                 "objective_key": objective.objective_key,
                 "status": objective.status,
                 "consecutive_pass_count": objective.consecutive_pass_count,
             },
-        )
+        }
+        if event_id:
+            event_payload["event_id"] = event_id
+        event = CaseEvent(**event_payload)
         updated = await self.store.update_verification_objective_result(objective, event=event)
         record_lhp_verification_result(objective_type=updated.objective_type, status=updated.status)
         return updated
@@ -626,6 +634,58 @@ class CaseService:
     async def list_lhp_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]:
         return await self.store.list_knowledge_artifacts(case_id=case_id)
 
+    async def review_lhp_knowledge_artifact(
+        self,
+        artifact_id: str,
+        *,
+        review_status: str,
+        actor_id: str,
+        comment: str = "",
+        event_id: str = "",
+    ) -> KnowledgeArtifact:
+        allowed = {"pending", "approved", "rejected", "superseded", "deprecated", "published"}
+        if review_status not in allowed:
+            raise ValueError("invalid knowledge artifact review_status")
+        artifacts = await self.store.list_knowledge_artifacts()
+        artifact = next((item for item in artifacts if item.artifact_id == artifact_id), None)
+        if artifact is None:
+            raise KeyError(f"knowledge artifact not found: {artifact_id}")
+        payload = dict(artifact.payload or {})
+        payload["review"] = sanitize_lhp_payload(
+            {
+                "actor_id": actor_id,
+                "comment": comment,
+                "review_status": review_status,
+                "policy_version": self.policy.policy_version,
+                "untrusted_operator_text": True,
+                "model_consumption_allowed": False,
+            }
+        )
+        artifact_data = artifact.model_dump(mode="json")
+        artifact_data["review_status"] = review_status
+        if review_status != "pending":
+            artifact_data["status"] = review_status
+        artifact_data["payload"] = payload
+        reviewed = KnowledgeArtifact.model_validate(artifact_data)
+        event_payload: dict[str, Any] = {
+            "case_id": reviewed.case_id,
+            "event_type": "lhp_knowledge_artifact_reviewed",
+            "actor_type": "operator",
+            "actor_id": actor_id,
+            "source": "loop_console",
+            "policy_version": self.policy.policy_version,
+            "payload": {
+                "artifact_id": reviewed.artifact_id,
+                "review_status": reviewed.review_status,
+                "comment": comment,
+                "untrusted_operator_text": True,
+                "model_consumption_allowed": False,
+            },
+        }
+        if event_id:
+            event_payload["event_id"] = event_id
+        return await self.store.update_knowledge_artifact(reviewed, event=CaseEvent(**event_payload))
+
     async def record_lhp_outcome(self, outcome: OutcomeRecord) -> OutcomeRecord:
         event = CaseEvent(
             case_id=outcome.work_item_id,
@@ -671,11 +731,12 @@ class CaseService:
         stored = await self.store.record_feedback(feedback)
         if stored.case_id:
             case = await self._require_atomic_case(stored.case_id)
-            if stored.feedback_id not in case.feedback_ids:
-                case.feedback_ids.append(stored.feedback_id)
-                case.updated_at = utc_now()
-                case.policy_version = self.policy.policy_version
-                await self.store.upsert_case(case)
+            if stored.feedback_id in case.feedback_ids:
+                return stored
+            case.feedback_ids.append(stored.feedback_id)
+            case.updated_at = utc_now()
+            case.policy_version = self.policy.policy_version
+            await self.store.upsert_case(case)
             await self.store.append_event(
                 CaseEvent(
                     case_id=case.case_id,
