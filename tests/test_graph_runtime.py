@@ -45,6 +45,12 @@ async def _case_service_graph_case(alert: dict | None = None):
 @pytest.mark.asyncio
 async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
     monkeypatch.setattr(graph_runtime, "_GRAPH", None)
+    emitted = []
+    monkeypatch.setattr(
+        graph_runtime,
+        "emit_state_trace",
+        lambda state, *, phase: emitted.append((phase, state["incident_id"])) or 0,
+    )
     graph_runtime._THREAD_GRAPHS.clear()
     _store, _service, graph_memory, graph_case = await _case_service_graph_case(_ALERT)
 
@@ -64,6 +70,7 @@ async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
     assert "perimeter_context" not in state
     assert state["perimeter_context_version"]
     assert state["manifest_hash"]
+    assert emitted == [("investigation", state["incident_id"])]
     summary = await graph_memory.get_summary(state["incident_id"])
     assert summary is not None
     assert summary["status"] == "waiting_approval"
@@ -233,7 +240,13 @@ async def test_case_service_graph_summary_cannot_resolve_case_without_operator_d
 
 
 @pytest.mark.asyncio
-async def test_record_operator_decision_updates_case_service_summary():
+async def test_record_operator_decision_updates_case_service_summary(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        graph_runtime,
+        "emit_state_trace",
+        lambda state, *, phase: emitted.append((phase, state["incident_id"])) or 0,
+    )
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(
@@ -265,6 +278,7 @@ async def test_record_operator_decision_updates_case_service_summary():
     assert stored_summary["incident_id"] == created.case.case_id
     assert stored_summary["case_number"] == created.case.case_number
     assert case.status == "resolved"
+    assert emitted == [("resume", created.case.case_id)]
 
 
 @pytest.mark.asyncio

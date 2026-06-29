@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from langgraph.types import Command
 
+from app.agent_core_trace import emit_state_trace
 from app.agents.triage import DiagnosticSynthesis
 from app.alert_utils import case_event_from_alert
 from app.deps.runtime import RuntimeDeps
@@ -106,6 +107,7 @@ async def run_investigation_graph(
             "case_context": await memory.case_context(incident_id),
         },
     )
+    emit_state_trace(result_state, phase="investigation")
     return synthesis, result_state
 
 
@@ -153,6 +155,7 @@ async def record_operator_decision(
             "verification_results": summary.get("verification_results", []),
         },
     )
+    emit_state_trace(final_state if final_state is not None else summary, phase="resume")
     return summary
 
 
