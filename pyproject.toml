@@ -21,6 +21,7 @@ dependencies = [
     "discord.py>=2.5.0",
     "pyjwt[crypto]>=2.9",
     "asyncpg>=0.30",
+    "agent-core",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +65,9 @@ ignore = ["E501"]
 [tool.mypy]
 python_version = "3.14"
 ignore_missing_imports = true
+
+[tool.uv.sources]
+agent-core = { git = "https://github.com/AS215932/agent-core", tag = "v0.4.0" }
 
 [[tool.mypy.overrides]]
 module = [

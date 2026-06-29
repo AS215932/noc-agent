@@ -19,6 +19,14 @@ wheels = [
 ]
 
 [[package]]
+name = "agent-core"
+version = "0.4.0"
+source = { git = "https://github.com/AS215932/agent-core?tag=v0.4.0#0faf25793eaa0ca4ad74382f544aa2e10d7c80db" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "aiofile"
 version = "3.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1655,6 +1663,7 @@ name = "noc-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "agent-core" },
     { name = "asyncpg" },
     { name = "discord-py" },
     { name = "fastapi" },
@@ -1693,6 +1702,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-core", git = "https://github.com/AS215932/agent-core?tag=v0.4.0" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40" },
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "discord-py", specifier = ">=2.5.0" },
