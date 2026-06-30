@@ -34,7 +34,13 @@ from app.cases.models import (
     OutboxIntent,
     TraceRecord,
 )
-from app.cases.store import CallbackClaimResult, CaseLinkResult, CaseProjection, HandoffCreateResult, HandoffUpdateResult
+from app.cases.store import (
+    CallbackClaimResult,
+    CaseLinkResult,
+    CaseProjection,
+    HandoffCreateResult,
+    HandoffUpdateResult,
+)
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
 
@@ -189,7 +195,9 @@ class PostgresCaseStore:
                         existing_case = _case_from_payload(_row_payload(existing))
                         if isinstance(existing_case, AtomicCaseProjection):
                             return existing_case, [], False
-                        raise ValueError(f"active alias {alias.alias_type}:{alias.alias_value} resolved to non-atomic case")
+                        raise ValueError(
+                            f"active alias {alias.alias_type}:{alias.alias_value} resolved to non-atomic case"
+                        )
                 if case.fingerprint:
                     existing = await conn.fetchrow(
                         """
@@ -304,7 +312,9 @@ class PostgresCaseStore:
             row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1", case_id)
         return _case_from_payload(_row_payload(row)) if row else None
 
-    async def list_cases(self, *, kind: str | None = None, status: str | None = None, limit: int = 100) -> list[CaseProjection]:
+    async def list_cases(
+        self, *, kind: str | None = None, status: str | None = None, limit: int = 100
+    ) -> list[CaseProjection]:
         async with self.pool.acquire() as conn:
             if kind and status:
                 rows = await conn.fetch(
@@ -314,9 +324,13 @@ class PostgresCaseStore:
                     limit,
                 )
             elif kind:
-                rows = await conn.fetch("SELECT payload FROM cases WHERE kind = $1 ORDER BY updated_at DESC LIMIT $2", kind, limit)
+                rows = await conn.fetch(
+                    "SELECT payload FROM cases WHERE kind = $1 ORDER BY updated_at DESC LIMIT $2", kind, limit
+                )
             elif status:
-                rows = await conn.fetch("SELECT payload FROM cases WHERE status = $1 ORDER BY updated_at DESC LIMIT $2", status, limit)
+                rows = await conn.fetch(
+                    "SELECT payload FROM cases WHERE status = $1 ORDER BY updated_at DESC LIMIT $2", status, limit
+                )
             else:
                 rows = await conn.fetch("SELECT payload FROM cases ORDER BY updated_at DESC LIMIT $1", limit)
         return [_case_from_payload(_row_payload(row)) for row in rows]
@@ -325,17 +339,40 @@ class PostgresCaseStore:
         async with self.pool.acquire() as conn:
             return await _insert_case_event(conn, event)
 
-    async def case_events(self, case_id: str) -> list[CaseEvent]:
+    async def case_events(
+        self, case_id: str, *, limit: int | None = None, newest_first: bool = False
+    ) -> list[CaseEvent]:
+        direction = "DESC" if newest_first else "ASC"
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT payload FROM case_events
-                WHERE case_id = $1 OR meta_case_id = $1
-                ORDER BY occurred_at ASC, event_id ASC
-                """,
+            if limit is not None:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT payload FROM case_events
+                    WHERE case_id = $1 OR meta_case_id = $1
+                    ORDER BY occurred_at {direction}, event_id {direction}
+                    LIMIT $2
+                    """,
+                    case_id,
+                    _bounded_limit(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT payload FROM case_events
+                    WHERE case_id = $1 OR meta_case_id = $1
+                    ORDER BY occurred_at {direction}, event_id {direction}
+                    """,
+                    case_id,
+                )
+        return [CaseEvent.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_case_events(self, case_id: str) -> int:
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT count(*) FROM case_events WHERE case_id = $1 OR meta_case_id = $1",
                 case_id,
             )
-        return [CaseEvent.model_validate(_row_payload(row)) for row in rows]
+        return int(value or 0)
 
     async def record_alias(self, alias: CaseIdentityAlias) -> CaseIdentityAlias:
         async with self.pool.acquire() as conn:
@@ -692,21 +729,71 @@ class PostgresCaseStore:
             row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1", handoff_id)
         return CaseHandoff.model_validate(_row_payload(row)) if row else None
 
-    async def list_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> list[CaseHandoff]:
+    async def list_handoffs(
+        self, *, case_id: str | None = None, status: str | None = None, limit: int | None = None
+    ) -> list[CaseHandoff]:
         async with self.pool.acquire() as conn:
             if case_id is not None and status is not None:
-                rows = await conn.fetch(
-                    "SELECT payload FROM case_handoffs WHERE case_id = $1 AND status = $2 ORDER BY updated_at DESC",
+                if limit is not None:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs WHERE case_id = $1 AND status = $2 ORDER BY updated_at DESC LIMIT $3",
+                        case_id,
+                        status,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs WHERE case_id = $1 AND status = $2 ORDER BY updated_at DESC",
+                        case_id,
+                        status,
+                    )
+            elif case_id is not None:
+                if limit is not None:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs WHERE case_id = $1 ORDER BY updated_at DESC LIMIT $2",
+                        case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs WHERE case_id = $1 ORDER BY updated_at DESC", case_id
+                    )
+            elif status is not None:
+                if limit is not None:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs WHERE status = $1 ORDER BY updated_at DESC LIMIT $2",
+                        status,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs WHERE status = $1 ORDER BY updated_at DESC", status
+                    )
+            else:
+                if limit is not None:
+                    rows = await conn.fetch(
+                        "SELECT payload FROM case_handoffs ORDER BY updated_at DESC LIMIT $1",
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch("SELECT payload FROM case_handoffs ORDER BY updated_at DESC")
+        return [CaseHandoff.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            if case_id is not None and status is not None:
+                value = await conn.fetchval(
+                    "SELECT count(*) FROM case_handoffs WHERE case_id = $1 AND status = $2",
                     case_id,
                     status,
                 )
             elif case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM case_handoffs WHERE case_id = $1 ORDER BY updated_at DESC", case_id)
+                value = await conn.fetchval("SELECT count(*) FROM case_handoffs WHERE case_id = $1", case_id)
             elif status is not None:
-                rows = await conn.fetch("SELECT payload FROM case_handoffs WHERE status = $1 ORDER BY updated_at DESC", status)
+                value = await conn.fetchval("SELECT count(*) FROM case_handoffs WHERE status = $1", status)
             else:
-                rows = await conn.fetch("SELECT payload FROM case_handoffs ORDER BY updated_at DESC")
-        return [CaseHandoff.model_validate(_row_payload(row)) for row in rows]
+                value = await conn.fetchval("SELECT count(*) FROM case_handoffs")
+        return int(value or 0)
 
     async def record_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
         return await _record_handoff_delivery(self.pool, delivery, upsert=True)
@@ -738,7 +825,9 @@ class PostgresCaseStore:
             )
             if existing_row:
                 existing_update = HandoffUpdate.model_validate(_row_payload(existing_row))
-                handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1", existing_update.handoff_id)
+                handoff_row = await conn.fetchrow(
+                    "SELECT payload FROM case_handoffs WHERE handoff_id = $1", existing_update.handoff_id
+                )
                 if not handoff_row:
                     raise KeyError(f"handoff not found: {existing_update.handoff_id}")
                 handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
@@ -747,7 +836,9 @@ class PostgresCaseStore:
                 if not isinstance(case, AtomicCaseProjection):
                     raise KeyError(f"atomic case not found: {handoff.case_id}")
                 return HandoffUpdateResult(existing_update, handoff, case, None, False)
-            handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", update.handoff_id)
+            handoff_row = await conn.fetchrow(
+                "SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", update.handoff_id
+            )
             if not handoff_row:
                 raise KeyError(f"handoff not found: {update.handoff_id}")
             handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
@@ -878,17 +969,64 @@ class PostgresCaseStore:
             )
         return [VerificationObjective.model_validate(_row_payload(row)) for row in rows]
 
-    async def list_verification_objectives(self, *, case_id: str | None = None) -> list[VerificationObjective]:
+    async def list_verification_objectives(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[VerificationObjective]:
+        direction = "DESC" if newest_first else "ASC"
         async with self.pool.acquire() as conn:
             if case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM verification_objectives WHERE case_id = $1 ORDER BY created_at", case_id)
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM verification_objectives
+                        WHERE case_id = $1
+                        ORDER BY updated_at {direction}, created_at {direction}, objective_id {direction}
+                        LIMIT $2
+                        """,
+                        case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM verification_objectives
+                        WHERE case_id = $1
+                        ORDER BY updated_at {direction}, created_at {direction}, objective_id {direction}
+                        """,
+                        case_id,
+                    )
             else:
-                rows = await conn.fetch("SELECT payload FROM verification_objectives ORDER BY created_at")
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM verification_objectives
+                        ORDER BY updated_at {direction}, created_at {direction}, objective_id {direction}
+                        LIMIT $1
+                        """,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM verification_objectives
+                        ORDER BY updated_at {direction}, created_at {direction}, objective_id {direction}
+                        """
+                    )
         return [VerificationObjective.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_verification_objectives(self, *, case_id: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                value = await conn.fetchval("SELECT count(*) FROM verification_objectives WHERE case_id = $1", case_id)
+            else:
+                value = await conn.fetchval("SELECT count(*) FROM verification_objectives")
+        return int(value or 0)
 
     async def mark_handoff_verified(self, handoff_id: str, *, now: str, event: CaseEvent | None = None) -> CaseHandoff:
         async with self.pool.acquire() as conn, conn.transaction():
-            handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id)
+            handoff_row = await conn.fetchrow(
+                "SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id
+            )
             if not handoff_row:
                 raise KeyError(f"handoff not found: {handoff_id}")
             handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
@@ -897,7 +1035,9 @@ class PostgresCaseStore:
             updated_handoff.status = "verified"
             updated_handoff.updated_at = now
             updated_handoff = await _update_case_handoff(conn, updated_handoff)
-            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", updated_handoff.case_id)
+            case_row = await conn.fetchrow(
+                "SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", updated_handoff.case_id
+            )
             case = _case_from_payload(_row_payload(case_row)) if case_row else None
             if not isinstance(case, AtomicCaseProjection):
                 raise KeyError(f"atomic case not found: {updated_handoff.case_id}")
@@ -927,7 +1067,9 @@ class PostgresCaseStore:
             if outcome.work_item_id != case.case_id:
                 raise ValueError("outcome work_item_id must match case_id")
             if handoff_id:
-                handoff_row = await conn.fetchrow("SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id)
+                handoff_row = await conn.fetchrow(
+                    "SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id
+                )
                 if not handoff_row:
                     raise KeyError(f"handoff not found: {handoff_id}")
                 handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
@@ -1015,13 +1157,55 @@ class PostgresCaseStore:
                 await _insert_case_event(conn, event)
         return KnowledgeArtifact.model_validate(_row_payload(row))
 
-    async def list_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]:
+    async def list_knowledge_artifacts(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[KnowledgeArtifact]:
+        direction = "DESC" if newest_first else "ASC"
         async with self.pool.acquire() as conn:
             if case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM knowledge_artifacts WHERE case_id = $1 ORDER BY created_at", case_id)
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM knowledge_artifacts
+                        WHERE case_id = $1
+                        ORDER BY created_at {direction}, artifact_id {direction}
+                        LIMIT $2
+                        """,
+                        case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM knowledge_artifacts
+                        WHERE case_id = $1
+                        ORDER BY created_at {direction}, artifact_id {direction}
+                        """,
+                        case_id,
+                    )
             else:
-                rows = await conn.fetch("SELECT payload FROM knowledge_artifacts ORDER BY created_at")
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM knowledge_artifacts
+                        ORDER BY created_at {direction}, artifact_id {direction}
+                        LIMIT $1
+                        """,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM knowledge_artifacts ORDER BY created_at {direction}, artifact_id {direction}"
+                    )
         return [KnowledgeArtifact.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_knowledge_artifacts(self, *, case_id: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                value = await conn.fetchval("SELECT count(*) FROM knowledge_artifacts WHERE case_id = $1", case_id)
+            else:
+                value = await conn.fetchval("SELECT count(*) FROM knowledge_artifacts")
+        return int(value or 0)
 
     async def record_outcome(self, outcome: OutcomeRecord, *, event: CaseEvent | None = None) -> OutcomeRecord:
         async with self.pool.acquire() as conn, conn.transaction():
@@ -1030,13 +1214,55 @@ class PostgresCaseStore:
                 await _insert_case_event(conn, event)
             return stored
 
-    async def list_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]:
+    async def list_outcomes(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[OutcomeRecord]:
+        direction = "DESC" if newest_first else "ASC"
         async with self.pool.acquire() as conn:
             if case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM outcome_records WHERE work_item_id = $1 ORDER BY created_at", case_id)
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM outcome_records
+                        WHERE work_item_id = $1
+                        ORDER BY created_at {direction}, outcome_id {direction}
+                        LIMIT $2
+                        """,
+                        case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM outcome_records
+                        WHERE work_item_id = $1
+                        ORDER BY created_at {direction}, outcome_id {direction}
+                        """,
+                        case_id,
+                    )
             else:
-                rows = await conn.fetch("SELECT payload FROM outcome_records ORDER BY created_at")
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM outcome_records
+                        ORDER BY created_at {direction}, outcome_id {direction}
+                        LIMIT $1
+                        """,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM outcome_records ORDER BY created_at {direction}, outcome_id {direction}"
+                    )
         return [OutcomeRecord.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_outcomes(self, *, case_id: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                value = await conn.fetchval("SELECT count(*) FROM outcome_records WHERE work_item_id = $1", case_id)
+            else:
+                value = await conn.fetchval("SELECT count(*) FROM outcome_records")
+        return int(value or 0)
 
     async def record_trace(self, trace: TraceRecord) -> TraceRecord:
         payload = trace.model_dump(mode="json")
@@ -1064,15 +1290,61 @@ class PostgresCaseStore:
             )
         return TraceRecord.model_validate(_row_payload(row))
 
-    async def list_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[TraceRecord]:
+    async def list_traces(
+        self,
+        *,
+        case_id: str | None = None,
+        meta_case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[TraceRecord]:
+        direction = "DESC" if newest_first else "ASC"
         async with self.pool.acquire() as conn:
             if case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM traces WHERE case_id = $1 ORDER BY created_at", case_id)
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM traces WHERE case_id = $1 ORDER BY created_at {direction}, trace_id {direction} LIMIT $2",
+                        case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM traces WHERE case_id = $1 ORDER BY created_at {direction}, trace_id {direction}",
+                        case_id,
+                    )
             elif meta_case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM traces WHERE meta_case_id = $1 ORDER BY created_at", meta_case_id)
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM traces WHERE meta_case_id = $1 ORDER BY created_at {direction}, trace_id {direction} LIMIT $2",
+                        meta_case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM traces WHERE meta_case_id = $1 ORDER BY created_at {direction}, trace_id {direction}",
+                        meta_case_id,
+                    )
             else:
-                rows = await conn.fetch("SELECT payload FROM traces ORDER BY created_at")
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM traces ORDER BY created_at {direction}, trace_id {direction} LIMIT $1",
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM traces ORDER BY created_at {direction}, trace_id {direction}"
+                    )
         return [TraceRecord.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                value = await conn.fetchval("SELECT count(*) FROM traces WHERE case_id = $1", case_id)
+            elif meta_case_id is not None:
+                value = await conn.fetchval("SELECT count(*) FROM traces WHERE meta_case_id = $1", meta_case_id)
+            else:
+                value = await conn.fetchval("SELECT count(*) FROM traces")
+        return int(value or 0)
 
     async def record_feedback(self, feedback: OperatorFeedback) -> OperatorFeedback:
         payload = feedback.model_dump(mode="json")
@@ -1098,17 +1370,85 @@ class PostgresCaseStore:
             )
         return OperatorFeedback.model_validate(_row_payload(row))
 
-    async def list_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[OperatorFeedback]:
+    async def list_feedback(
+        self,
+        *,
+        case_id: str | None = None,
+        meta_case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[OperatorFeedback]:
+        direction = "DESC" if newest_first else "ASC"
         async with self.pool.acquire() as conn:
             if case_id is not None:
-                rows = await conn.fetch("SELECT payload FROM operator_feedback WHERE case_id = $1 ORDER BY created_at", case_id)
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM operator_feedback
+                        WHERE case_id = $1
+                        ORDER BY created_at {direction}, feedback_id {direction}
+                        LIMIT $2
+                        """,
+                        case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM operator_feedback
+                        WHERE case_id = $1
+                        ORDER BY created_at {direction}, feedback_id {direction}
+                        """,
+                        case_id,
+                    )
             elif meta_case_id is not None:
-                rows = await conn.fetch(
-                    "SELECT payload FROM operator_feedback WHERE meta_case_id = $1 ORDER BY created_at", meta_case_id
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM operator_feedback
+                        WHERE meta_case_id = $1
+                        ORDER BY created_at {direction}, feedback_id {direction}
+                        LIMIT $2
+                        """,
+                        meta_case_id,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM operator_feedback
+                        WHERE meta_case_id = $1
+                        ORDER BY created_at {direction}, feedback_id {direction}
+                        """,
+                        meta_case_id,
+                    )
+            else:
+                if limit is not None:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT payload FROM operator_feedback
+                        ORDER BY created_at {direction}, feedback_id {direction}
+                        LIMIT $1
+                        """,
+                        _bounded_limit(limit),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        f"SELECT payload FROM operator_feedback ORDER BY created_at {direction}, feedback_id {direction}"
+                    )
+        return [OperatorFeedback.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            if case_id is not None:
+                value = await conn.fetchval("SELECT count(*) FROM operator_feedback WHERE case_id = $1", case_id)
+            elif meta_case_id is not None:
+                value = await conn.fetchval(
+                    "SELECT count(*) FROM operator_feedback WHERE meta_case_id = $1", meta_case_id
                 )
             else:
-                rows = await conn.fetch("SELECT payload FROM operator_feedback ORDER BY created_at")
-        return [OperatorFeedback.model_validate(_row_payload(row)) for row in rows]
+                value = await conn.fetchval("SELECT count(*) FROM operator_feedback")
+        return int(value or 0)
 
 
 async def _insert_case_event(conn: Any, event: CaseEvent) -> CaseEvent:
@@ -1139,7 +1479,6 @@ async def _insert_case_event(conn: Any, event: CaseEvent) -> CaseEvent:
         event.schema_version,
     )
     return CaseEvent.model_validate(_row_payload(row))
-
 
 
 async def _insert_outbox_intent(conn: Any, intent: OutboxIntent) -> OutboxIntent:
@@ -1349,7 +1688,9 @@ async def _upsert_verification_objective(conn: Any, objective: VerificationObjec
     return VerificationObjective.model_validate(_row_payload(row))
 
 
-async def _record_handoff_delivery(pool: Any, delivery: HandoffTransportDelivery, *, upsert: bool) -> HandoffTransportDelivery:
+async def _record_handoff_delivery(
+    pool: Any, delivery: HandoffTransportDelivery, *, upsert: bool
+) -> HandoffTransportDelivery:
     payload = delivery.model_dump(mode="json")
     async with pool.acquire() as conn:
         if upsert:
