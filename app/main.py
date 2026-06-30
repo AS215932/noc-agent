@@ -34,9 +34,20 @@ from app.model_metrics import (
 from app.quota import check_model_provider_credits
 from app.safe_errors import classify_exception, log_exception, safe_health_error
 from app.mcp_runtime import MCPRuntime
-from app.config import LOOP_CONSOLE_SECRET_ENV, LHP_ENGINEERING_SECRET_ENV, load_loop_handoff_settings, load_proactive_settings
+from app.config import (
+    LOOP_CONSOLE_SECRET_ENV,
+    LHP_ENGINEERING_SECRET_ENV,
+    load_loop_handoff_settings,
+    load_proactive_settings,
+)
 from app.cases.graph_memory import CaseServiceGraphMemory
-from app.cases.lhp import CallbackInboxRecord, HandoffUpdate, assert_lhp_payload_size, lhp_payload_hash, verify_loop_signature
+from app.cases.lhp import (
+    CallbackInboxRecord,
+    HandoffUpdate,
+    assert_lhp_payload_size,
+    lhp_payload_hash,
+    verify_loop_signature,
+)
 from app.proactive.loop import ProactiveLoop
 from app.alert_utils import case_display_title, case_event_from_alert
 from app.graph_runtime import record_operator_decision, run_investigation_graph
@@ -66,6 +77,7 @@ REQUIRED_CONFIG = [
     "ICINGA_API_PASSWORD",
     "MAIL_IMAP_PASSWORD",
 ]
+
 
 def _try_acquire_mail_poller_lock() -> int | None:
     os.makedirs(os.path.dirname(MAIL_POLLER_LOCK_PATH), exist_ok=True)
@@ -344,6 +356,8 @@ def _proactive_investigator(settings):
 
 
 app = FastAPI(title="AS215932 NOC Agent", lifespan=lifespan)
+LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT = 200
+LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT = 100
 
 
 class AlertManagerPayload(BaseModel):
@@ -427,7 +441,7 @@ def _is_recovery_alert(alert_payload: dict) -> bool:
 
 def _instance_host(instance: str) -> str:
     if instance.startswith("[") and "]" in instance:
-        return instance[1:instance.index("]")]
+        return instance[1 : instance.index("]")]
     if instance.count(":") == 1:
         return instance.rsplit(":", 1)[0]
     return instance
@@ -458,10 +472,10 @@ def _alert_overview(alert_payload: dict) -> str:
 def _severity_color(severity: str, requires_human: bool) -> int:
     severity = (severity or "").upper()
     if requires_human or severity in {"CRITICAL", "HIGH"}:
-        return 0xe74c3c
+        return 0xE74C3C
     if severity == "MEDIUM":
-        return 0xf39c12
-    return 0x2ecc71
+        return 0xF39C12
+    return 0x2ECC71
 
 
 def _operator_reason(plan) -> str:
@@ -485,21 +499,25 @@ def _fallback_operator_next_steps(alert_payload: dict) -> list[str]:
     steps = ["Check `/health/mcp` and the NOC agent logs to confirm diagnostic tools are connected."]
 
     if instance := labels.get("instance"):
-        steps.append(f"Run Prometheus query `up{{instance=\"{instance}\"}}` and inspect scrape errors for the target.")
+        steps.append(f'Run Prometheus query `up{{instance="{instance}"}}` and inspect scrape errors for the target.')
         host = _instance_host(instance)
         if host:
             steps.append(f"SSH to `{host}` and check `systemctl status node_exporter` plus recent journal entries.")
     elif host := labels.get("host") or labels.get("hostname"):
         steps.append(f"SSH to `{host}` and check the failing service plus host health.")
 
-    steps.append("Acknowledge or silence the alert only after confirming whether customer-impacting symptoms are present.")
+    steps.append(
+        "Acknowledge or silence the alert only after confirming whether customer-impacting symptoms are present."
+    )
     return steps
 
 
 def _diagnostic_next_steps_text(plan, alert_payload: dict) -> str:
     proposal = plan.remediation_proposal
     if proposal is not None:
-        actions = proposal.proposed_actions or plan.recommended_next_checks or _fallback_operator_next_steps(alert_payload)
+        actions = (
+            proposal.proposed_actions or plan.recommended_next_checks or _fallback_operator_next_steps(alert_payload)
+        )
         details = [
             "**Remediation proposal requires human approval**",
             f"Reason: {_operator_reason(plan)}",
@@ -607,7 +625,7 @@ async def _take_ownership_ack(alert_payload: dict, case: dict | None, runtime) -
         return  # only Icinga-sourced alerts have an Icinga object to ack
     labels = {**(alert_payload.get("commonLabels") or {}), **(alert_payload.get("groupLabels") or {})}
     host = str(labels.get("host") or labels.get("hostname") or "").strip()
-    service = (str(labels.get("service") or "").strip() or None)
+    service = str(labels.get("service") or "").strip() or None
     if not host:
         return
     case_no = (case or {}).get("case_number") or (case or {}).get("incident_id") or ""
@@ -657,7 +675,7 @@ async def investigate_alert(
         case_id=(case or {}).get("incident_id", display_title),
         title=f"⏳ {display_title}",
         description="Starting investigation and collecting telemetry.",
-        color=0xf39c12,
+        color=0xF39C12,
         level=Verbosity.INFO,
     )
 
@@ -836,7 +854,11 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
             if case is None:
                 continue
             existing_diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
-            graph_summary = existing_diagnosis.get("graph_summary") if isinstance(existing_diagnosis.get("graph_summary"), dict) else None
+            graph_summary = (
+                existing_diagnosis.get("graph_summary")
+                if isinstance(existing_diagnosis.get("graph_summary"), dict)
+                else None
+            )
             diagnosis = {
                 "source": "reactive_graph",
                 "incident_id": str(graph_state.get("incident_id") or ""),
@@ -965,10 +987,14 @@ def _case_service_proactive_primary_enabled() -> bool:
 
 
 def _case_service_graph_summary_routes_enabled() -> bool:
-    return case_service_runtime is not None and hasattr(case_service_runtime, "store") and (
-        _case_service_control_primary_enabled()
-        or _case_service_reactive_primary_enabled()
-        or _case_service_proactive_primary_enabled()
+    return (
+        case_service_runtime is not None
+        and hasattr(case_service_runtime, "store")
+        and (
+            _case_service_control_primary_enabled()
+            or _case_service_reactive_primary_enabled()
+            or _case_service_proactive_primary_enabled()
+        )
     )
 
 
@@ -1007,7 +1033,10 @@ def _case_service_control_case_payload(case, graph_summary: dict | None = None) 
         "status": _safe_monitor_token(status_value, limit=64),
         "severity": _safe_monitor_token(graph.get("severity") or getattr(case, "severity", "") or "UNKNOWN", limit=32),
         "resource_id": _safe_monitor_text(
-            graph.get("resource_id") or getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
+            graph.get("resource_id")
+            or getattr(case, "resource_id", "")
+            or getattr(case, "suspected_primary_entity", "")
+            or "",
             limit=240,
         ),
         "title": _safe_monitor_text(graph.get("title") or getattr(case, "title", "") or "", limit=240),
@@ -1020,7 +1049,9 @@ def _case_service_control_case_payload(case, graph_summary: dict | None = None) 
         "pending_approval": status_value == "waiting_approval" or graph.get("approval_state") == "waiting_approval",
         "source": "case_service",
         "diagnostic_summary": _safe_monitor_text(graph.get("title") or diagnosis.get("summary", ""), limit=1000),
-        "recommendations": [_safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])],
+        "recommendations": [
+            _safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])
+        ],
         "issue_url": _safe_monitor_text(getattr(case, "issue_url", "") or "", limit=300),
     }
 
@@ -1030,11 +1061,19 @@ def _case_service_control_summary(case, graph_summary: dict | None = None) -> di
     graph = graph_summary if isinstance(graph_summary, dict) else {}
     return {
         "incident_id": _validated_case_service_lookup_identifier(getattr(case, "case_id", "") or ""),
-        "graph_incident_id": _safe_monitor_token(graph.get("incident_id") or diagnosis.get("incident_id") or "", limit=128),
+        "graph_incident_id": _safe_monitor_token(
+            graph.get("incident_id") or diagnosis.get("incident_id") or "", limit=128
+        ),
         "case_number": _case_service_control_identifier(case),
-        "resource_id": _safe_monitor_text(graph.get("resource_id") or getattr(case, "resource_id", "") or "", limit=240),
+        "resource_id": _safe_monitor_text(
+            graph.get("resource_id") or getattr(case, "resource_id", "") or "", limit=240
+        ),
         "title": _safe_monitor_text(
-            graph.get("title") or diagnosis.get("summary") or getattr(case, "summary", "") or getattr(case, "title", "") or "",
+            graph.get("title")
+            or diagnosis.get("summary")
+            or getattr(case, "summary", "")
+            or getattr(case, "title", "")
+            or "",
             limit=1000,
         ),
         "status": _safe_monitor_token(graph.get("status") or getattr(case, "status", ""), limit=64),
@@ -1044,13 +1083,15 @@ def _case_service_control_summary(case, graph_summary: dict | None = None) -> di
         "proposals": _safe_case_service_output_value(graph.get("proposals", [])),
         "executed_actions": _safe_case_service_output_value(graph.get("executed_actions", [])),
         "verification_results": _safe_case_service_output_value(graph.get("verification_results", [])),
-        "recommendations": [_safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])],
+        "recommendations": [
+            _safe_monitor_text(item, limit=300) for item in list(getattr(case, "recommendations", []) or [])
+        ],
         "updated_at": _safe_monitor_token(graph.get("updated_at") or getattr(case, "updated_at", "") or "", limit=80),
         "source": "case_service",
     }
 
 
-def _case_service_control_event_payload(event) -> dict[str, object]:
+def _case_service_control_event_payload(event, *, include_payload: bool = True) -> dict[str, object]:
     payload = event.model_dump(mode="json")
     event_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     summary = (
@@ -1060,39 +1101,304 @@ def _case_service_control_event_payload(event) -> dict[str, object]:
         or event_payload.get("status")
         or ""
     )
-    return {
+    row = {
         "received_at": _safe_monitor_token(payload.get("occurred_at", ""), limit=80),
         "event_type": _safe_monitor_token(payload.get("event_type", ""), limit=80),
         "state": _safe_monitor_token(event_payload.get("status", ""), limit=64),
         "summary": _safe_monitor_text(summary, limit=1000),
         "operator": _safe_monitor_token(payload.get("actor_id", ""), limit=120),
         "source": _safe_monitor_token(payload.get("source", "case_service"), limit=64),
-        "payload": _safe_case_service_feedback_payload(event_payload),
     }
+    if include_payload:
+        row["payload"] = _safe_case_service_feedback_payload(event_payload)
+    return row
 
 
-def _case_service_control_feedback_event_payload(feedback) -> dict[str, object]:
+def _case_service_control_feedback_event_payload(feedback, *, include_payload: bool = True) -> dict[str, object]:
     payload = feedback.model_dump(mode="json")
     feedback_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
-    return {
+    row = {
         "received_at": _safe_monitor_token(payload.get("created_at", ""), limit=80),
         "event_type": _safe_monitor_token(payload.get("feedback_type", "operator_feedback"), limit=80),
         "state": "",
-        "summary": _safe_monitor_text(feedback_payload.get("comment") or payload.get("feedback_type") or "", limit=1000),
+        "summary": _safe_monitor_text(
+            feedback_payload.get("comment") or payload.get("feedback_type") or "", limit=1000
+        ),
         "operator": _safe_monitor_token(payload.get("actor_id", ""), limit=120),
         "source": "case_service_feedback",
-        "payload": _safe_case_service_feedback_payload(feedback_payload),
+    }
+    if include_payload:
+        row["payload"] = _safe_case_service_feedback_payload(feedback_payload)
+    return row
+
+
+def _case_service_control_timeline(
+    events,
+    feedback,
+    *,
+    include_payload: bool = True,
+    limit: int | None = None,
+    newest_first: bool = False,
+) -> list[dict[str, object]]:
+    rows = [_case_service_control_event_payload(event, include_payload=include_payload) for event in events]
+    rows.extend(
+        _case_service_control_feedback_event_payload(item, include_payload=include_payload) for item in feedback
+    )
+    sorted_rows = sorted(rows, key=lambda item: str(item.get("received_at") or ""), reverse=newest_first)
+    if limit is None:
+        return sorted_rows
+    return sorted_rows[: max(0, limit)]
+
+
+def _loop_console_token(value: object, *, limit: int = 128) -> str:
+    if value is None or str(value).strip() == "":
+        return ""
+    return _safe_monitor_token(value, limit=limit)
+
+
+def _loop_console_text(value: object, *, limit: int = 1000) -> str:
+    if value is None or str(value).strip() == "":
+        return ""
+    return _safe_monitor_text(value, limit=limit)
+
+
+def _loop_console_text_list(values: object, *, limit: int = 500, max_items: int = 20) -> list[str]:
+    if not isinstance(values, list | tuple | set):
+        values = [values] if values else []
+    return [_loop_console_text(item, limit=limit) for item in list(values)[:max_items]]
+
+
+def _loop_console_recent_time(row: dict[str, object]) -> str:
+    for key in ("updated_at", "created_at", "received_at", "last_checked_at", "next_check_at"):
+        value = str(row.get(key) or "")
+        if value:
+            return value
+    return ""
+
+
+def _loop_console_limit_rows(
+    rows: list[dict[str, object]], *, limit: int = LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT
+) -> list[dict[str, object]]:
+    return sorted(rows, key=_loop_console_recent_time, reverse=True)[: max(0, limit)]
+
+
+def _loop_console_counts(
+    *,
+    events,
+    traces,
+    feedback,
+    handoffs,
+    objectives,
+    artifacts,
+    outcomes,
+) -> dict[str, int]:
+    return {
+        "events": len(events),
+        "traces": len(traces),
+        "feedback": len(feedback),
+        "timeline": len(events) + len(feedback),
+        "handoffs": len(handoffs),
+        "verification_objectives": len(objectives),
+        "knowledge_artifacts": len(artifacts),
+        "outcomes": len(outcomes),
     }
 
 
-def _case_service_control_timeline(events, feedback) -> list[dict[str, object]]:
-    rows = [_case_service_control_event_payload(event) for event in events]
-    rows.extend(_case_service_control_feedback_event_payload(item) for item in feedback)
-    return sorted(rows, key=lambda item: str(item.get("received_at") or ""))
+def _case_service_case_detail_payload(case, *, counts: dict[str, int]) -> dict[str, object]:
+    operator_state = {
+        "acknowledged_by": _loop_console_token(getattr(case, "acknowledged_by", ""), limit=120),
+        "acknowledged_at": _loop_console_token(getattr(case, "acknowledged_at", ""), limit=80),
+        "snoozed_until": _loop_console_token(getattr(case, "snoozed_until", ""), limit=80),
+        "suppressed_until": _loop_console_token(getattr(case, "suppressed_until", ""), limit=80),
+        "suppression_reason": _loop_console_text(getattr(case, "suppression_reason", ""), limit=500),
+        "suppression_source": _loop_console_token(getattr(case, "suppression_source", ""), limit=64),
+        "investigation_status": _loop_console_token(getattr(case, "investigation_status", ""), limit=64),
+        "investigation_error": _loop_console_text(getattr(case, "investigation_error", ""), limit=700),
+        "last_investigated_at": _loop_console_token(getattr(case, "last_investigated_at", ""), limit=80),
+        "handoff_status": _loop_console_token(getattr(case, "handoff_status", ""), limit=64),
+        "last_handoff_at": _loop_console_token(getattr(case, "last_handoff_at", ""), limit=80),
+        "resolution_reason": _loop_console_text(getattr(case, "resolution_reason", ""), limit=500),
+    }
+    activity = {
+        "last_seen": _loop_console_token(getattr(case, "last_seen", ""), limit=80),
+        "last_observed_unhealthy": _loop_console_token(getattr(case, "last_observed_unhealthy", ""), limit=80),
+        "last_observed_clean": _loop_console_token(getattr(case, "last_observed_clean", ""), limit=80),
+        "last_evaluated_at": _loop_console_token(getattr(case, "last_evaluated_at", ""), limit=80),
+        "last_scan_cycle_id": _loop_console_token(getattr(case, "last_scan_cycle_id", ""), limit=128),
+        "last_reported_at": _loop_console_token(getattr(case, "last_reported_at", ""), limit=80),
+        "last_reasserted_at": _loop_console_token(getattr(case, "last_reasserted_at", ""), limit=80),
+    }
+    return {
+        "case_id": _loop_console_token(getattr(case, "case_id", ""), limit=128),
+        "case_number": _loop_console_token(getattr(case, "case_number", ""), limit=128),
+        "kind": _loop_console_token(getattr(case, "kind", ""), limit=32),
+        "status": _loop_console_token(getattr(case, "status", ""), limit=64),
+        "severity": _loop_console_token(getattr(case, "severity", ""), limit=32),
+        "title": _loop_console_text(getattr(case, "title", ""), limit=240),
+        "summary": _loop_console_text(getattr(case, "summary", ""), limit=1200),
+        "resource_id": _loop_console_text(
+            getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", ""),
+            limit=240,
+        ),
+        "origin": _loop_console_token(getattr(case, "origin", ""), limit=64),
+        "rule_id": _loop_console_token(getattr(case, "rule_id", ""), limit=128),
+        "detector": _loop_console_token(getattr(case, "detector", ""), limit=128),
+        "site": _loop_console_token(getattr(case, "site", ""), limit=128),
+        "customer": _loop_console_token(getattr(case, "customer", ""), limit=128),
+        "service": _loop_console_token(getattr(case, "service", ""), limit=128),
+        "opened_at": _loop_console_token(getattr(case, "opened_at", ""), limit=80),
+        "updated_at": _loop_console_token(getattr(case, "updated_at", ""), limit=80),
+        "resolved_at": _loop_console_token(getattr(case, "resolved_at", ""), limit=80),
+        "closed_at": _loop_console_token(getattr(case, "closed_at", ""), limit=80),
+        "issue_url": _loop_console_text(getattr(case, "issue_url", ""), limit=300),
+        "issue_id": _loop_console_token(getattr(case, "issue_id", ""), limit=128),
+        "operator_state": operator_state,
+        "activity": activity,
+        "counts": counts,
+    }
+
+
+def _case_service_trace_summary(trace) -> dict[str, object]:
+    payload = trace.model_dump(mode="json")
+    return {
+        "trace_id": _loop_console_token(payload.get("trace_id", ""), limit=128),
+        "cycle_id": _loop_console_token(payload.get("cycle_id", ""), limit=128),
+        "case_id": _loop_console_token(payload.get("case_id", ""), limit=128),
+        "meta_case_id": _loop_console_token(payload.get("meta_case_id", ""), limit=128),
+        "trace_type": _loop_console_token(payload.get("trace_type", ""), limit=80),
+        "policy_version": _loop_console_token(payload.get("policy_version", ""), limit=80),
+        "model_chain": _loop_console_text_list(payload.get("model_chain", []), limit=120, max_items=10),
+        "prompt_version": _loop_console_token(payload.get("prompt_version", ""), limit=120),
+        "knowledge_export_version": _loop_console_token(payload.get("knowledge_export_version", ""), limit=120),
+        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
+def _case_service_feedback_summary(feedback) -> dict[str, object]:
+    payload = feedback.model_dump(mode="json")
+    feedback_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    return {
+        "feedback_id": _loop_console_token(payload.get("feedback_id", ""), limit=128),
+        "case_id": _loop_console_token(payload.get("case_id", ""), limit=128),
+        "meta_case_id": _loop_console_token(payload.get("meta_case_id", ""), limit=128),
+        "trace_id": _loop_console_token(payload.get("trace_id", ""), limit=128),
+        "actor_id": _loop_console_token(payload.get("actor_id", ""), limit=120),
+        "actor_role": _loop_console_token(payload.get("actor_role", ""), limit=80),
+        "feedback_type": _loop_console_token(payload.get("feedback_type", ""), limit=80),
+        "comment": _loop_console_text(feedback_payload.get("comment", ""), limit=1000),
+        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
+def _case_service_handoff_summary(handoff) -> dict[str, object]:
+    payload = handoff.model_dump(mode="json")
+    return {
+        "handoff_id": _loop_console_token(payload.get("handoff_id", ""), limit=128),
+        "case_id": _loop_console_token(payload.get("case_id", ""), limit=128),
+        "source_loop": _loop_console_token(payload.get("source_loop", ""), limit=80),
+        "target_loop": _loop_console_token(payload.get("target_loop", ""), limit=80),
+        "objective": _loop_console_text(payload.get("objective", ""), limit=700),
+        "objective_key": _loop_console_token(payload.get("objective_key", ""), limit=128),
+        "knowledge_scope": _loop_console_text(payload.get("knowledge_scope", ""), limit=500),
+        "status": _loop_console_token(payload.get("status", ""), limit=80),
+        "owner": _loop_console_text(payload.get("owner", ""), limit=240),
+        "verifier": _loop_console_token(payload.get("verifier", ""), limit=80),
+        "resource": _safe_case_service_output_value(payload.get("resource", {}), string_limit=500),
+        "case_type": _loop_console_token(payload.get("case_type", ""), limit=128),
+        "constraints": _loop_console_text_list(payload.get("constraints", []), limit=500),
+        "acceptance_criteria": _loop_console_text_list(payload.get("acceptance_criteria", []), limit=500),
+        "knowledge_context_refs": _loop_console_text_list(payload.get("knowledge_context_refs", []), limit=300),
+        "correlation_id": _loop_console_token(payload.get("correlation_id", ""), limit=128),
+        "trace_id": _loop_console_token(payload.get("trace_id", ""), limit=128),
+        "created_by": _loop_console_text(payload.get("created_by", ""), limit=240),
+        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "updated_at": _loop_console_token(payload.get("updated_at", ""), limit=80),
+        "expires_at": _loop_console_token(payload.get("expires_at", ""), limit=80),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
+def _case_service_verification_objective_summary(objective) -> dict[str, object]:
+    payload = objective.model_dump(mode="json")
+    return {
+        "objective_id": _loop_console_token(payload.get("objective_id", ""), limit=128),
+        "case_id": _loop_console_token(payload.get("case_id", ""), limit=128),
+        "handoff_id": _loop_console_token(payload.get("handoff_id", ""), limit=128),
+        "objective_key": _loop_console_token(payload.get("objective_key", ""), limit=128),
+        "objective_type": _loop_console_token(payload.get("objective_type", ""), limit=128),
+        "name": _loop_console_text(payload.get("name", ""), limit=500),
+        "description": _loop_console_text(payload.get("description", ""), limit=800),
+        "required_status": _loop_console_token(payload.get("required_status", ""), limit=80),
+        "status": _loop_console_token(payload.get("status", ""), limit=80),
+        "required": bool(payload.get("required", True)),
+        "required_consecutive_passes": int(payload.get("required_consecutive_passes", 0) or 0),
+        "consecutive_pass_count": int(payload.get("consecutive_pass_count", 0) or 0),
+        "last_checked_at": _loop_console_token(payload.get("last_checked_at", ""), limit=80),
+        "next_check_at": _loop_console_token(payload.get("next_check_at", ""), limit=80),
+        "evidence_ref": _loop_console_token(payload.get("evidence_ref", ""), limit=180),
+        "failure_reason": _loop_console_text(payload.get("failure_reason", ""), limit=800),
+        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "updated_at": _loop_console_token(payload.get("updated_at", ""), limit=80),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
+def _case_service_knowledge_artifact_summary(artifact) -> dict[str, object]:
+    payload = artifact.model_dump(mode="json")
+    return {
+        "artifact_id": _loop_console_token(payload.get("artifact_id", ""), limit=128),
+        "case_id": _loop_console_token(payload.get("case_id", ""), limit=128),
+        "handoff_id": _loop_console_token(payload.get("handoff_id", ""), limit=128),
+        "artifact_type": _loop_console_token(payload.get("artifact_type", ""), limit=128),
+        "scope": _loop_console_text(payload.get("scope", ""), limit=500),
+        "status": _loop_console_token(payload.get("status", ""), limit=80),
+        "review_status": _loop_console_token(payload.get("review_status", ""), limit=80),
+        "version": int(payload.get("version", 0) or 0),
+        "content_hash": _loop_console_token(payload.get("content_hash", ""), limit=128),
+        "summary": _loop_console_text(payload.get("summary", ""), limit=1200),
+        "source_refs": _loop_console_text_list(payload.get("source_refs", []), limit=300),
+        "created_by": _loop_console_token(payload.get("created_by", ""), limit=80),
+        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
+def _case_service_outcome_summary(outcome) -> dict[str, object]:
+    payload = outcome.model_dump(mode="json")
+    human_review = payload.get("human_review") if isinstance(payload.get("human_review"), dict) else {}
+    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+    safety = payload.get("safety") if isinstance(payload.get("safety"), dict) else {}
+    return {
+        "outcome_id": _loop_console_token(payload.get("outcome_id", ""), limit=128),
+        "work_item_type": _loop_console_token(payload.get("work_item_type", ""), limit=80),
+        "work_item_id": _loop_console_token(payload.get("work_item_id", ""), limit=128),
+        "case_id": _loop_console_token(payload.get("work_item_id", ""), limit=128),
+        "case_type": _loop_console_token(payload.get("case_type", ""), limit=128),
+        "fingerprint": _loop_console_token(payload.get("fingerprint", ""), limit=128),
+        "agent_roles": _loop_console_text_list(payload.get("agent_roles", []), limit=80, max_items=10),
+        "proposed_action": _loop_console_text(payload.get("proposed_action", ""), limit=1200),
+        "action_taken": _loop_console_text(payload.get("action_taken", ""), limit=1200),
+        "human_review_status": _loop_console_token(
+            human_review.get("status") or human_review.get("decision") or "", limit=80
+        ),
+        "validation_status": _loop_console_token(validation.get("status") or "", limit=80),
+        "safety_status": _loop_console_token(safety.get("status") or "", limit=80),
+        "final_score": _safe_case_service_output_value(payload.get("final_score", {}), string_limit=120),
+        "evidence_refs": _loop_console_text_list(payload.get("evidence_refs", []), limit=300),
+        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "schema_version": payload.get("schema_version", ""),
+    }
 
 
 def _case_service_graph_memory_for_case(case: dict | None):
-    if case_service_runtime is None or not hasattr(case_service_runtime, "store") or not case or case.get("source") != "case_service":
+    if (
+        case_service_runtime is None
+        or not hasattr(case_service_runtime, "store")
+        or not case
+        or case.get("source") != "case_service"
+    ):
         return None
     return CaseServiceGraphMemory(case_service_runtime.store)
 
@@ -1115,7 +1421,9 @@ def _case_service_graph_case(case, alert_payload: dict) -> dict[str, object]:
         "status": _safe_monitor_token(getattr(case, "status", ""), limit=64),
         "created_at": _safe_monitor_token(getattr(case, "opened_at", ""), limit=80),
         "updated_at": _safe_monitor_token(getattr(case, "updated_at", ""), limit=80),
-        "last_event_at": _safe_monitor_token(getattr(case, "last_seen", "") or getattr(case, "updated_at", ""), limit=80),
+        "last_event_at": _safe_monitor_token(
+            getattr(case, "last_seen", "") or getattr(case, "updated_at", ""), limit=80
+        ),
         "event_count": 1,
         "latest_event": event,
         "latest_transition": None,
@@ -1240,7 +1548,9 @@ def _matching_alert_for_observation(alert_payload: dict, observation: object) ->
     if not isinstance(raw_alerts, list):
         return None
     common_labels = alert_payload.get("commonLabels") if isinstance(alert_payload.get("commonLabels"), dict) else {}
-    common_annotations = alert_payload.get("commonAnnotations") if isinstance(alert_payload.get("commonAnnotations"), dict) else {}
+    common_annotations = (
+        alert_payload.get("commonAnnotations") if isinstance(alert_payload.get("commonAnnotations"), dict) else {}
+    )
     observation_labels = getattr(observation, "labels", {}) or {}
     observation_annotations = getattr(observation, "annotations", {}) or {}
     snapshot = getattr(observation, "signal_snapshot", {}) or {}
@@ -1317,7 +1627,9 @@ async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[ob
     return results
 
 
-async def _case_service_reactive_primary_response(alert_payload: dict, background_tasks: BackgroundTasks, *, label: str) -> dict:
+async def _case_service_reactive_primary_response(
+    alert_payload: dict, background_tasks: BackgroundTasks, *, label: str
+) -> dict:
     _require_case_service_runtime()
     shadow_results = await _observe_case_service_reactive_primary(alert_payload)
     result = _case_service_primary_result(shadow_results)
@@ -1378,7 +1690,9 @@ async def _case_service_control_decision_response(case, request_body) -> dict[st
     return {"status": "ok", "incident": summary or _case_service_control_summary(updated)}
 
 
-async def _apply_case_service_primary_decision_state(case, request_body, graph_summary: dict | None, event_id: str = ""):
+async def _apply_case_service_primary_decision_state(
+    case, request_body, graph_summary: dict | None, event_id: str = ""
+):
     if request_body.decision not in {"approved", "rejected"}:
         return case
     if getattr(case, "kind", "") != "atomic":
@@ -1505,7 +1819,9 @@ def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
     name = notif.service_name or notif.check_command or "host-check"
     return {
         "source": "icinga2",
-        "status": "firing" if (notif.state_type or "").upper() == "PROBLEM" or notif.state.upper() not in {"OK", "UP"} else "resolved",
+        "status": "firing"
+        if (notif.state_type or "").upper() == "PROBLEM" or notif.state.upper() not in {"OK", "UP"}
+        else "resolved",
         "groupLabels": {
             "alertname": name,
             "host": notif.host_name,
@@ -1519,18 +1835,20 @@ def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
         "commonAnnotations": {
             "summary": notif.output or "",
         },
-        "alerts": [{
-            "labels": {
-                "alertname": name,
-                "host": notif.host_name,
-                "service": notif.service_name or "",
-                "state": notif.state,
-            },
-            "annotations": {
-                "summary": notif.output or "",
-            },
-            "status": notif.state,
-        }],
+        "alerts": [
+            {
+                "labels": {
+                    "alertname": name,
+                    "host": notif.host_name,
+                    "service": notif.service_name or "",
+                    "state": notif.state,
+                },
+                "annotations": {
+                    "summary": notif.output or "",
+                },
+                "status": notif.state,
+            }
+        ],
         "tags": notif.tags,
     }
 
@@ -1550,7 +1868,9 @@ async def icinga_webhook(payload: IcingaNotification, background_tasks: Backgrou
     """Receives Icinga2 NotificationCommand POSTs and triggers the NOC agent."""
     alert_payload = _icinga_to_alert_payload(payload)
     if _case_service_reactive_primary_enabled():
-        return await _case_service_reactive_primary_response(alert_payload, background_tasks, label="Icinga notification")
+        return await _case_service_reactive_primary_response(
+            alert_payload, background_tasks, label="Icinga notification"
+        )
     _require_case_service_reactive_primary()
 
 
@@ -1639,18 +1959,21 @@ class LoopConsoleVerificationResultRequest(LoopConsoleBaseRequest):
 @app.post("/task", response_model=MailPollResponse)
 async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
     """Run an arbitrary task on the NOC Triage agent (e.g. 'Draft email to LocIX')."""
+
     async def _run_task():
         await notify_start("Manual Task", f"Task: {request.prompt}")
         run_started = start_run("manual_task")
         try:
             result = await noc_triage_agent.run(request.prompt)
-            plan = result.data if hasattr(result, 'data') else result.output
+            plan = result.data if hasattr(result, "data") else result.output
             record_success("manual_task", run_started, result)
             await notify_finish("Manual Task", f"Task completed: {plan.incident_summary}")
         except Exception as e:
             safe = classify_exception(e)
             record_failure("manual_task", run_started, safe)
-            log_exception("manual_task_failed", e, category=safe.category, provider=safe.provider, model=safe.model_name)
+            log_exception(
+                "manual_task_failed", e, category=safe.category, provider=safe.provider, model=safe.model_name
+            )
             await notify_finish(
                 "Manual Task",
                 safe.discord_description("Manual task"),
@@ -1660,6 +1983,7 @@ async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_task)
     return {"status": "accepted", "message": "Task queued"}
+
 
 @app.get("/health")
 async def health_check():
@@ -1688,7 +2012,9 @@ async def control_ui(request: Request, token: str | None = Query(default=None)):
 
 
 @app.get("/control/cases")
-async def control_cases(request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
+async def control_cases(
+    request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)
+):
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_routes_enabled():
         return await _case_service_control_cases_response()
@@ -1696,7 +2022,12 @@ async def control_cases(request: Request, token: str | None = Query(default=None
 
 
 @app.get("/control/cases/{case_id}")
-async def control_case_detail(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
+async def control_case_detail(
+    case_id: str,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_routes_enabled():
         return await _case_service_control_case_detail_response(case_id)
@@ -1807,26 +2138,49 @@ async def loop_console_case_detail(case_id: str, request: Request):
     runtime = _require_case_service_runtime()
     case = await _loop_console_case(case_id)
     canonical_case_id = case.case_id
-    events = await runtime.store.case_events(canonical_case_id)
-    traces = await runtime.store.list_traces(case_id=canonical_case_id)
-    feedback = await runtime.store.list_feedback(case_id=canonical_case_id)
-    handoffs = await runtime.service.list_lhp_handoffs(case_id=canonical_case_id)
-    objectives = await runtime.service.list_lhp_verification_objectives(case_id=canonical_case_id)
-    artifacts = await runtime.service.list_lhp_knowledge_artifacts(case_id=canonical_case_id)
-    outcomes = await runtime.service.list_lhp_outcomes(case_id=canonical_case_id)
+    events, traces, feedback, handoffs, objectives, artifacts, outcomes = await asyncio.gather(
+        runtime.store.case_events(canonical_case_id),
+        runtime.store.list_traces(case_id=canonical_case_id),
+        runtime.store.list_feedback(case_id=canonical_case_id),
+        runtime.service.list_lhp_handoffs(case_id=canonical_case_id),
+        runtime.service.list_lhp_verification_objectives(case_id=canonical_case_id),
+        runtime.service.list_lhp_knowledge_artifacts(case_id=canonical_case_id),
+        runtime.service.list_lhp_outcomes(case_id=canonical_case_id),
+    )
+    counts = _loop_console_counts(
+        events=events,
+        traces=traces,
+        feedback=feedback,
+        handoffs=handoffs,
+        objectives=objectives,
+        artifacts=artifacts,
+        outcomes=outcomes,
+    )
     return {
         "status": "ok",
         "schema_version": "loop-console.v1",
-        "case": case.model_dump(mode="json"),
+        "case": _case_service_case_detail_payload(case, counts=counts),
         "summary": _case_service_case_summary(case),
-        "timeline": _case_service_control_timeline(events, feedback),
-        "events": [event.model_dump(mode="json") for event in events],
-        "traces": [trace.model_dump(mode="json") for trace in traces],
-        "feedback": [item.model_dump(mode="json") for item in feedback],
-        "handoffs": [item.model_dump(mode="json") for item in handoffs],
-        "verification_objectives": [item.model_dump(mode="json") for item in objectives],
-        "knowledge_artifacts": [item.model_dump(mode="json") for item in artifacts],
-        "outcomes": [item.model_dump(mode="json") for item in outcomes],
+        "counts": counts,
+        "timeline_limit": LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+        "collection_limit": LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT,
+        "timeline": _case_service_control_timeline(
+            events,
+            feedback,
+            include_payload=False,
+            limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+            newest_first=True,
+        ),
+        "traces": _loop_console_limit_rows([_case_service_trace_summary(trace) for trace in traces]),
+        "feedback": _loop_console_limit_rows([_case_service_feedback_summary(item) for item in feedback]),
+        "handoffs": _loop_console_limit_rows([_case_service_handoff_summary(item) for item in handoffs]),
+        "verification_objectives": _loop_console_limit_rows(
+            [_case_service_verification_objective_summary(item) for item in objectives]
+        ),
+        "knowledge_artifacts": _loop_console_limit_rows(
+            [_case_service_knowledge_artifact_summary(item) for item in artifacts]
+        ),
+        "outcomes": _loop_console_limit_rows([_case_service_outcome_summary(item) for item in outcomes]),
     }
 
 
@@ -1837,7 +2191,19 @@ async def loop_console_case_timeline(case_id: str, request: Request):
     case = await _loop_console_case(case_id)
     events = await runtime.store.case_events(case.case_id)
     feedback = await runtime.store.list_feedback(case_id=case.case_id)
-    return {"status": "ok", "case_id": case.case_id, "timeline": _case_service_control_timeline(events, feedback)}
+    return {
+        "status": "ok",
+        "case_id": case.case_id,
+        "timeline_limit": LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+        "timeline_count": len(events) + len(feedback),
+        "timeline": _case_service_control_timeline(
+            events,
+            feedback,
+            include_payload=False,
+            limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+            newest_first=True,
+        ),
+    }
 
 
 @app.get("/loop-console/v1/cases/{case_id}/handoffs")
@@ -1846,7 +2212,7 @@ async def loop_console_case_handoffs(case_id: str, request: Request):
     runtime = _require_case_service_runtime()
     case = await _loop_console_case(case_id)
     rows = await runtime.service.list_lhp_handoffs(case_id=case.case_id)
-    return {"status": "ok", "case_id": case.case_id, "handoffs": [row.model_dump(mode="json") for row in rows]}
+    return {"status": "ok", "case_id": case.case_id, "handoffs": [_case_service_handoff_summary(row) for row in rows]}
 
 
 @app.get("/loop-console/v1/cases/{case_id}/verification-objectives")
@@ -1858,7 +2224,7 @@ async def loop_console_case_verification_objectives(case_id: str, request: Reque
     return {
         "status": "ok",
         "case_id": case.case_id,
-        "verification_objectives": [row.model_dump(mode="json") for row in rows],
+        "verification_objectives": [_case_service_verification_objective_summary(row) for row in rows],
     }
 
 
@@ -1868,7 +2234,11 @@ async def loop_console_case_knowledge_artifacts(case_id: str, request: Request):
     runtime = _require_case_service_runtime()
     case = await _loop_console_case(case_id)
     rows = await runtime.service.list_lhp_knowledge_artifacts(case_id=case.case_id)
-    return {"status": "ok", "case_id": case.case_id, "knowledge_artifacts": [row.model_dump(mode="json") for row in rows]}
+    return {
+        "status": "ok",
+        "case_id": case.case_id,
+        "knowledge_artifacts": [_case_service_knowledge_artifact_summary(row) for row in rows],
+    }
 
 
 @app.get("/loop-console/v1/cases/{case_id}/outcomes")
@@ -1877,7 +2247,7 @@ async def loop_console_case_outcomes(case_id: str, request: Request):
     runtime = _require_case_service_runtime()
     case = await _loop_console_case(case_id)
     rows = await runtime.service.list_lhp_outcomes(case_id=case.case_id)
-    return {"status": "ok", "case_id": case.case_id, "outcomes": [row.model_dump(mode="json") for row in rows]}
+    return {"status": "ok", "case_id": case.case_id, "outcomes": [_case_service_outcome_summary(row) for row in rows]}
 
 
 @app.get("/loop-console/v1/outbox")
@@ -1988,7 +2358,9 @@ async def loop_console_case_decision(case_id: str, request_body: LoopConsoleDeci
 
 
 @app.post("/loop-console/v1/cases/{case_id}/knowledge-context-requests")
-async def loop_console_knowledge_context_request(case_id: str, request_body: LoopConsoleKnowledgeContextRequest, request: Request):
+async def loop_console_knowledge_context_request(
+    case_id: str, request_body: LoopConsoleKnowledgeContextRequest, request: Request
+):
     body = _loop_console_signed_body(request_body)
     _require_loop_console_request(request, body=body)
     case = await _loop_console_atomic_case(case_id)
@@ -2002,7 +2374,9 @@ async def loop_console_knowledge_context_request(case_id: str, request_body: Loo
 
 
 @app.post("/loop-console/v1/cases/{case_id}/knowledge-artifact-proposals")
-async def loop_console_knowledge_artifact_proposal(case_id: str, request_body: LoopConsoleKnowledgeArtifactProposalRequest, request: Request):
+async def loop_console_knowledge_artifact_proposal(
+    case_id: str, request_body: LoopConsoleKnowledgeArtifactProposalRequest, request: Request
+):
     body = _loop_console_signed_body(request_body)
     _require_loop_console_request(request, body=body)
     case = await _loop_console_atomic_case(case_id)
@@ -2016,7 +2390,9 @@ async def loop_console_knowledge_artifact_proposal(case_id: str, request_body: L
 
 
 @app.post("/loop-console/v1/knowledge-artifacts/{artifact_id}/review")
-async def loop_console_knowledge_artifact_review(artifact_id: str, request_body: LoopConsoleKnowledgeArtifactReviewRequest, request: Request):
+async def loop_console_knowledge_artifact_review(
+    artifact_id: str, request_body: LoopConsoleKnowledgeArtifactReviewRequest, request: Request
+):
     body = _loop_console_signed_body(request_body)
     _require_loop_console_request(request, body=body)
     event_id = _loop_console_action_id("knowledge_artifact_review", request_body.idempotency_key, artifact_id)
@@ -2036,7 +2412,9 @@ async def loop_console_knowledge_artifact_review(artifact_id: str, request_body:
 
 
 @app.post("/loop-console/v1/verification-objectives/{objective_id}/result")
-async def loop_console_verification_result(objective_id: str, request_body: LoopConsoleVerificationResultRequest, request: Request):
+async def loop_console_verification_result(
+    objective_id: str, request_body: LoopConsoleVerificationResultRequest, request: Request
+):
     body = _loop_console_signed_body(request_body)
     _require_loop_console_request(request, body=body)
     runtime = _require_case_service_runtime()
@@ -2046,15 +2424,21 @@ async def loop_console_verification_result(objective_id: str, request_body: Loop
         raise HTTPException(status_code=404, detail="Verification objective not found")
     event_id = _loop_console_action_id("verification_result", request_body.idempotency_key, objective_id)
     if not await _loop_console_has_event(objective.case_id, event_id):
-        objective.evidence_ref = _safe_monitor_token(request_body.evidence_ref, limit=180) if request_body.evidence_ref else ""
+        objective.evidence_ref = (
+            _safe_monitor_token(request_body.evidence_ref, limit=180) if request_body.evidence_ref else ""
+        )
         objective.failure_reason = _safe_monitor_text(request_body.failure_reason, limit=800)
         if request_body.status == "pass":
             objective.consecutive_pass_count += 1
-            objective.status = "pass" if objective.consecutive_pass_count >= objective.required_consecutive_passes else "pending"
+            objective.status = (
+                "pass" if objective.consecutive_pass_count >= objective.required_consecutive_passes else "pending"
+            )
         else:
             objective.consecutive_pass_count = 0
             objective.status = request_body.status
-        objective.payload.update({"source": "loop_console", "actor_id": request_body.actor_id, **dict(request_body.payload)})
+        objective.payload.update(
+            {"source": "loop_console", "actor_id": request_body.actor_id, **dict(request_body.payload)}
+        )
         objective = await runtime.service.record_lhp_verification_result(objective, event_id=event_id)
     return {"status": "ok", "verification_objective": objective.model_dump(mode="json")}
 
@@ -2090,7 +2474,12 @@ async def loop_console_handoff_update(handoff_id: str, request: Request):
 
 
 @app.get("/control/cases/{case_id}/events")
-async def control_case_events(case_id: str, request: Request, token: str | None = Query(default=None), x_noc_control_token: str | None = Header(default=None)):
+async def control_case_events(
+    case_id: str,
+    request: Request,
+    token: str | None = Query(default=None),
+    x_noc_control_token: str | None = Header(default=None),
+):
     _require_control_request(request, token, x_noc_control_token)
     if _case_service_control_routes_enabled():
         return await _case_service_control_case_events_response(case_id)
@@ -2140,7 +2529,9 @@ async def control_manual_investigation(
     if _case_service_control_routes_enabled():
         _require_case_service_runtime()
         results = await _shadow_observe_alert_payload(alert_payload)
-        case = next((getattr(result, "case", None) for result in results if getattr(result, "case", None) is not None), None)
+        case = next(
+            (getattr(result, "case", None) for result in results if getattr(result, "case", None) is not None), None
+        )
         if case is None:
             raise HTTPException(status_code=409, detail="Manual investigation was not queued by CaseService")
         background_tasks.add_task(investigate_alert, alert_payload, case=_case_service_graph_case(case, alert_payload))
@@ -2264,7 +2655,11 @@ def _case_service_case_summary(case) -> dict:
         "title": getattr(case, "title", "") or "",
         "summary": getattr(case, "summary", "") or "",
         "resource_id": getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
+        "origin": getattr(case, "origin", "") or "",
+        "opened_at": getattr(case, "opened_at", "") or "",
         "updated_at": getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "",
+        "resolved_at": getattr(case, "resolved_at", "") or "",
+        "closed_at": getattr(case, "closed_at", "") or "",
         "issue_url": getattr(case, "issue_url", "") or "",
         "suppressed_until": getattr(case, "suppressed_until", "") or "",
         "child_case_count": getattr(case, "child_case_count", 0) or 0,

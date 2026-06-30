@@ -6,7 +6,17 @@ from datetime import datetime, timezone
 import pytest
 from fastapi import HTTPException
 
-from app.cases import CaseHandoff, CaseService, HandoffUpdate, InMemoryCaseStore, KnowledgeArtifact, ObservationRecord, OutcomeRecord, VerificationObjective
+from app.cases import (
+    CaseEvent,
+    CaseHandoff,
+    CaseService,
+    HandoffUpdate,
+    InMemoryCaseStore,
+    KnowledgeArtifact,
+    ObservationRecord,
+    OutcomeRecord,
+    VerificationObjective,
+)
 from app.cases.graph_memory import CaseServiceGraphMemory
 import app.main as main_module
 from app.main import (
@@ -168,7 +178,9 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
     monkeypatch.setenv("NOC_LHP_ENGINEERING_SECRET", "shared")
     store = InMemoryCaseStore()
     service = CaseService(store)
-    created = await service.observe(ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing"))
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing")
+    )
     assert created.case is not None
     handoff = CaseHandoff(
         handoff_id="handoff_disk_1",
@@ -284,7 +296,9 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     monkeypatch.setenv("NOC_LOOP_CONSOLE_SECRET", "console-shared")
     store = InMemoryCaseStore()
     service = CaseService(store)
-    created = await service.observe(ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing"))
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing")
+    )
     assert created.case is not None
     case = created.case
     handoff = CaseHandoff(
@@ -294,6 +308,10 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
         objective="resolve disk condition",
         objective_key="resolve-disk-v1",
         idempotency_key="console:handoff:1",
+        resource={"host": "rtr", "mount": "/"},
+        constraints=["preserve customer traffic"],
+        acceptance_criteria=["disk free space stays above threshold"],
+        payload={"raw_evidence": {"disk": {"free_percent": 19.9}}},
     )
     objective = VerificationObjective(
         objective_id="objective_console_1",
@@ -302,6 +320,7 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
         objective_key="disk-clear",
         objective_type="monitoring_alert_clear",
         name="disk alert clears",
+        payload={"raw_probe": "icinga payload"},
     )
     await service.request_lhp_handoff(handoff, objectives=[objective])
     artifact = await service.record_lhp_knowledge_artifact(
@@ -311,10 +330,16 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
             handoff_id=handoff.handoff_id,
             artifact_type="runbook_delta",
             summary="candidate runbook update",
+            payload={"document": "raw candidate body"},
         )
     )
     await service.record_lhp_outcome(
-        OutcomeRecord(outcome_id="outcome_console_1", work_item_id=case.case_id, proposed_action="review")
+        OutcomeRecord(
+            outcome_id="outcome_console_1",
+            work_item_id=case.case_id,
+            proposed_action="review",
+            payload={"transcript": "raw final evidence"},
+        )
     )
 
     class _Runtime:
@@ -333,7 +358,18 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     case.status = "resolved"
     case.updated_at = "2026-01-01T00:00:00+00:00"
     await store.upsert_case(case)
-    await service.observe(ObservationRecord(source="proactive", rule_id="memory_fill", resource="rtr:/var", status="firing"))
+    await service.observe(
+        ObservationRecord(source="proactive", rule_id="memory_fill", resource="rtr:/var", status="firing")
+    )
+    for index in range(220):
+        await store.append_event(
+            CaseEvent(
+                case_id=case.case_id,
+                event_type=f"noise_{index}",
+                occurred_at=f"2026-12-31T00:{index // 60:02d}:{index % 60:02d}+00:00",
+                payload={"summary": f"noise {index}", "raw_evidence": {"index": index}},
+            )
+        )
     resolved_cases = await loop_console_cases(
         _console_request("GET", "/loop-console/v1/cases?status=resolved&limit=1"),
         kind=None,
@@ -341,14 +377,55 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
         limit=1,
     )
     assert [item["case_id"] for item in resolved_cases["cases"]] == [case.case_id]
-    detail = await loop_console_case_detail(case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}"))
+    detail = await loop_console_case_detail(
+        case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}")
+    )
     assert detail["case"]["case_id"] == case.case_id
+    assert detail["case"]["opened_at"]
+    assert detail["case"]["resolved_at"] == ""
+    assert "signal_snapshot" not in detail["case"]
+    assert "last_diagnosis" not in detail["case"]
+    assert detail["counts"]["timeline"] > detail["timeline_limit"]
+    assert len(detail["timeline"]) == detail["timeline_limit"]
+    assert "noise_219" in [item["event_type"] for item in detail["timeline"]]
+    assert "noise_0" not in [item["event_type"] for item in detail["timeline"]]
+    assert all("payload" not in item for item in detail["timeline"])
     assert detail["handoffs"][0]["handoff_id"] == handoff.handoff_id
-    assert (await loop_console_case_timeline(case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/timeline")))["timeline"]
-    assert (await loop_console_case_handoffs(case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/handoffs")))["handoffs"]
-    assert (await loop_console_case_verification_objectives(case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/verification-objectives")))["verification_objectives"]
-    assert (await loop_console_case_knowledge_artifacts(case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/knowledge-artifacts")))["knowledge_artifacts"]
-    assert (await loop_console_case_outcomes(case.case_id, _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/outcomes")))["outcomes"]
+    assert detail["handoffs"][0]["acceptance_criteria"] == ["disk free space stays above threshold"]
+    assert "payload" not in detail["handoffs"][0]
+    assert "payload" not in detail["verification_objectives"][0]
+    assert "payload" not in detail["knowledge_artifacts"][0]
+    assert "payload" not in detail["outcomes"][0]
+    timeline_response = await loop_console_case_timeline(
+        case.case_id,
+        _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/timeline"),
+    )
+    assert timeline_response["timeline"]
+    assert all("payload" not in item for item in timeline_response["timeline"])
+    handoffs_response = await loop_console_case_handoffs(
+        case.case_id,
+        _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/handoffs"),
+    )
+    assert handoffs_response["handoffs"]
+    assert "payload" not in handoffs_response["handoffs"][0]
+    objectives_response = await loop_console_case_verification_objectives(
+        case.case_id,
+        _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/verification-objectives"),
+    )
+    assert objectives_response["verification_objectives"]
+    assert "payload" not in objectives_response["verification_objectives"][0]
+    artifacts_response = await loop_console_case_knowledge_artifacts(
+        case.case_id,
+        _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/knowledge-artifacts"),
+    )
+    assert artifacts_response["knowledge_artifacts"]
+    assert "payload" not in artifacts_response["knowledge_artifacts"][0]
+    outcomes_response = await loop_console_case_outcomes(
+        case.case_id,
+        _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/outcomes"),
+    )
+    assert outcomes_response["outcomes"]
+    assert "payload" not in outcomes_response["outcomes"][0]
 
     feedback_request = LoopConsoleFeedbackRequest(
         actor_id="operator",
@@ -399,7 +476,9 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     )
     assert (await store.get_case(case.case_id)).suppression_reason == "maintenance window"
 
-    context_request = LoopConsoleKnowledgeContextRequest(actor_id="operator", idempotency_key="ctx-1", handoff_id=handoff.handoff_id)
+    context_request = LoopConsoleKnowledgeContextRequest(
+        actor_id="operator", idempotency_key="ctx-1", handoff_id=handoff.handoff_id
+    )
     context_body = context_request.model_dump(mode="json")
     context = await loop_console_knowledge_context_request(
         case.case_id,
@@ -407,7 +486,9 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
         _console_request("POST", f"/loop-console/v1/cases/{case.case_id}/knowledge-context-requests", context_body),
     )
     assert context["outbox"]["intent_type"] == "knowledge_context_requested"
-    proposal_request = LoopConsoleKnowledgeArtifactProposalRequest(actor_id="operator", idempotency_key="ka-1", handoff_id=handoff.handoff_id)
+    proposal_request = LoopConsoleKnowledgeArtifactProposalRequest(
+        actor_id="operator", idempotency_key="ka-1", handoff_id=handoff.handoff_id
+    )
     proposal_body = proposal_request.model_dump(mode="json")
     proposal = await loop_console_knowledge_artifact_proposal(
         case.case_id,
@@ -463,7 +544,9 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     verified = await loop_console_verification_result(
         objective.objective_id,
         verification_request,
-        _console_request("POST", f"/loop-console/v1/verification-objectives/{objective.objective_id}/result", verification_body),
+        _console_request(
+            "POST", f"/loop-console/v1/verification-objectives/{objective.objective_id}/result", verification_body
+        ),
     )
     assert verified["verification_objective"]["status"] == "pending"
     assert verified["verification_objective"]["consecutive_pass_count"] == 1
