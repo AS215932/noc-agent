@@ -355,6 +355,7 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
         _console_request("GET", "/loop-console/v1/cases"), kind=None, status_filter=None, limit=100
     )
     assert cases["cases"][0]["case_id"] == case.case_id
+    case.summary = f"{'large monitoring annotation ' * 80}tail-marker"
     case.status = "resolved"
     case.updated_at = "2026-01-01T00:00:00+00:00"
     await store.upsert_case(case)
@@ -383,6 +384,9 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     assert detail["case"]["case_id"] == case.case_id
     assert detail["case"]["opened_at"]
     assert detail["case"]["resolved_at"] == ""
+    assert len(detail["case"]["summary"]) <= 1200
+    assert len(detail["summary"]["summary"]) <= 1200
+    assert "tail-marker" not in detail["summary"]["summary"]
     assert "signal_snapshot" not in detail["case"]
     assert "last_diagnosis" not in detail["case"]
     assert detail["counts"]["timeline"] > detail["timeline_limit"]

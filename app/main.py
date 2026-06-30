@@ -2647,21 +2647,27 @@ def _validated_case_service_lookup_identifier(value: str) -> str:
 
 def _case_service_case_summary(case) -> dict:
     return {
-        "case_id": getattr(case, "case_id", ""),
-        "case_number": getattr(case, "case_number", "") or "",
-        "kind": getattr(case, "kind", ""),
-        "status": getattr(case, "status", ""),
-        "severity": getattr(case, "severity", "") or "",
-        "title": getattr(case, "title", "") or "",
-        "summary": getattr(case, "summary", "") or "",
-        "resource_id": getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", "") or "",
-        "origin": getattr(case, "origin", "") or "",
-        "opened_at": getattr(case, "opened_at", "") or "",
-        "updated_at": getattr(case, "updated_at", "") or getattr(case, "opened_at", "") or "",
-        "resolved_at": getattr(case, "resolved_at", "") or "",
-        "closed_at": getattr(case, "closed_at", "") or "",
-        "issue_url": getattr(case, "issue_url", "") or "",
-        "suppressed_until": getattr(case, "suppressed_until", "") or "",
+        "case_id": _loop_console_token(getattr(case, "case_id", ""), limit=128),
+        "case_number": _loop_console_token(getattr(case, "case_number", ""), limit=128),
+        "kind": _loop_console_token(getattr(case, "kind", ""), limit=32),
+        "status": _loop_console_token(getattr(case, "status", ""), limit=64),
+        "severity": _loop_console_token(getattr(case, "severity", ""), limit=32),
+        "title": _loop_console_text(getattr(case, "title", ""), limit=240),
+        "summary": _loop_console_text(getattr(case, "summary", ""), limit=1200),
+        "resource_id": _loop_console_text(
+            getattr(case, "resource_id", "") or getattr(case, "suspected_primary_entity", ""),
+            limit=240,
+        ),
+        "origin": _loop_console_token(getattr(case, "origin", ""), limit=64),
+        "opened_at": _loop_console_token(getattr(case, "opened_at", ""), limit=80),
+        "updated_at": _loop_console_token(
+            getattr(case, "updated_at", "") or getattr(case, "opened_at", ""),
+            limit=80,
+        ),
+        "resolved_at": _loop_console_token(getattr(case, "resolved_at", ""), limit=80),
+        "closed_at": _loop_console_token(getattr(case, "closed_at", ""), limit=80),
+        "issue_url": _loop_console_text(getattr(case, "issue_url", ""), limit=300),
+        "suppressed_until": _loop_console_token(getattr(case, "suppressed_until", ""), limit=80),
         "child_case_count": getattr(case, "child_case_count", 0) or 0,
     }
 
