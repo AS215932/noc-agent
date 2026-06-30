@@ -2142,24 +2142,71 @@ async def loop_console_case_detail(case_id: str, request: Request):
     runtime = _require_case_service_runtime()
     case = await _loop_console_case(case_id)
     canonical_case_id = case.case_id
-    events, traces, feedback, handoffs, objectives, artifacts, outcomes = await asyncio.gather(
-        runtime.store.case_events(canonical_case_id),
-        runtime.store.list_traces(case_id=canonical_case_id),
-        runtime.store.list_feedback(case_id=canonical_case_id),
-        runtime.service.list_lhp_handoffs(case_id=canonical_case_id),
-        runtime.service.list_lhp_verification_objectives(case_id=canonical_case_id),
-        runtime.service.list_lhp_knowledge_artifacts(case_id=canonical_case_id),
-        runtime.service.list_lhp_outcomes(case_id=canonical_case_id),
+    (
+        events,
+        traces,
+        feedback,
+        handoffs,
+        objectives,
+        artifacts,
+        outcomes,
+        event_count,
+        trace_count,
+        feedback_count,
+        handoff_count,
+        objective_count,
+        artifact_count,
+        outcome_count,
+    ) = await asyncio.gather(
+        runtime.store.case_events(
+            canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.list_traces(
+            case_id=canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.list_feedback(
+            case_id=canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.list_handoffs(case_id=canonical_case_id, limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT),
+        runtime.store.list_verification_objectives(
+            case_id=canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.list_knowledge_artifacts(
+            case_id=canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.list_outcomes(
+            case_id=canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.count_case_events(canonical_case_id),
+        runtime.store.count_traces(case_id=canonical_case_id),
+        runtime.store.count_feedback(case_id=canonical_case_id),
+        runtime.store.count_handoffs(case_id=canonical_case_id),
+        runtime.store.count_verification_objectives(case_id=canonical_case_id),
+        runtime.store.count_knowledge_artifacts(case_id=canonical_case_id),
+        runtime.store.count_outcomes(case_id=canonical_case_id),
     )
-    counts = _loop_console_counts(
-        events=events,
-        traces=traces,
-        feedback=feedback,
-        handoffs=handoffs,
-        objectives=objectives,
-        artifacts=artifacts,
-        outcomes=outcomes,
-    )
+    counts = {
+        "events": event_count,
+        "traces": trace_count,
+        "feedback": feedback_count,
+        "timeline": event_count + feedback_count,
+        "handoffs": handoff_count,
+        "verification_objectives": objective_count,
+        "knowledge_artifacts": artifact_count,
+        "outcomes": outcome_count,
+    }
     return {
         "status": "ok",
         "schema_version": "loop-console.v1",
@@ -2193,13 +2240,21 @@ async def loop_console_case_timeline(case_id: str, request: Request):
     _require_loop_console_request(request, body={})
     runtime = _require_case_service_runtime()
     case = await _loop_console_case(case_id)
-    events = await runtime.store.case_events(case.case_id)
-    feedback = await runtime.store.list_feedback(case_id=case.case_id)
+    events, feedback, event_count, feedback_count = await asyncio.gather(
+        runtime.store.case_events(case.case_id, limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT, newest_first=True),
+        runtime.store.list_feedback(
+            case_id=case.case_id,
+            limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.count_case_events(case.case_id),
+        runtime.store.count_feedback(case_id=case.case_id),
+    )
     return {
         "status": "ok",
         "case_id": case.case_id,
         "timeline_limit": LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
-        "timeline_count": len(events) + len(feedback),
+        "timeline_count": event_count + feedback_count,
         "timeline": _case_service_control_timeline(
             events,
             feedback,

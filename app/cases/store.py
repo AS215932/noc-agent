@@ -103,11 +103,17 @@ class CaseStore(Protocol):
 
     async def get_case(self, case_id: str) -> CaseProjection | None: ...
 
-    async def list_cases(self, *, kind: str | None = None, status: str | None = None, limit: int = 100) -> list[CaseProjection]: ...
+    async def list_cases(
+        self, *, kind: str | None = None, status: str | None = None, limit: int = 100
+    ) -> list[CaseProjection]: ...
 
     async def append_event(self, event: CaseEvent) -> CaseEvent: ...
 
-    async def case_events(self, case_id: str) -> list[CaseEvent]: ...
+    async def case_events(
+        self, case_id: str, *, limit: int | None = None, newest_first: bool = False
+    ) -> list[CaseEvent]: ...
+
+    async def count_case_events(self, case_id: str) -> int: ...
 
     async def record_alias(self, alias: CaseIdentityAlias) -> CaseIdentityAlias: ...
 
@@ -141,7 +147,11 @@ class CaseStore(Protocol):
 
     async def get_handoff(self, handoff_id: str) -> CaseHandoff | None: ...
 
-    async def list_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> list[CaseHandoff]: ...
+    async def list_handoffs(
+        self, *, case_id: str | None = None, status: str | None = None, limit: int | None = None
+    ) -> list[CaseHandoff]: ...
+
+    async def count_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> int: ...
 
     async def record_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery: ...
 
@@ -168,9 +178,15 @@ class CaseStore(Protocol):
 
     async def list_due_verification_objectives(self, *, now: str, limit: int = 100) -> list[VerificationObjective]: ...
 
-    async def list_verification_objectives(self, *, case_id: str | None = None) -> list[VerificationObjective]: ...
+    async def list_verification_objectives(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[VerificationObjective]: ...
 
-    async def mark_handoff_verified(self, handoff_id: str, *, now: str, event: CaseEvent | None = None) -> CaseHandoff: ...
+    async def count_verification_objectives(self, *, case_id: str | None = None) -> int: ...
+
+    async def mark_handoff_verified(
+        self, handoff_id: str, *, now: str, event: CaseEvent | None = None
+    ) -> CaseHandoff: ...
 
     async def resolve_case_with_outcome(
         self,
@@ -190,19 +206,45 @@ class CaseStore(Protocol):
         self, artifact: KnowledgeArtifact, *, event: CaseEvent | None = None
     ) -> KnowledgeArtifact: ...
 
-    async def list_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]: ...
+    async def list_knowledge_artifacts(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[KnowledgeArtifact]: ...
+
+    async def count_knowledge_artifacts(self, *, case_id: str | None = None) -> int: ...
 
     async def record_outcome(self, outcome: OutcomeRecord, *, event: CaseEvent | None = None) -> OutcomeRecord: ...
 
-    async def list_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]: ...
+    async def list_outcomes(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[OutcomeRecord]: ...
+
+    async def count_outcomes(self, *, case_id: str | None = None) -> int: ...
 
     async def record_feedback(self, feedback: OperatorFeedback) -> OperatorFeedback: ...
 
-    async def list_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[OperatorFeedback]: ...
+    async def list_feedback(
+        self,
+        *,
+        case_id: str | None = None,
+        meta_case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[OperatorFeedback]: ...
+
+    async def count_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int: ...
 
     async def record_trace(self, trace: TraceRecord) -> TraceRecord: ...
 
-    async def list_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[TraceRecord]: ...
+    async def list_traces(
+        self,
+        *,
+        case_id: str | None = None,
+        meta_case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[TraceRecord]: ...
+
+    async def count_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int: ...
 
 
 class InMemoryCaseStore:
@@ -335,7 +377,9 @@ class InMemoryCaseStore:
             case = self._cases.get(str(case_id or ""))
             return case.model_copy(deep=True) if case else None
 
-    async def list_cases(self, *, kind: str | None = None, status: str | None = None, limit: int = 100) -> list[CaseProjection]:
+    async def list_cases(
+        self, *, kind: str | None = None, status: str | None = None, limit: int = 100
+    ) -> list[CaseProjection]:
         async with self._lock:
             cases = list(self._cases.values())
             if kind:
@@ -360,10 +404,22 @@ class InMemoryCaseStore:
                 self._case_events.setdefault(target, []).append(stored.event_id)
         return stored
 
-    async def case_events(self, case_id: str) -> list[CaseEvent]:
+    async def case_events(
+        self, case_id: str, *, limit: int | None = None, newest_first: bool = False
+    ) -> list[CaseEvent]:
         async with self._lock:
             ids = list(self._case_events.get(str(case_id or ""), []))
-            return [self._events[event_id].model_copy(deep=True) for event_id in ids if event_id in self._events]
+            rows = [self._events[event_id] for event_id in ids if event_id in self._events]
+            rows.sort(key=lambda row: (row.occurred_at, row.event_id), reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
+            return [row.model_copy(deep=True) for row in rows]
+
+    async def count_case_events(self, case_id: str) -> int:
+        async with self._lock:
+            return len(
+                [event_id for event_id in self._case_events.get(str(case_id or ""), []) if event_id in self._events]
+            )
 
     async def record_alias(self, alias: CaseIdentityAlias) -> CaseIdentityAlias:
         if not alias.alias_value:
@@ -472,9 +528,7 @@ class InMemoryCaseStore:
     def _reassign_aliases_locked(self, from_case_id: str, to_case_id: str, now: str) -> list[CaseIdentityAlias]:
         moved: list[CaseIdentityAlias] = []
         active_aliases = [
-            alias
-            for alias in self._aliases.values()
-            if alias.case_id == from_case_id and alias.retired_at is None
+            alias for alias in self._aliases.values() if alias.case_id == from_case_id and alias.retired_at is None
         ]
         for alias in active_aliases:
             key = _alias_key(alias.alias_type, alias.alias_value)
@@ -589,7 +643,9 @@ class InMemoryCaseStore:
             handoff = self._handoffs.get(str(handoff_id or ""))
             return handoff.model_copy(deep=True) if handoff else None
 
-    async def list_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> list[CaseHandoff]:
+    async def list_handoffs(
+        self, *, case_id: str | None = None, status: str | None = None, limit: int | None = None
+    ) -> list[CaseHandoff]:
         async with self._lock:
             rows = list(self._handoffs.values())
             if case_id is not None:
@@ -597,7 +653,18 @@ class InMemoryCaseStore:
             if status is not None:
                 rows = [row for row in rows if row.status == status]
             rows.sort(key=lambda row: row.updated_at, reverse=True)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
             return [row.model_copy(deep=True) for row in rows]
+
+    async def count_handoffs(self, *, case_id: str | None = None, status: str | None = None) -> int:
+        async with self._lock:
+            rows = list(self._handoffs.values())
+            if case_id is not None:
+                rows = [row for row in rows if row.case_id == case_id]
+            if status is not None:
+                rows = [row for row in rows if row.status == status]
+            return len(rows)
 
     async def record_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
         async with self._lock:
@@ -679,7 +746,9 @@ class InMemoryCaseStore:
             key = (callback.source_loop, callback.external_event_id)
             existing_id = self._callback_index.get(key)
             if existing_id:
-                return CallbackClaimResult(callback=self._callback_inbox[existing_id].model_copy(deep=True), created=False)
+                return CallbackClaimResult(
+                    callback=self._callback_inbox[existing_id].model_copy(deep=True), created=False
+                )
             stored = callback.model_copy(deep=True)
             self._callback_inbox[stored.callback_id] = stored
             self._callback_index[key] = stored.callback_id
@@ -718,13 +787,24 @@ class InMemoryCaseStore:
             rows.sort(key=lambda row: (row.next_check_at or "", row.created_at, row.objective_id))
             return [row.model_copy(deep=True) for row in rows[: _bounded_limit(limit)]]
 
-    async def list_verification_objectives(self, *, case_id: str | None = None) -> list[VerificationObjective]:
+    async def list_verification_objectives(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[VerificationObjective]:
         async with self._lock:
             rows = list(self._verification_objectives.values())
             if case_id is not None:
                 rows = [row for row in rows if row.case_id == case_id]
-            rows.sort(key=lambda row: (row.created_at, row.objective_id))
+            rows.sort(key=lambda row: (row.updated_at, row.created_at, row.objective_id), reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
             return [row.model_copy(deep=True) for row in rows]
+
+    async def count_verification_objectives(self, *, case_id: str | None = None) -> int:
+        async with self._lock:
+            rows = list(self._verification_objectives.values())
+            if case_id is not None:
+                rows = [row for row in rows if row.case_id == case_id]
+            return len(rows)
 
     async def mark_handoff_verified(self, handoff_id: str, *, now: str, event: CaseEvent | None = None) -> CaseHandoff:
         async with self._lock:
@@ -812,13 +892,24 @@ class InMemoryCaseStore:
                 self._store_event_locked(event)
             return stored.model_copy(deep=True)
 
-    async def list_knowledge_artifacts(self, *, case_id: str | None = None) -> list[KnowledgeArtifact]:
+    async def list_knowledge_artifacts(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[KnowledgeArtifact]:
         async with self._lock:
             rows = list(self._knowledge_artifacts.values())
             if case_id is not None:
                 rows = [row for row in rows if row.case_id == case_id]
-            rows.sort(key=lambda row: (row.created_at, row.artifact_id))
+            rows.sort(key=lambda row: (row.created_at, row.artifact_id), reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
             return [row.model_copy(deep=True) for row in rows]
+
+    async def count_knowledge_artifacts(self, *, case_id: str | None = None) -> int:
+        async with self._lock:
+            rows = list(self._knowledge_artifacts.values())
+            if case_id is not None:
+                rows = [row for row in rows if row.case_id == case_id]
+            return len(rows)
 
     async def record_outcome(self, outcome: OutcomeRecord, *, event: CaseEvent | None = None) -> OutcomeRecord:
         async with self._lock:
@@ -832,13 +923,24 @@ class InMemoryCaseStore:
                 self._store_event_locked(event)
             return stored.model_copy(deep=True)
 
-    async def list_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]:
+    async def list_outcomes(
+        self, *, case_id: str | None = None, limit: int | None = None, newest_first: bool = False
+    ) -> list[OutcomeRecord]:
         async with self._lock:
             rows = list(self._outcomes.values())
             if case_id is not None:
                 rows = [row for row in rows if row.work_item_id == case_id]
-            rows.sort(key=lambda row: (row.created_at, row.outcome_id))
+            rows.sort(key=lambda row: (row.created_at, row.outcome_id), reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
             return [row.model_copy(deep=True) for row in rows]
+
+    async def count_outcomes(self, *, case_id: str | None = None) -> int:
+        async with self._lock:
+            rows = list(self._outcomes.values())
+            if case_id is not None:
+                rows = [row for row in rows if row.work_item_id == case_id]
+            return len(rows)
 
     def _require_atomic_case_locked(self, case_id: str) -> AtomicCaseProjection:
         case = self._cases.get(str(case_id or ""))
@@ -885,15 +987,33 @@ class InMemoryCaseStore:
             self._feedback[stored.feedback_id] = stored
             return stored.model_copy(deep=True)
 
-    async def list_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[OperatorFeedback]:
+    async def list_feedback(
+        self,
+        *,
+        case_id: str | None = None,
+        meta_case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[OperatorFeedback]:
         async with self._lock:
             rows = list(self._feedback.values())
             if case_id is not None:
                 rows = [row for row in rows if row.case_id == case_id]
             if meta_case_id is not None:
                 rows = [row for row in rows if row.meta_case_id == meta_case_id]
-            rows.sort(key=lambda row: row.created_at)
+            rows.sort(key=lambda row: row.created_at, reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
             return [row.model_copy(deep=True) for row in rows]
+
+    async def count_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int:
+        async with self._lock:
+            rows = list(self._feedback.values())
+            if case_id is not None:
+                rows = [row for row in rows if row.case_id == case_id]
+            if meta_case_id is not None:
+                rows = [row for row in rows if row.meta_case_id == meta_case_id]
+            return len(rows)
 
     async def record_trace(self, trace: TraceRecord) -> TraceRecord:
         async with self._lock:
@@ -904,15 +1024,33 @@ class InMemoryCaseStore:
             self._traces[stored.trace_id] = stored
             return stored.model_copy(deep=True)
 
-    async def list_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> list[TraceRecord]:
+    async def list_traces(
+        self,
+        *,
+        case_id: str | None = None,
+        meta_case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[TraceRecord]:
         async with self._lock:
             rows = list(self._traces.values())
             if case_id is not None:
                 rows = [row for row in rows if row.case_id == case_id]
             if meta_case_id is not None:
                 rows = [row for row in rows if row.meta_case_id == meta_case_id]
-            rows.sort(key=lambda row: row.created_at)
+            rows.sort(key=lambda row: row.created_at, reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
             return [row.model_copy(deep=True) for row in rows]
+
+    async def count_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int:
+        async with self._lock:
+            rows = list(self._traces.values())
+            if case_id is not None:
+                rows = [row for row in rows if row.case_id == case_id]
+            if meta_case_id is not None:
+                rows = [row for row in rows if row.meta_case_id == meta_case_id]
+            return len(rows)
 
 
 def _alias_key(alias_type: str, alias_value: str) -> tuple[str, str]:
