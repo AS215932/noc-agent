@@ -355,6 +355,7 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
         _console_request("GET", "/loop-console/v1/cases"), kind=None, status_filter=None, limit=100
     )
     assert cases["cases"][0]["case_id"] == case.case_id
+    assert "+" in cases["cases"][0]["opened_at"]
     case.summary = f"{'large monitoring annotation ' * 80}tail-marker"
     case.status = "resolved"
     case.updated_at = "2026-01-01T00:00:00+00:00"
@@ -384,6 +385,9 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     assert detail["case"]["case_id"] == case.case_id
     assert detail["case"]["opened_at"]
     assert detail["case"]["resolved_at"] == ""
+    assert detail["summary"]["updated_at"] == "2026-01-01T00:00:00+00:00"
+    assert "+" in detail["case"]["opened_at"]
+    assert "+" in detail["timeline"][0]["received_at"]
     assert len(detail["case"]["summary"]) <= 1200
     assert len(detail["summary"]["summary"]) <= 1200
     assert "tail-marker" not in detail["summary"]["summary"]
@@ -396,6 +400,7 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     assert all("payload" not in item for item in detail["timeline"])
     assert detail["handoffs"][0]["handoff_id"] == handoff.handoff_id
     assert detail["handoffs"][0]["acceptance_criteria"] == ["disk free space stays above threshold"]
+    assert "+" in detail["handoffs"][0]["updated_at"]
     assert "payload" not in detail["handoffs"][0]
     assert "payload" not in detail["verification_objectives"][0]
     assert "payload" not in detail["knowledge_artifacts"][0]

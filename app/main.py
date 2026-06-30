@@ -1102,7 +1102,7 @@ def _case_service_control_event_payload(event, *, include_payload: bool = True) 
         or ""
     )
     row = {
-        "received_at": _safe_monitor_token(payload.get("occurred_at", ""), limit=80),
+        "received_at": _loop_console_timestamp(payload.get("occurred_at", "")),
         "event_type": _safe_monitor_token(payload.get("event_type", ""), limit=80),
         "state": _safe_monitor_token(event_payload.get("status", ""), limit=64),
         "summary": _safe_monitor_text(summary, limit=1000),
@@ -1118,7 +1118,7 @@ def _case_service_control_feedback_event_payload(feedback, *, include_payload: b
     payload = feedback.model_dump(mode="json")
     feedback_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     row = {
-        "received_at": _safe_monitor_token(payload.get("created_at", ""), limit=80),
+        "received_at": _loop_console_timestamp(payload.get("created_at", "")),
         "event_type": _safe_monitor_token(payload.get("feedback_type", "operator_feedback"), limit=80),
         "state": "",
         "summary": _safe_monitor_text(
@@ -1160,6 +1160,10 @@ def _loop_console_text(value: object, *, limit: int = 1000) -> str:
     if value is None or str(value).strip() == "":
         return ""
     return _safe_monitor_text(value, limit=limit)
+
+
+def _loop_console_timestamp(value: object) -> str:
+    return _loop_console_text(value, limit=80)
 
 
 def _loop_console_text_list(values: object, *, limit: int = 500, max_items: int = 20) -> list[str]:
@@ -1207,26 +1211,26 @@ def _loop_console_counts(
 def _case_service_case_detail_payload(case, *, counts: dict[str, int]) -> dict[str, object]:
     operator_state = {
         "acknowledged_by": _loop_console_token(getattr(case, "acknowledged_by", ""), limit=120),
-        "acknowledged_at": _loop_console_token(getattr(case, "acknowledged_at", ""), limit=80),
-        "snoozed_until": _loop_console_token(getattr(case, "snoozed_until", ""), limit=80),
-        "suppressed_until": _loop_console_token(getattr(case, "suppressed_until", ""), limit=80),
+        "acknowledged_at": _loop_console_timestamp(getattr(case, "acknowledged_at", "")),
+        "snoozed_until": _loop_console_timestamp(getattr(case, "snoozed_until", "")),
+        "suppressed_until": _loop_console_timestamp(getattr(case, "suppressed_until", "")),
         "suppression_reason": _loop_console_text(getattr(case, "suppression_reason", ""), limit=500),
         "suppression_source": _loop_console_token(getattr(case, "suppression_source", ""), limit=64),
         "investigation_status": _loop_console_token(getattr(case, "investigation_status", ""), limit=64),
         "investigation_error": _loop_console_text(getattr(case, "investigation_error", ""), limit=700),
-        "last_investigated_at": _loop_console_token(getattr(case, "last_investigated_at", ""), limit=80),
+        "last_investigated_at": _loop_console_timestamp(getattr(case, "last_investigated_at", "")),
         "handoff_status": _loop_console_token(getattr(case, "handoff_status", ""), limit=64),
-        "last_handoff_at": _loop_console_token(getattr(case, "last_handoff_at", ""), limit=80),
+        "last_handoff_at": _loop_console_timestamp(getattr(case, "last_handoff_at", "")),
         "resolution_reason": _loop_console_text(getattr(case, "resolution_reason", ""), limit=500),
     }
     activity = {
-        "last_seen": _loop_console_token(getattr(case, "last_seen", ""), limit=80),
-        "last_observed_unhealthy": _loop_console_token(getattr(case, "last_observed_unhealthy", ""), limit=80),
-        "last_observed_clean": _loop_console_token(getattr(case, "last_observed_clean", ""), limit=80),
-        "last_evaluated_at": _loop_console_token(getattr(case, "last_evaluated_at", ""), limit=80),
+        "last_seen": _loop_console_timestamp(getattr(case, "last_seen", "")),
+        "last_observed_unhealthy": _loop_console_timestamp(getattr(case, "last_observed_unhealthy", "")),
+        "last_observed_clean": _loop_console_timestamp(getattr(case, "last_observed_clean", "")),
+        "last_evaluated_at": _loop_console_timestamp(getattr(case, "last_evaluated_at", "")),
         "last_scan_cycle_id": _loop_console_token(getattr(case, "last_scan_cycle_id", ""), limit=128),
-        "last_reported_at": _loop_console_token(getattr(case, "last_reported_at", ""), limit=80),
-        "last_reasserted_at": _loop_console_token(getattr(case, "last_reasserted_at", ""), limit=80),
+        "last_reported_at": _loop_console_timestamp(getattr(case, "last_reported_at", "")),
+        "last_reasserted_at": _loop_console_timestamp(getattr(case, "last_reasserted_at", "")),
     }
     return {
         "case_id": _loop_console_token(getattr(case, "case_id", ""), limit=128),
@@ -1246,10 +1250,10 @@ def _case_service_case_detail_payload(case, *, counts: dict[str, int]) -> dict[s
         "site": _loop_console_token(getattr(case, "site", ""), limit=128),
         "customer": _loop_console_token(getattr(case, "customer", ""), limit=128),
         "service": _loop_console_token(getattr(case, "service", ""), limit=128),
-        "opened_at": _loop_console_token(getattr(case, "opened_at", ""), limit=80),
-        "updated_at": _loop_console_token(getattr(case, "updated_at", ""), limit=80),
-        "resolved_at": _loop_console_token(getattr(case, "resolved_at", ""), limit=80),
-        "closed_at": _loop_console_token(getattr(case, "closed_at", ""), limit=80),
+        "opened_at": _loop_console_timestamp(getattr(case, "opened_at", "")),
+        "updated_at": _loop_console_timestamp(getattr(case, "updated_at", "")),
+        "resolved_at": _loop_console_timestamp(getattr(case, "resolved_at", "")),
+        "closed_at": _loop_console_timestamp(getattr(case, "closed_at", "")),
         "issue_url": _loop_console_text(getattr(case, "issue_url", ""), limit=300),
         "issue_id": _loop_console_token(getattr(case, "issue_id", ""), limit=128),
         "operator_state": operator_state,
@@ -1270,7 +1274,7 @@ def _case_service_trace_summary(trace) -> dict[str, object]:
         "model_chain": _loop_console_text_list(payload.get("model_chain", []), limit=120, max_items=10),
         "prompt_version": _loop_console_token(payload.get("prompt_version", ""), limit=120),
         "knowledge_export_version": _loop_console_token(payload.get("knowledge_export_version", ""), limit=120),
-        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
         "schema_version": payload.get("schema_version", ""),
     }
 
@@ -1287,7 +1291,7 @@ def _case_service_feedback_summary(feedback) -> dict[str, object]:
         "actor_role": _loop_console_token(payload.get("actor_role", ""), limit=80),
         "feedback_type": _loop_console_token(payload.get("feedback_type", ""), limit=80),
         "comment": _loop_console_text(feedback_payload.get("comment", ""), limit=1000),
-        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
         "schema_version": payload.get("schema_version", ""),
     }
 
@@ -1313,9 +1317,9 @@ def _case_service_handoff_summary(handoff) -> dict[str, object]:
         "correlation_id": _loop_console_token(payload.get("correlation_id", ""), limit=128),
         "trace_id": _loop_console_token(payload.get("trace_id", ""), limit=128),
         "created_by": _loop_console_text(payload.get("created_by", ""), limit=240),
-        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
-        "updated_at": _loop_console_token(payload.get("updated_at", ""), limit=80),
-        "expires_at": _loop_console_token(payload.get("expires_at", ""), limit=80),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
+        "updated_at": _loop_console_timestamp(payload.get("updated_at", "")),
+        "expires_at": _loop_console_timestamp(payload.get("expires_at", "")),
         "schema_version": payload.get("schema_version", ""),
     }
 
@@ -1335,12 +1339,12 @@ def _case_service_verification_objective_summary(objective) -> dict[str, object]
         "required": bool(payload.get("required", True)),
         "required_consecutive_passes": int(payload.get("required_consecutive_passes", 0) or 0),
         "consecutive_pass_count": int(payload.get("consecutive_pass_count", 0) or 0),
-        "last_checked_at": _loop_console_token(payload.get("last_checked_at", ""), limit=80),
-        "next_check_at": _loop_console_token(payload.get("next_check_at", ""), limit=80),
+        "last_checked_at": _loop_console_timestamp(payload.get("last_checked_at", "")),
+        "next_check_at": _loop_console_timestamp(payload.get("next_check_at", "")),
         "evidence_ref": _loop_console_token(payload.get("evidence_ref", ""), limit=180),
         "failure_reason": _loop_console_text(payload.get("failure_reason", ""), limit=800),
-        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
-        "updated_at": _loop_console_token(payload.get("updated_at", ""), limit=80),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
+        "updated_at": _loop_console_timestamp(payload.get("updated_at", "")),
         "schema_version": payload.get("schema_version", ""),
     }
 
@@ -1360,7 +1364,7 @@ def _case_service_knowledge_artifact_summary(artifact) -> dict[str, object]:
         "summary": _loop_console_text(payload.get("summary", ""), limit=1200),
         "source_refs": _loop_console_text_list(payload.get("source_refs", []), limit=300),
         "created_by": _loop_console_token(payload.get("created_by", ""), limit=80),
-        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
         "schema_version": payload.get("schema_version", ""),
     }
 
@@ -1387,7 +1391,7 @@ def _case_service_outcome_summary(outcome) -> dict[str, object]:
         "safety_status": _loop_console_token(safety.get("status") or "", limit=80),
         "final_score": _safe_case_service_output_value(payload.get("final_score", {}), string_limit=120),
         "evidence_refs": _loop_console_text_list(payload.get("evidence_refs", []), limit=300),
-        "created_at": _loop_console_token(payload.get("created_at", ""), limit=80),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
         "schema_version": payload.get("schema_version", ""),
     }
 
@@ -2659,15 +2663,14 @@ def _case_service_case_summary(case) -> dict:
             limit=240,
         ),
         "origin": _loop_console_token(getattr(case, "origin", ""), limit=64),
-        "opened_at": _loop_console_token(getattr(case, "opened_at", ""), limit=80),
-        "updated_at": _loop_console_token(
+        "opened_at": _loop_console_timestamp(getattr(case, "opened_at", "")),
+        "updated_at": _loop_console_timestamp(
             getattr(case, "updated_at", "") or getattr(case, "opened_at", ""),
-            limit=80,
         ),
-        "resolved_at": _loop_console_token(getattr(case, "resolved_at", ""), limit=80),
-        "closed_at": _loop_console_token(getattr(case, "closed_at", ""), limit=80),
+        "resolved_at": _loop_console_timestamp(getattr(case, "resolved_at", "")),
+        "closed_at": _loop_console_timestamp(getattr(case, "closed_at", "")),
         "issue_url": _loop_console_text(getattr(case, "issue_url", ""), limit=300),
-        "suppressed_until": _loop_console_token(getattr(case, "suppressed_until", ""), limit=80),
+        "suppressed_until": _loop_console_timestamp(getattr(case, "suppressed_until", "")),
         "child_case_count": getattr(case, "child_case_count", 0) or 0,
     }
 
