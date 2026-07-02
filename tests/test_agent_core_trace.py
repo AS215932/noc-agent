@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from agent_core.contracts import LoopDecisionEnvelope
+
 from app import agent_core_trace
 
 
@@ -43,7 +45,7 @@ def test_emits_graph_proposal_evidence_and_decision_events(monkeypatch, tmp_path
 
     count = agent_core_trace.emit_state_trace(_state(), phase="resume")
 
-    assert count == 7
+    assert count == 8
     records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
     assert [record["event_type"] for record in records] == [
         "noc_graph_summary",
@@ -53,6 +55,7 @@ def test_emits_graph_proposal_evidence_and_decision_events(monkeypatch, tmp_path
         "noc_operator_decision",
         "noc_executed_action",
         "noc_verification_result",
+        "loop_decision_envelope",
     ]
     assert {record["run_id"] for record in records} == {"case_123"}
     assert {record["graph_id"] for record in records} == {"noc-agent"}
@@ -67,6 +70,12 @@ def test_emits_graph_proposal_evidence_and_decision_events(monkeypatch, tmp_path
     assert records[6]["event_type"] == "noc_verification_result"
     assert records[6]["objective_id"] == "objective_1"
     assert records[6]["parent_event_id"] == records[4]["event_id"]
+    envelope = LoopDecisionEnvelope.model_validate(records[7]["payload"]["loop_decision_envelope"])
+    assert envelope.loop == "noc"
+    assert envelope.decision == "draft"
+    assert envelope.case_id == "case_123"
+    assert envelope.human_outcome["operator"] == "pytest"
+    assert envelope.proposed_action["proposal_count"] == 2
 
 
 def test_emits_tuple_state_values_and_sanitizes_unknown_objects(monkeypatch, tmp_path):
@@ -83,9 +92,10 @@ def test_emits_tuple_state_values_and_sanitizes_unknown_objects(monkeypatch, tmp
 
     count = agent_core_trace.emit_state_trace(state, phase="resume")
 
-    assert count == 6
+    assert count == 7
     records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
     assert records[0]["payload"]["proposal_count"] == 1
     assert records[0]["payload"]["evidence_count"] == 1
     assert records[1]["payload"]["proposal"]["proposed_remediation"] == ["marker-as-text"]
     assert records[2]["payload"]["evidence_log"] == [{"source": "marker-as-text"}]
+    LoopDecisionEnvelope.model_validate(records[-1]["payload"]["loop_decision_envelope"])
