@@ -28,6 +28,11 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    InsightAction,
+    InsightDecisionRecord,
+    InsightLabel,
+    InsightLoop,
+    InsightSamplingClass,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
@@ -1449,6 +1454,161 @@ class PostgresCaseStore:
             else:
                 value = await conn.fetchval("SELECT count(*) FROM operator_feedback")
         return int(value or 0)
+
+    async def record_insight_decision(self, decision: InsightDecisionRecord) -> InsightDecisionRecord:
+        payload = decision.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO insight_decisions (
+                    insight_id, loop, fingerprint, sampling_class, action_selected,
+                    candidate_type, candidate_source, case_id, meta_case_id, trace_id,
+                    created_at, policy_version, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
+                ON CONFLICT (insight_id) DO UPDATE SET insight_id = insight_decisions.insight_id
+                RETURNING payload
+                """,
+                decision.insight_id,
+                decision.loop,
+                decision.fingerprint,
+                decision.sampling_class,
+                decision.action_selected,
+                decision.candidate_type,
+                decision.candidate_source,
+                decision.case_id,
+                decision.meta_case_id,
+                decision.trace_id,
+                decision.created_at,
+                decision.policy_version or "",
+                json.dumps(payload),
+                decision.schema_version,
+            )
+        return InsightDecisionRecord.model_validate(_row_payload(row))
+
+    async def get_insight_decision(self, insight_id: str) -> InsightDecisionRecord | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM insight_decisions WHERE insight_id = $1", insight_id)
+        return InsightDecisionRecord.model_validate(_row_payload(row)) if row else None
+
+    async def list_insight_decisions(
+        self,
+        *,
+        loop: InsightLoop | None = None,
+        action_selected: InsightAction | None = None,
+        sampling_class: InsightSamplingClass | None = None,
+        case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[InsightDecisionRecord]:
+        direction = "DESC" if newest_first else "ASC"
+        conditions: list[str] = []
+        args: list[Any] = []
+        if loop is not None:
+            args.append(loop)
+            conditions.append(f"loop = ${len(args)}")
+        if action_selected is not None:
+            args.append(action_selected)
+            conditions.append(f"action_selected = ${len(args)}")
+        if sampling_class is not None:
+            args.append(sampling_class)
+            conditions.append(f"sampling_class = ${len(args)}")
+        if case_id is not None:
+            args.append(case_id)
+            conditions.append(f"case_id = ${len(args)}")
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        if limit is not None:
+            args.append(_bounded_limit(limit))
+            limit_clause = f" LIMIT ${len(args)}"
+        else:
+            limit_clause = ""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT payload FROM insight_decisions{where}
+                ORDER BY created_at {direction}, insight_id {direction}
+                {limit_clause}
+                """,
+                *args,
+            )
+        return [InsightDecisionRecord.model_validate(_row_payload(row)) for row in rows]
+
+    async def count_insight_decisions(
+        self,
+        *,
+        loop: InsightLoop | None = None,
+        action_selected: InsightAction | None = None,
+        sampling_class: InsightSamplingClass | None = None,
+        case_id: str | None = None,
+    ) -> int:
+        conditions: list[str] = []
+        args: list[Any] = []
+        if loop is not None:
+            args.append(loop)
+            conditions.append(f"loop = ${len(args)}")
+        if action_selected is not None:
+            args.append(action_selected)
+            conditions.append(f"action_selected = ${len(args)}")
+        if sampling_class is not None:
+            args.append(sampling_class)
+            conditions.append(f"sampling_class = ${len(args)}")
+        if case_id is not None:
+            args.append(case_id)
+            conditions.append(f"case_id = ${len(args)}")
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        async with self.pool.acquire() as conn:
+            value = await conn.fetchval(f"SELECT count(*) FROM insight_decisions{where}", *args)
+        return int(value or 0)
+
+    async def record_insight_label(self, label: InsightLabel) -> InsightLabel:
+        payload = label.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO insight_labels (
+                    label_id, insight_id, loop, created_at, reference_action,
+                    reviewer, payload, schema_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)
+                ON CONFLICT (label_id) DO UPDATE SET label_id = insight_labels.label_id
+                RETURNING payload
+                """,
+                label.label_id,
+                label.insight_id,
+                label.loop,
+                label.created_at,
+                label.reference_action,
+                label.reviewer,
+                json.dumps(payload),
+                label.schema_version,
+            )
+        return InsightLabel.model_validate(_row_payload(row))
+
+    async def list_insight_labels(
+        self, *, insight_id: str | None = None, loop: InsightLoop | None = None, limit: int | None = None
+    ) -> list[InsightLabel]:
+        conditions: list[str] = []
+        args: list[Any] = []
+        if insight_id is not None:
+            args.append(insight_id)
+            conditions.append(f"insight_id = ${len(args)}")
+        if loop is not None:
+            args.append(loop)
+            conditions.append(f"loop = ${len(args)}")
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        if limit is not None:
+            args.append(_bounded_limit(limit))
+            limit_clause = f" LIMIT ${len(args)}"
+        else:
+            limit_clause = ""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT payload FROM insight_labels{where}
+                ORDER BY created_at ASC, label_id ASC
+                {limit_clause}
+                """,
+                *args,
+            )
+        return [InsightLabel.model_validate(_row_payload(row)) for row in rows]
 
 
 async def _insert_case_event(conn: Any, event: CaseEvent) -> CaseEvent:

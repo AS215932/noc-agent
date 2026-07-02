@@ -2,7 +2,15 @@ import json
 
 import pytest
 
-from app.cases import ObservationRecord, load_observation_fixture, replay_observations
+from app.cases import (
+    InsightDecisionRecord,
+    InsightLabel,
+    ObservationRecord,
+    load_insight_fixture,
+    load_observation_fixture,
+    replay_insights,
+    replay_observations,
+)
 
 
 @pytest.mark.asyncio
@@ -71,3 +79,56 @@ def test_load_observation_fixture_accepts_list_or_object(tmp_path):
 
     assert load_observation_fixture(list_path)[0].rule_id == "bgp"
     assert load_observation_fixture(object_path)[0].rule_id == "bgp"
+
+
+@pytest.mark.asyncio
+async def test_replay_insights_scores_idq_and_cgs():
+    decision = InsightDecisionRecord(
+        insight_id="ins1",
+        fingerprint="fp1",
+        sampling_class="surfaced",
+        candidate_type="hotspot",
+        candidate_source="scanner",
+        action_selected="notify",
+        support_facts=["disk free below threshold", "eta 2h"],
+    )
+    label = InsightLabel(
+        insight_id="ins1",
+        reference_action="notify",
+        support_facts=["disk free below threshold", "eta 2h"],
+        faithfulness_verdict="faithful",
+    )
+
+    result = await replay_insights([decision], [label])
+    metrics = await result.metrics()
+
+    assert metrics["idq"] == 1.0
+    assert metrics["cgs"] == 1.0
+    assert metrics["silence_rate"] == 0.0
+
+
+def test_load_insight_fixture(tmp_path):
+    decision = InsightDecisionRecord(
+        insight_id="ins1",
+        fingerprint="fp1",
+        sampling_class="withheld_logged",
+        candidate_type="hotspot",
+        candidate_source="scanner",
+        action_selected="stay_silent",
+    )
+    label = InsightLabel(insight_id="ins1", reference_action="stay_silent")
+    fixture = tmp_path / "insights.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "insights": [decision.model_dump(mode="json")],
+                "labels": [label.model_dump(mode="json")],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decisions, labels = load_insight_fixture(fixture)
+
+    assert decisions[0].insight_id == "ins1"
+    assert labels[0].reference_action == "stay_silent"

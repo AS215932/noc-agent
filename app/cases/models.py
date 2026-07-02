@@ -104,6 +104,10 @@ FeedbackType = Literal[
     "operator_merge",
     "operator_resolution_label",
 ]
+InsightAction = Literal["notify", "question", "draft", "stay_silent"]
+InsightSamplingClass = Literal["surfaced", "withheld_logged", "sampled_quiet_interval"]
+InsightLoop = Literal["engineering", "noc", "knowledge", "soc"]
+InsightFaithfulnessVerdict = Literal["faithful", "partially_faithful", "unsupported", "not_applicable"]
 
 
 def utc_now() -> str:
@@ -417,6 +421,78 @@ class OperatorFeedback(BaseModel):
         if not (self.case_id or self.meta_case_id or self.trace_id):
             raise ValueError("operator feedback requires a case_id, meta_case_id, or trace_id")
         return self
+
+
+class InsightScore(BaseModel):
+    """Separated benefit/cost score object for proactive insight decisions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    total: float | None = None
+    components: dict[str, float] = Field(default_factory=dict)
+    rationale: list[str] = Field(default_factory=list)
+    schema_version: int = 1
+
+
+class InsightDecisionRecord(BaseModel):
+    """Durable proactive-loop decision, including deliberate silence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    insight_id: str = Field(default_factory=lambda: f"ins_{uuid4().hex[:12]}")
+    loop: InsightLoop = "noc"
+    created_at: str = Field(default_factory=utc_now)
+    fingerprint: str
+    sampling_class: InsightSamplingClass
+    candidate_type: str
+    candidate_source: str
+    case_id: str | None = None
+    meta_case_id: str | None = None
+    trace_id: str | None = None
+    observation_ids: list[str] = Field(default_factory=list)
+    state_snapshot_refs: list[str] = Field(default_factory=list)
+    support_facts: list[str] = Field(default_factory=list)
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    action_space: list[InsightAction] = Field(
+        default_factory=lambda: ["notify", "question", "draft", "stay_silent"]
+    )
+    action_selected: InsightAction
+    why_now: str = ""
+    why_not_other_actions: dict[InsightAction, str] = Field(default_factory=dict)
+    expected_utility: InsightScore = Field(default_factory=InsightScore)
+    interruption_cost: InsightScore = Field(default_factory=InsightScore)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    risk_class: Literal["low", "medium", "high", "critical"] | None = None
+    policy_version: str | None = None
+    tool_versions: dict[str, str] = Field(default_factory=dict)
+    budget_context: dict[str, Any] = Field(default_factory=dict)
+    reference_action: InsightAction | None = None
+    acceptable_alternatives: list[InsightAction] = Field(default_factory=list)
+    faithfulness_verdict: InsightFaithfulnessVerdict | None = None
+    evidence_precision: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence_recall: float | None = Field(default=None, ge=0.0, le=1.0)
+    human_feedback: dict[str, Any] = Field(default_factory=dict)
+    downstream_outcome: dict[str, Any] = Field(default_factory=dict)
+    learning_event_ref: str | None = None
+    schema_version: int = 1
+
+
+class InsightLabel(BaseModel):
+    """Human or fixture label for replay metrics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label_id: str = Field(default_factory=lambda: f"ilabel_{uuid4().hex[:12]}")
+    insight_id: str
+    loop: InsightLoop = "noc"
+    created_at: str = Field(default_factory=utc_now)
+    reference_action: InsightAction
+    acceptable_alternatives: list[InsightAction] = Field(default_factory=list)
+    support_facts: list[str] = Field(default_factory=list)
+    faithfulness_verdict: InsightFaithfulnessVerdict | None = None
+    feedback: dict[str, Any] = Field(default_factory=dict)
+    reviewer: str | None = None
+    schema_version: int = 1
 
 
 class OutboxIntent(BaseModel):

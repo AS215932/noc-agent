@@ -1296,6 +1296,52 @@ def _case_service_feedback_summary(feedback) -> dict[str, object]:
     }
 
 
+def _case_service_insight_summary(insight) -> dict[str, object]:
+    payload = insight.model_dump(mode="json")
+    utility = payload.get("expected_utility") if isinstance(payload.get("expected_utility"), dict) else {}
+    cost = payload.get("interruption_cost") if isinstance(payload.get("interruption_cost"), dict) else {}
+    return {
+        "insight_id": _loop_console_token(payload.get("insight_id", ""), limit=128),
+        "loop": _loop_console_token(payload.get("loop", ""), limit=80),
+        "case_id": _loop_console_token(payload.get("case_id", ""), limit=128),
+        "meta_case_id": _loop_console_token(payload.get("meta_case_id", ""), limit=128),
+        "trace_id": _loop_console_token(payload.get("trace_id", ""), limit=128),
+        "fingerprint": _loop_console_token(payload.get("fingerprint", ""), limit=128),
+        "sampling_class": _loop_console_token(payload.get("sampling_class", ""), limit=80),
+        "candidate_type": _loop_console_token(payload.get("candidate_type", ""), limit=120),
+        "candidate_source": _loop_console_token(payload.get("candidate_source", ""), limit=180),
+        "action_selected": _loop_console_token(payload.get("action_selected", ""), limit=80),
+        "why_now": _loop_console_text(payload.get("why_now", ""), limit=1000),
+        "expected_utility_total": utility.get("total"),
+        "interruption_cost_total": cost.get("total"),
+        "confidence": payload.get("confidence"),
+        "risk_class": _loop_console_token(payload.get("risk_class", ""), limit=80),
+        "policy_version": _loop_console_token(payload.get("policy_version", ""), limit=120),
+        "support_facts": _loop_console_text_list(payload.get("support_facts", []), limit=500, max_items=8),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
+def _case_service_insight_label_summary(label) -> dict[str, object]:
+    payload = label.model_dump(mode="json")
+    feedback = payload.get("feedback") if isinstance(payload.get("feedback"), dict) else {}
+    return {
+        "label_id": _loop_console_token(payload.get("label_id", ""), limit=128),
+        "insight_id": _loop_console_token(payload.get("insight_id", ""), limit=128),
+        "loop": _loop_console_token(payload.get("loop", ""), limit=80),
+        "reference_action": _loop_console_token(payload.get("reference_action", ""), limit=80),
+        "acceptable_alternatives": _loop_console_text_list(
+            payload.get("acceptable_alternatives", []), limit=80, max_items=8
+        ),
+        "faithfulness_verdict": _loop_console_token(payload.get("faithfulness_verdict", ""), limit=80),
+        "reviewer": _loop_console_token(payload.get("reviewer", ""), limit=120),
+        "comment": _loop_console_text(feedback.get("comment", ""), limit=1000),
+        "created_at": _loop_console_timestamp(payload.get("created_at", "")),
+        "schema_version": payload.get("schema_version", ""),
+    }
+
+
 def _case_service_handoff_summary(handoff) -> dict[str, object]:
     payload = handoff.model_dump(mode="json")
     return {
@@ -1939,6 +1985,17 @@ class LoopConsoleDecisionRequest(LoopConsoleBaseRequest):
     comment: str = ""
 
 
+class LoopConsoleInsightLabelRequest(LoopConsoleBaseRequest):
+    reference_action: str = Field(pattern="^(notify|question|draft|stay_silent)$")
+    acceptable_alternatives: list[str] = Field(default_factory=list)
+    support_facts: list[str] = Field(default_factory=list)
+    faithfulness_verdict: str | None = Field(
+        default=None,
+        pattern="^(faithful|partially_faithful|unsupported|not_applicable)$",
+    )
+    comment: str = ""
+
+
 class LoopConsoleKnowledgeContextRequest(LoopConsoleBaseRequest):
     handoff_id: str = ""
     objective_key: str = ""
@@ -2146,6 +2203,7 @@ async def loop_console_case_detail(case_id: str, request: Request):
         events,
         traces,
         feedback,
+        insights,
         handoffs,
         objectives,
         artifacts,
@@ -2153,6 +2211,7 @@ async def loop_console_case_detail(case_id: str, request: Request):
         event_count,
         trace_count,
         feedback_count,
+        insight_count,
         handoff_count,
         objective_count,
         artifact_count,
@@ -2171,6 +2230,11 @@ async def loop_console_case_detail(case_id: str, request: Request):
         runtime.store.list_feedback(
             case_id=canonical_case_id,
             limit=LOOP_CONSOLE_DETAIL_TIMELINE_LIMIT,
+            newest_first=True,
+        ),
+        runtime.store.list_insight_decisions(
+            case_id=canonical_case_id,
+            limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT,
             newest_first=True,
         ),
         runtime.store.list_handoffs(case_id=canonical_case_id, limit=LOOP_CONSOLE_DETAIL_COLLECTION_LIMIT),
@@ -2192,6 +2256,7 @@ async def loop_console_case_detail(case_id: str, request: Request):
         runtime.store.count_case_events(canonical_case_id),
         runtime.store.count_traces(case_id=canonical_case_id),
         runtime.store.count_feedback(case_id=canonical_case_id),
+        runtime.store.count_insight_decisions(case_id=canonical_case_id),
         runtime.store.count_handoffs(case_id=canonical_case_id),
         runtime.store.count_verification_objectives(case_id=canonical_case_id),
         runtime.store.count_knowledge_artifacts(case_id=canonical_case_id),
@@ -2201,6 +2266,7 @@ async def loop_console_case_detail(case_id: str, request: Request):
         "events": event_count,
         "traces": trace_count,
         "feedback": feedback_count,
+        "insights": insight_count,
         "timeline": event_count + feedback_count,
         "handoffs": handoff_count,
         "verification_objectives": objective_count,
@@ -2224,6 +2290,7 @@ async def loop_console_case_detail(case_id: str, request: Request):
         ),
         "traces": _loop_console_limit_rows([_case_service_trace_summary(trace) for trace in traces]),
         "feedback": _loop_console_limit_rows([_case_service_feedback_summary(item) for item in feedback]),
+        "insights": _loop_console_limit_rows([_case_service_insight_summary(item) for item in insights]),
         "handoffs": _loop_console_limit_rows([_case_service_handoff_summary(item) for item in handoffs]),
         "verification_objectives": _loop_console_limit_rows(
             [_case_service_verification_objective_summary(item) for item in objectives]
@@ -2319,6 +2386,119 @@ async def loop_console_outbox(
     safe_status = _validated_case_service_outbox_status(outbox_status)
     rows = await runtime.store.list_outbox(status=safe_status)
     return {"status": "ok", "outbox": [row.model_dump(mode="json") for row in rows]}
+
+
+@app.get("/loop-console/v1/insights")
+async def loop_console_insights(
+    request: Request,
+    loop: str | None = Query(default=None),
+    action: str | None = Query(default=None),
+    sampling_class: str | None = Query(default=None),
+    case_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    rows = await runtime.store.list_insight_decisions(
+        loop=_validated_insight_loop(loop),
+        action_selected=_validated_insight_action(action),
+        sampling_class=_validated_insight_sampling_class(sampling_class),
+        case_id=_loop_console_token(case_id, limit=128) if case_id else None,
+        limit=limit,
+        newest_first=True,
+    )
+    return {
+        "status": "ok",
+        "schema_version": "loop-console.v1",
+        "insights": [_case_service_insight_summary(row) for row in rows],
+    }
+
+
+@app.get("/loop-console/v1/insight-metrics")
+async def loop_console_insight_metrics(request: Request, loop: str | None = Query(default="noc")):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    safe_loop = _validated_insight_loop(loop)
+    actions = ["notify", "question", "draft", "stay_silent"]
+    sampling_classes = ["surfaced", "withheld_logged", "sampled_quiet_interval"]
+    action_counts = {
+        action: await runtime.store.count_insight_decisions(loop=safe_loop, action_selected=action) for action in actions
+    }
+    sampling_counts = {
+        sampling: await runtime.store.count_insight_decisions(loop=safe_loop, sampling_class=sampling)
+        for sampling in sampling_classes
+    }
+    total = await runtime.store.count_insight_decisions(loop=safe_loop)
+    silence = action_counts.get("stay_silent", 0)
+    return {
+        "status": "ok",
+        "schema_version": "loop-console.v1",
+        "loop": safe_loop,
+        "total": total,
+        "action_counts": action_counts,
+        "sampling_counts": sampling_counts,
+        "silence_rate": round(silence / total, 4) if total else 0.0,
+    }
+
+
+@app.get("/loop-console/v1/insights/{insight_id}")
+async def loop_console_insight_detail(insight_id: str, request: Request):
+    _require_loop_console_request(request, body={})
+    runtime = _require_case_service_runtime()
+    insight = await runtime.store.get_insight_decision(_loop_console_token(insight_id, limit=128))
+    if insight is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    labels = await runtime.store.list_insight_labels(insight_id=insight.insight_id)
+    return {
+        "status": "ok",
+        "schema_version": "loop-console.v1",
+        "insight": insight.model_dump(mode="json"),
+        "summary": _case_service_insight_summary(insight),
+        "labels": [_case_service_insight_label_summary(label) for label in labels],
+    }
+
+
+@app.post("/loop-console/v1/insights/{insight_id}/label")
+async def loop_console_insight_label(
+    insight_id: str, request_body: LoopConsoleInsightLabelRequest, request: Request
+):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    runtime = _require_case_service_runtime()
+    safe_insight_id = _loop_console_token(insight_id, limit=128)
+    insight = await runtime.store.get_insight_decision(safe_insight_id)
+    if insight is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    from app.cases.models import InsightLabel
+
+    label_id = _loop_console_insight_label_id(request_body.idempotency_key, safe_insight_id)
+    try:
+        label = await runtime.service.record_insight_label(
+            InsightLabel(
+                label_id=label_id,
+                insight_id=insight.insight_id,
+                loop=insight.loop,
+                reference_action=request_body.reference_action,
+                acceptable_alternatives=[
+                    _validated_required_insight_action(action) for action in request_body.acceptable_alternatives
+                ],
+                support_facts=[_loop_console_text(item, limit=500) for item in request_body.support_facts[:20]],
+                faithfulness_verdict=request_body.faithfulness_verdict,
+                feedback={
+                    "source": "loop_console",
+                    "comment": _loop_console_text(request_body.comment, limit=1000),
+                    **dict(request_body.payload),
+                },
+                reviewer=_loop_console_token(request_body.actor_id, limit=120),
+            )
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid insight label payload") from exc
+    return {
+        "status": "ok",
+        "insight_id": insight.insight_id,
+        "label": _case_service_insight_label_summary(label),
+    }
 
 
 @app.post("/loop-console/v1/cases/{case_id}/feedback")
@@ -3122,6 +3302,42 @@ def _loop_console_action_id(action: str, idempotency_key: str, target_id: str) -
 def _loop_console_feedback_id(action: str, idempotency_key: str, target_id: str) -> str:
     digest = hashlib.sha256(f"{action}:{target_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:16]
     return f"fb_loop_console_{digest}"
+
+
+def _loop_console_insight_label_id(idempotency_key: str, insight_id: str) -> str:
+    digest = hashlib.sha256(f"insight_label:{insight_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:16]
+    return f"ilabel_loop_console_{digest}"
+
+
+def _validated_insight_loop(value: str | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    token = _loop_console_token(value, limit=80)
+    if token not in {"engineering", "noc", "knowledge", "soc"}:
+        raise HTTPException(status_code=422, detail="Invalid insight loop")
+    return token
+
+
+def _validated_insight_action(value: str | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return _validated_required_insight_action(value)
+
+
+def _validated_required_insight_action(value: str) -> str:
+    token = _loop_console_token(value, limit=80)
+    if token not in {"notify", "question", "draft", "stay_silent"}:
+        raise HTTPException(status_code=422, detail="Invalid insight action")
+    return token
+
+
+def _validated_insight_sampling_class(value: str | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    token = _loop_console_token(value, limit=80)
+    if token not in {"surfaced", "withheld_logged", "sampled_quiet_interval"}:
+        raise HTTPException(status_code=422, detail="Invalid insight sampling class")
+    return token
 
 
 async def _loop_console_has_event(case_id: str, event_id: str) -> bool:

@@ -30,6 +30,9 @@ from app.cases.models import (
     CaseIdentityAlias,
     CaseKind,
     CaseStatus,
+    InsightDecisionRecord,
+    InsightLabel,
+    InsightScore,
     MetaCaseProjection,
     ObservationRecord,
     ObservationStatus,
@@ -45,7 +48,14 @@ from app.cases.notifications import observation_from_icinga_alert_payload, obser
 from app.cases.outbox import OutboxHandlerResult, OutboxProcessReport, OutboxProcessor
 from app.cases.policy import CasePolicy
 from app.cases.proactive import observation_from_hotspot
-from app.cases.replay import ReplayResult, load_observation_fixture, replay_observations
+from app.cases.replay import (
+    InsightReplayResult,
+    ReplayResult,
+    load_insight_fixture,
+    load_observation_fixture,
+    replay_insights,
+    replay_observations,
+)
 from app.cases.runtime import CaseServiceRuntime, build_case_service_runtime_from_env, process_case_outbox_once
 from app.cases.service import CaseService, ObserveResult, observation_identity_fingerprint
 from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult, InMemoryCaseStore
@@ -72,6 +82,10 @@ __all__ = [
     "HandoffUpdate",
     "HandoffUpdateResult",
     "InMemoryCaseStore",
+    "InsightDecisionRecord",
+    "InsightLabel",
+    "InsightReplayResult",
+    "InsightScore",
     "KnowledgeArtifact",
     "MetaCaseProjection",
     "MetaCaseResult",
@@ -102,12 +116,14 @@ __all__ = [
     "build_report_handler",
     "event_fingerprint_from_parts",
     "lhp_payload_hash",
+    "load_insight_fixture",
     "load_observation_fixture",
     "observation_from_hotspot",
     "observation_from_icinga_alert_payload",
     "observation_identity_fingerprint",
     "observations_from_alertmanager",
     "process_case_outbox_once",
+    "replay_insights",
     "replay_observations",
     "require_handoff_transition",
     "sanitize_lhp_payload",

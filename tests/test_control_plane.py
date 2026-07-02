@@ -12,6 +12,7 @@ from app.cases import (
     CaseService,
     HandoffUpdate,
     InMemoryCaseStore,
+    InsightDecisionRecord,
     KnowledgeArtifact,
     ObservationRecord,
     OutcomeRecord,
@@ -24,6 +25,7 @@ from app.main import (
     LocalDecisionRequest,
     LoopConsoleAckRequest,
     LoopConsoleFeedbackRequest,
+    LoopConsoleInsightLabelRequest,
     LoopConsoleKnowledgeArtifactProposalRequest,
     LoopConsoleKnowledgeArtifactReviewRequest,
     LoopConsoleKnowledgeContextRequest,
@@ -56,6 +58,10 @@ from app.main import (
     loop_console_cases,
     loop_console_health,
     loop_console_handoff_update,
+    loop_console_insight_detail,
+    loop_console_insight_label,
+    loop_console_insight_metrics,
+    loop_console_insights,
     loop_console_knowledge_artifact_proposal,
     loop_console_knowledge_artifact_review,
     loop_console_knowledge_context_request,
@@ -341,6 +347,19 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
             payload={"transcript": "raw final evidence"},
         )
     )
+    insight = await service.record_insight_decision(
+        InsightDecisionRecord(
+            insight_id="insight_console_1",
+            fingerprint="fp-console",
+            sampling_class="surfaced",
+            candidate_type="hotspot",
+            candidate_source="proactive_scanner:test",
+            case_id=case.case_id,
+            action_selected="notify",
+            why_now="test insight surfaced",
+            support_facts=["disk free below threshold"],
+        )
+    )
 
     class _Runtime:
         pass
@@ -405,6 +424,40 @@ async def test_loop_console_v1_reads_and_writes_case_service_state(monkeypatch):
     assert "payload" not in detail["verification_objectives"][0]
     assert "payload" not in detail["knowledge_artifacts"][0]
     assert "payload" not in detail["outcomes"][0]
+    assert detail["insights"][0]["insight_id"] == insight.insight_id
+    insights_response = await loop_console_insights(
+        _console_request("GET", "/loop-console/v1/insights?loop=noc"),
+        loop="noc",
+        action=None,
+        sampling_class=None,
+        case_id=None,
+        limit=100,
+    )
+    assert insights_response["insights"][0]["insight_id"] == insight.insight_id
+    metrics_response = await loop_console_insight_metrics(
+        _console_request("GET", "/loop-console/v1/insight-metrics?loop=noc"),
+        loop="noc",
+    )
+    assert metrics_response["total"] >= 1
+    insight_detail = await loop_console_insight_detail(
+        insight.insight_id,
+        _console_request("GET", f"/loop-console/v1/insights/{insight.insight_id}"),
+    )
+    assert insight_detail["summary"]["action_selected"] == "notify"
+    label_request = LoopConsoleInsightLabelRequest(
+        actor_id="operator",
+        idempotency_key="insight-label-1",
+        reference_action="notify",
+        support_facts=["disk free below threshold"],
+        comment="right call",
+    )
+    label_body = label_request.model_dump(mode="json")
+    label_response = await loop_console_insight_label(
+        insight.insight_id,
+        label_request,
+        _console_request("POST", f"/loop-console/v1/insights/{insight.insight_id}/label", label_body),
+    )
+    assert label_response["label"]["reference_action"] == "notify"
     timeline_response = await loop_console_case_timeline(
         case.case_id,
         _console_request("GET", f"/loop-console/v1/cases/{case.case_id}/timeline"),

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app import log
-from app.cases.models import AtomicCaseProjection, SourceHealth
+from app.cases.models import AtomicCaseProjection, InsightDecisionRecord, InsightScore, SourceHealth
 from app.config import LoopHandoffSettings, ProactiveLoopSettings, load_loop_handoff_settings, load_proactive_settings
 from app.discord import Verbosity, send_discord_notification
 from app.icinga_ack import acknowledge_icinga
@@ -215,6 +215,13 @@ class ProactiveLoop:
 
             gate = evaluate_gate(self.settings, ledger, report.hotspots)
             investigated = await self._investigate(gate, decision, report)
+            await self._record_insight_decisions(
+                effective=effective,
+                report=report,
+                decision=decision,
+                gate=gate,
+                ledger=ledger,
+            )
 
             update_ledger(
                 self._state_dir,
@@ -279,6 +286,180 @@ class ProactiveLoop:
         if not use_case_service:
             self._record_investigations(done)
         return investigated
+
+    async def _record_insight_decisions(
+        self,
+        *,
+        effective: list[Hotspot],
+        report: ProactiveCycleReport,
+        decision: DecisionContext,
+        gate: GateDecision,
+        ledger: dict[str, Any],
+    ) -> None:
+        """Best-effort Level 3 insight ledger: includes explicit silence.
+
+        The operational loop already performs the right conservative actions.
+        This records those actions in a replayable form before the reporting
+        de-dup gate and suppressions hide the denominator.
+        """
+
+        case_service = self.case_service
+        if case_service is None:
+            return
+        try:
+            should_notify, _, _ = self._report_decision(report)
+            reported_fps = {h.fingerprint() for h in report.hotspots}
+            investigated_keys = set(report.investigated)
+            eligible_fps = {h.fingerprint() for h in gate.eligible}
+            snoozed_keys = set(report.auto_snoozed)
+            if not effective:
+                await case_service.record_insight_decision(
+                    InsightDecisionRecord(
+                        loop="noc",
+                        fingerprint=f"quiet:{report.cycle_id}",
+                        sampling_class="sampled_quiet_interval",
+                        candidate_type="quiet_interval",
+                        candidate_source="proactive_scanner",
+                        action_selected="stay_silent",
+                        why_now="No scanner hotspot was firing in this cycle.",
+                        why_not_other_actions={
+                            "notify": "No operator-relevant change was observed.",
+                            "question": "No ambiguity requires operator input.",
+                            "draft": "No case or handoff candidate exists.",
+                        },
+                        expected_utility=InsightScore(total=0.0, rationale=["No active hotspot."]),
+                        interruption_cost=InsightScore(
+                            total=0.2,
+                            components={"baseline_operator_interruption": 0.2},
+                            rationale=["Avoids an empty-cycle notification."],
+                        ),
+                        confidence=1.0,
+                        policy_version=self.settings.ruleset_version,
+                        budget_context=_insight_budget_context(ledger, gate),
+                    )
+                )
+                return
+            for hotspot in effective:
+                fp = hotspot.fingerprint()
+                case_id = await self._case_id_for_fingerprint(fp)
+                if fp not in reported_fps:
+                    reason = self._silence_reason_for_hotspot(hotspot, gate=gate, snoozed_keys=snoozed_keys)
+                    await case_service.record_insight_decision(
+                        self._insight_from_hotspot(
+                            hotspot,
+                            report=report,
+                            decision=decision,
+                            gate=gate,
+                            ledger=ledger,
+                            case_id=case_id,
+                            action_selected="stay_silent",
+                            sampling_class="withheld_logged",
+                            why_now=reason,
+                            interruption_reason=reason,
+                        )
+                    )
+                    continue
+                if hotspot.key in investigated_keys:
+                    action = "draft" if hotspot.warrants_change else "notify"
+                    why = "Investigated within budget and surfaced with diagnostic context."
+                elif should_notify:
+                    action = "notify"
+                    why = "Hotspot set changed or was due for reassertion."
+                else:
+                    action = "stay_silent"
+                    why = "Digest de-duplication suppressed an unchanged hotspot set."
+                sampling_class = "surfaced" if action != "stay_silent" else "withheld_logged"
+                await case_service.record_insight_decision(
+                    self._insight_from_hotspot(
+                        hotspot,
+                        report=report,
+                        decision=decision,
+                        gate=gate,
+                        ledger=ledger,
+                        case_id=case_id,
+                        action_selected=action,
+                        sampling_class=sampling_class,
+                        why_now=why,
+                        interruption_reason=why,
+                        eligible=fp in eligible_fps,
+                    )
+                )
+        except Exception as exc:
+            safe = classify_exception(exc)
+            record_case_service_shadow_failure(path="proactive_insight_ledger", category=safe.category)
+            log_exception("proactive_insight_record_failed", exc, category=safe.category)
+
+    def _insight_from_hotspot(
+        self,
+        hotspot: Hotspot,
+        *,
+        report: ProactiveCycleReport,
+        decision: DecisionContext,
+        gate: GateDecision,
+        ledger: dict[str, Any],
+        case_id: str | None,
+        action_selected: str,
+        sampling_class: str,
+        why_now: str,
+        interruption_reason: str,
+        eligible: bool = False,
+    ) -> InsightDecisionRecord:
+        support_facts = _support_facts(hotspot)
+        return InsightDecisionRecord(
+            loop="noc",
+            fingerprint=hotspot.fingerprint(),
+            sampling_class=sampling_class,  # type: ignore[arg-type]
+            candidate_type="hotspot",
+            candidate_source=f"proactive_scanner:{hotspot.rule_id}",
+            case_id=case_id,
+            observation_ids=[],
+            state_snapshot_refs=[report.cycle_id, decision.decision_id],
+            support_facts=support_facts,
+            evidence_refs=[
+                {
+                    "kind": "hotspot_evidence",
+                    "ref": f"{hotspot.rule_id}:{idx}",
+                    "label": evidence.label,
+                    "query": evidence.query,
+                }
+                for idx, evidence in enumerate(hotspot.evidence)
+            ],
+            action_selected=action_selected,  # type: ignore[arg-type]
+            why_now=why_now,
+            why_not_other_actions=_why_not_other_actions(
+                action_selected=action_selected,
+                eligible=eligible,
+                gate_reason=gate.reason,
+            ),
+            expected_utility=_expected_utility(hotspot),
+            interruption_cost=_interruption_cost(hotspot, reason=interruption_reason),
+            confidence=_bounded_confidence(hotspot.score),
+            risk_class=_risk_class(hotspot.severity),
+            policy_version=self.settings.ruleset_version,
+            tool_versions={"scanner_ruleset": self.settings.ruleset_version},
+            budget_context=_insight_budget_context(ledger, gate),
+        )
+
+    async def _case_id_for_fingerprint(self, fingerprint: str) -> str | None:
+        if self.case_service is None:
+            return None
+        try:
+            case = await self.case_service.case_for_alias("source_fp", fingerprint)
+            return getattr(case, "case_id", None) if case is not None else None
+        except Exception:
+            return None
+
+    def _silence_reason_for_hotspot(
+        self, hotspot: Hotspot, *, gate: GateDecision, snoozed_keys: set[str]
+    ) -> str:
+        if hotspot.key in snoozed_keys:
+            return "Agent auto-snoozed this non-urgent hotspot."
+        entry = self._suppression_entry_for_hotspot(hotspot)
+        if entry is not None:
+            return f"Operator suppression active: {entry.get('reason', 'suppressed')}"
+        if gate.over_budget:
+            return gate.reason
+        return "Hotspot was withheld by reporting or investigation policy."
 
     async def _case_service_should_investigate(self, hotspot: Hotspot) -> bool:
         case_service = self.case_service
@@ -835,6 +1016,83 @@ def _hotspot_field(
                 meta.append(f"case: {number}")
     value += "\n" + " · ".join(meta)
     return {"name": f"{emoji} {hotspot.title}"[:256], "value": value[:1024] or "—"}
+
+
+def _support_facts(hotspot: Hotspot) -> list[str]:
+    facts = [hotspot.summary] if hotspot.summary else []
+    for evidence in hotspot.evidence:
+        bits = [bit for bit in (evidence.label, evidence.value, evidence.threshold, evidence.detail) if bit]
+        if bits:
+            facts.append(" | ".join(bits))
+    return facts[:8]
+
+
+def _expected_utility(hotspot: Hotspot) -> InsightScore:
+    severity_component = {"LOW": 0.2, "MEDIUM": 0.55, "HIGH": 0.85}.get(hotspot.severity, 0.1)
+    score_component = min(1.0, max(0.0, float(hotspot.score) / 100.0))
+    change_component = 0.15 if hotspot.warrants_change else 0.0
+    total = min(1.0, round((severity_component * 0.55) + (score_component * 0.3) + change_component, 3))
+    rationale = [f"{hotspot.severity} severity", f"scanner score {hotspot.score:g}"]
+    if hotspot.warrants_change:
+        rationale.append("candidate for config or handoff work")
+    return InsightScore(
+        total=total,
+        components={
+            "severity": severity_component,
+            "scanner_score": score_component,
+            "change_candidate": change_component,
+        },
+        rationale=rationale,
+    )
+
+
+def _interruption_cost(hotspot: Hotspot, *, reason: str) -> InsightScore:
+    severity_cost = {"LOW": 0.45, "MEDIUM": 0.25, "HIGH": 0.1}.get(hotspot.severity, 0.3)
+    change_cost = -0.05 if hotspot.warrants_change else 0.0
+    suppression_cost = 0.35 if "suppression" in reason.lower() or "snoozed" in reason.lower() else 0.0
+    total = min(1.0, max(0.0, round(0.2 + severity_cost + change_cost + suppression_cost, 3)))
+    return InsightScore(
+        total=total,
+        components={
+            "baseline_operator_interruption": 0.2,
+            "severity_noise": severity_cost,
+            "change_candidate_offset": change_cost,
+            "suppression_context": suppression_cost,
+        },
+        rationale=[reason],
+    )
+
+
+def _why_not_other_actions(*, action_selected: str, eligible: bool, gate_reason: str) -> dict[str, str]:
+    reasons: dict[str, str] = {}
+    if action_selected != "notify":
+        reasons["notify"] = "Notification utility did not exceed interruption cost for this cycle."
+    if action_selected != "question":
+        reasons["question"] = "No operator clarification was required before the safe next step."
+    if action_selected != "draft":
+        reasons["draft"] = gate_reason if not eligible else "No new draftable handoff was selected for this hotspot."
+    if action_selected != "stay_silent":
+        reasons["stay_silent"] = "The hotspot met the surfacing policy for this cycle."
+    return reasons
+
+
+def _insight_budget_context(ledger: dict[str, Any], gate: GateDecision) -> dict[str, Any]:
+    return {
+        "daily_cost_usd": ledger.get("cost_usd", 0.0),
+        "daily_investigations": ledger.get("investigations", 0),
+        "daily_handoffs": ledger.get("handoffs", 0),
+        "gate_max_investigations": gate.max_investigations,
+        "gate_reason": gate.reason,
+        "over_budget": gate.over_budget,
+    }
+
+
+def _bounded_confidence(score: float) -> float:
+    return min(0.99, max(0.2, round(0.35 + (float(score) / 100.0) * 0.6, 3)))
+
+
+def _risk_class(severity: str) -> str:
+    return {"LOW": "low", "MEDIUM": "medium", "HIGH": "high"}.get(str(severity).upper(), "low")
 
 
 def _default_model_chain() -> list[str]:

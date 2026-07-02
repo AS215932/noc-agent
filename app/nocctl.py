@@ -51,6 +51,7 @@ def main() -> None:
 
     replay = sub.add_parser("replay", help="Replay a sanitized observation fixture (offline).")
     replay.add_argument("fixture")
+    replay.add_argument("--insights", action="store_true", help="Replay an insight-policy fixture instead.")
 
     approvals = sub.add_parser("approvals", help="Operator signing helpers (offline).")
     approvals_sub = approvals.add_subparsers(dest="approvals_command", required=True)
@@ -72,7 +73,7 @@ def main() -> None:
         print(json.dumps(authorization, indent=2, sort_keys=True))
         return
     if args.command == "replay":
-        print(json.dumps(asyncio.run(_run_replay(args.fixture)), indent=2, sort_keys=True))
+        print(json.dumps(asyncio.run(_run_replay(args.fixture, insights=args.insights)), indent=2, sort_keys=True))
         return
 
     if not args.token:
@@ -94,7 +95,15 @@ def main() -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-async def _run_replay(fixture: str) -> dict:
+async def _run_replay(fixture: str, *, insights: bool = False) -> dict:
+    if insights:
+        from app.cases.replay import load_insight_fixture, replay_insights
+
+        decisions, labels = load_insight_fixture(fixture)
+        result = await replay_insights(decisions, labels)
+        metrics = await result.metrics()
+        return {"fixture": fixture, "metrics": metrics}
+
     from app.cases.replay import load_observation_fixture, replay_observations
 
     observations = load_observation_fixture(fixture)

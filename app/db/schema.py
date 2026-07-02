@@ -7,7 +7,7 @@ tables now back the primary reactive, control-plane, and proactive case paths.
 
 from __future__ import annotations
 
-CASE_SCHEMA_VERSION = 2
+CASE_SCHEMA_VERSION = 3
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -186,6 +186,52 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         payload JSONB NOT NULL,
         created_at TEXT NOT NULL DEFAULT ''
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS insight_decisions (
+        insight_id TEXT PRIMARY KEY,
+        loop TEXT NOT NULL,
+        fingerprint TEXT NOT NULL DEFAULT '',
+        sampling_class TEXT NOT NULL,
+        action_selected TEXT NOT NULL,
+        candidate_type TEXT NOT NULL DEFAULT '',
+        candidate_source TEXT NOT NULL DEFAULT '',
+        case_id TEXT REFERENCES cases(case_id) ON DELETE SET NULL,
+        meta_case_id TEXT REFERENCES cases(case_id) ON DELETE SET NULL,
+        trace_id TEXT REFERENCES traces(trace_id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT '',
+        policy_version TEXT NOT NULL DEFAULT '',
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        schema_version INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS insight_decisions_loop_action_idx
+        ON insight_decisions (loop, action_selected, sampling_class, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS insight_decisions_case_idx
+        ON insight_decisions (case_id, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS insight_decisions_fingerprint_idx
+        ON insight_decisions (fingerprint)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS insight_labels (
+        label_id TEXT PRIMARY KEY,
+        insight_id TEXT NOT NULL REFERENCES insight_decisions(insight_id) ON DELETE CASCADE,
+        loop TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT '',
+        reference_action TEXT NOT NULL,
+        reviewer TEXT,
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        schema_version INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS insight_labels_insight_idx
+        ON insight_labels (insight_id, created_at)
     """,
     """
     CREATE TABLE IF NOT EXISTS case_handoffs (

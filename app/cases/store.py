@@ -29,6 +29,11 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    InsightAction,
+    InsightDecisionRecord,
+    InsightLabel,
+    InsightLoop,
+    InsightSamplingClass,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
@@ -233,6 +238,36 @@ class CaseStore(Protocol):
 
     async def count_feedback(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int: ...
 
+    async def record_insight_decision(self, decision: InsightDecisionRecord) -> InsightDecisionRecord: ...
+
+    async def get_insight_decision(self, insight_id: str) -> InsightDecisionRecord | None: ...
+
+    async def list_insight_decisions(
+        self,
+        *,
+        loop: InsightLoop | None = None,
+        action_selected: InsightAction | None = None,
+        sampling_class: InsightSamplingClass | None = None,
+        case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[InsightDecisionRecord]: ...
+
+    async def count_insight_decisions(
+        self,
+        *,
+        loop: InsightLoop | None = None,
+        action_selected: InsightAction | None = None,
+        sampling_class: InsightSamplingClass | None = None,
+        case_id: str | None = None,
+    ) -> int: ...
+
+    async def record_insight_label(self, label: InsightLabel) -> InsightLabel: ...
+
+    async def list_insight_labels(
+        self, *, insight_id: str | None = None, loop: InsightLoop | None = None, limit: int | None = None
+    ) -> list[InsightLabel]: ...
+
     async def record_trace(self, trace: TraceRecord) -> TraceRecord: ...
 
     async def list_traces(
@@ -280,6 +315,8 @@ class InMemoryCaseStore:
         self._handoff_deliveries: dict[str, HandoffTransportDelivery] = {}
         self._handoff_delivery_index: dict[str, str] = {}
         self._feedback: dict[str, OperatorFeedback] = {}
+        self._insight_decisions: dict[str, InsightDecisionRecord] = {}
+        self._insight_labels: dict[str, InsightLabel] = {}
         self._traces: dict[str, TraceRecord] = {}
 
     async def put_observation(self, observation: ObservationRecord) -> ObservationRecord:
@@ -1014,6 +1051,87 @@ class InMemoryCaseStore:
             if meta_case_id is not None:
                 rows = [row for row in rows if row.meta_case_id == meta_case_id]
             return len(rows)
+
+    async def record_insight_decision(self, decision: InsightDecisionRecord) -> InsightDecisionRecord:
+        async with self._lock:
+            existing = self._insight_decisions.get(decision.insight_id)
+            if existing is not None:
+                return existing.model_copy(deep=True)
+            stored = decision.model_copy(deep=True)
+            self._insight_decisions[stored.insight_id] = stored
+            return stored.model_copy(deep=True)
+
+    async def get_insight_decision(self, insight_id: str) -> InsightDecisionRecord | None:
+        async with self._lock:
+            row = self._insight_decisions.get(str(insight_id or ""))
+            return row.model_copy(deep=True) if row else None
+
+    async def list_insight_decisions(
+        self,
+        *,
+        loop: InsightLoop | None = None,
+        action_selected: InsightAction | None = None,
+        sampling_class: InsightSamplingClass | None = None,
+        case_id: str | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[InsightDecisionRecord]:
+        async with self._lock:
+            rows = list(self._insight_decisions.values())
+            if loop is not None:
+                rows = [row for row in rows if row.loop == loop]
+            if action_selected is not None:
+                rows = [row for row in rows if row.action_selected == action_selected]
+            if sampling_class is not None:
+                rows = [row for row in rows if row.sampling_class == sampling_class]
+            if case_id is not None:
+                rows = [row for row in rows if row.case_id == case_id]
+            rows.sort(key=lambda row: (row.created_at, row.insight_id), reverse=newest_first)
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
+            return [row.model_copy(deep=True) for row in rows]
+
+    async def count_insight_decisions(
+        self,
+        *,
+        loop: InsightLoop | None = None,
+        action_selected: InsightAction | None = None,
+        sampling_class: InsightSamplingClass | None = None,
+        case_id: str | None = None,
+    ) -> int:
+        return len(
+            await self.list_insight_decisions(
+                loop=loop,
+                action_selected=action_selected,
+                sampling_class=sampling_class,
+                case_id=case_id,
+            )
+        )
+
+    async def record_insight_label(self, label: InsightLabel) -> InsightLabel:
+        async with self._lock:
+            existing = self._insight_labels.get(label.label_id)
+            if existing is not None:
+                return existing.model_copy(deep=True)
+            if label.insight_id not in self._insight_decisions:
+                raise KeyError(f"insight decision not found: {label.insight_id}")
+            stored = label.model_copy(deep=True)
+            self._insight_labels[stored.label_id] = stored
+            return stored.model_copy(deep=True)
+
+    async def list_insight_labels(
+        self, *, insight_id: str | None = None, loop: InsightLoop | None = None, limit: int | None = None
+    ) -> list[InsightLabel]:
+        async with self._lock:
+            rows = list(self._insight_labels.values())
+            if insight_id is not None:
+                rows = [row for row in rows if row.insight_id == insight_id]
+            if loop is not None:
+                rows = [row for row in rows if row.loop == loop]
+            rows.sort(key=lambda row: (row.created_at, row.label_id))
+            if limit is not None:
+                rows = rows[: _bounded_limit(limit)]
+            return [row.model_copy(deep=True) for row in rows]
 
     async def record_trace(self, trace: TraceRecord) -> TraceRecord:
         async with self._lock:

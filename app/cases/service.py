@@ -30,6 +30,8 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    InsightDecisionRecord,
+    InsightLabel,
     ObservationRecord,
     OperatorFeedback,
     OutboxIntent,
@@ -748,6 +750,12 @@ class CaseService:
                 )
             )
         return stored
+
+    async def record_insight_decision(self, decision: InsightDecisionRecord) -> InsightDecisionRecord:
+        return await self.store.record_insight_decision(decision)
+
+    async def record_insight_label(self, label: InsightLabel) -> InsightLabel:
+        return await self.store.record_insight_label(label)
 
     async def record_knowledge_citations(
         self,
