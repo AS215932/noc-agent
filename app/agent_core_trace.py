@@ -213,8 +213,12 @@ def _loop_decision_envelope(state: Mapping[str, Any], *, phase: str, run_id: str
     executed_actions = _listish(state.get("executed_actions"))
     verification_results = _listish(state.get("verification_results"))
     operator_decision = state.get("operator_decision")
+    safe_phase = _safe_token(phase, limit=64) or "unknown"
+    safe_run_id = _safe_token(run_id)
+    safe_trace_id = _safe_token(trace_id)
     case_id = _safe_token(state.get("case_id") or state.get("incident_id"))
     fingerprint = _safe_token(state.get("fingerprint") or state.get("resource_id") or case_id) or ""
+    decision = _decision_from_state(state)
     proposed_action: dict[str, Any] = {
         "proposal_count": len(proposals),
         "executed_action_count": len(executed_actions),
@@ -235,23 +239,25 @@ def _loop_decision_envelope(state: Mapping[str, Any], *, phase: str, run_id: str
             "status": _string_or_none(state.get("approval_state")),
         }
     return LoopDecisionEnvelope(
-        envelope_id=f"ldec_noc_{_stable_hash([run_id, phase, fingerprint, _decision_from_state(state)])}",
+        envelope_id=f"ldec_noc_{_stable_hash([safe_run_id, safe_phase, fingerprint, decision])}",
         loop="noc",
         environment="production",
         graph_id=GRAPH_ID,
         node_id="graph_runtime",
         agent_role="noc_duty",
-        run_id=run_id,
-        trace_id=trace_id,
+        run_id=safe_run_id,
+        trace_id=safe_trace_id,
         input_event={
-            "phase": phase,
-            "incident_id": state.get("incident_id"),
-            "case_number": state.get("case_number"),
-            "resource_id": state.get("resource_id"),
-            "approval_state": state.get("approval_state"),
+            "phase": safe_phase,
+            "incident_id": _safe_token(state.get("incident_id")),
+            "case_number": _safe_token(state.get("case_number"), limit=80),
+            "resource_id": _safe_token(state.get("resource_id")),
+            "approval_state": _safe_token(state.get("approval_state"), limit=80),
+            "untrusted_loop_text": True,
+            "model_consumption_allowed": False,
         },
         retrieved_context=evidence_refs,
-        decision=_decision_from_state(state),
+        decision=decision,
         evidence_refs=evidence_refs,
         proposed_action=proposed_action,
         human_outcome={key: value for key, value in human_outcome.items() if value},
