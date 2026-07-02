@@ -1,0 +1,70 @@
+{
+  "insights": [
+    {
+      "insight_id": "ins_noc_notify",
+      "loop": "noc",
+      "fingerprint": "noc-notify",
+      "sampling_class": "surfaced",
+      "candidate_type": "hotspot",
+      "candidate_source": "proactive_scanner:test",
+      "case_id": "case_notify",
+      "support_facts": ["disk pressure increased", "case is not recently reported"],
+      "evidence_refs": [{"kind": "mcp", "ref": "mcp:disk:router-1"}],
+      "action_selected": "notify",
+      "why_now": "New surfaced hotspot needs operator visibility.",
+      "expected_utility": {"total": 0.8, "components": {"actionability": 0.8}},
+      "interruption_cost": {"total": 0.2, "components": {"operator_attention": 0.2}},
+      "policy_version": "noc-insight.fixture"
+    },
+    {
+      "insight_id": "ins_noc_question",
+      "loop": "noc",
+      "fingerprint": "noc-question",
+      "sampling_class": "surfaced",
+      "candidate_type": "handoff",
+      "candidate_source": "case_service:test",
+      "support_facts": ["case lacks authoritative owner"],
+      "evidence_refs": [{"kind": "case", "ref": "case_question"}],
+      "action_selected": "question",
+      "why_now": "Missing context blocks a safe handoff.",
+      "policy_version": "noc-insight.fixture"
+    },
+    {
+      "insight_id": "ins_noc_draft",
+      "loop": "noc",
+      "fingerprint": "noc-draft",
+      "sampling_class": "surfaced",
+      "candidate_type": "handoff",
+      "candidate_source": "lhp:test",
+      "case_id": "case_draft",
+      "support_facts": ["verified remediation path exists"],
+      "evidence_refs": [{"kind": "lhp", "ref": "handoff_draft"}],
+      "action_selected": "draft",
+      "why_now": "Handoff is ready for engineering review.",
+      "policy_version": "noc-insight.fixture"
+    },
+    {
+      "insight_id": "ins_noc_silent",
+      "loop": "noc",
+      "fingerprint": "noc-silent",
+      "sampling_class": "withheld_logged",
+      "candidate_type": "quiet_cycle",
+      "candidate_source": "proactive_scanner:test",
+      "support_facts": ["no eligible hotspots"],
+      "evidence_refs": [{"kind": "ledger", "ref": "noc-ledger:quiet"}],
+      "action_selected": "stay_silent",
+      "why_now": "No intervention is useful this cycle.",
+      "policy_version": "noc-insight.fixture"
+    }
+  ],
+  "labels": [
+    {
+      "label_id": "ilabel_noc_notify",
+      "insight_id": "ins_noc_notify",
+      "loop": "noc",
+      "reference_action": "notify",
+      "support_facts": ["disk pressure increased"],
+      "faithfulness_verdict": "faithful"
+    }
+  ]
+}
