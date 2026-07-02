@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -179,7 +180,132 @@ def _events_from_state(state: Mapping[str, Any], *, phase: str) -> list[Any]:
         )
         events.append(result_event)
 
+    envelope = _loop_decision_envelope(state, phase=phase, run_id=run_id, trace_id=trace_id)
+    events.append(
+        TraceEvent(
+            **_correlation_fields(state),
+            event_type="loop_decision_envelope",
+            graph_id=GRAPH_ID,
+            node_id="loop_decision_envelope",
+            agent_role="noc_duty",
+            environment="production",
+            run_id=run_id,
+            trace_id=trace_id,
+            parent_event_id=parent_event_id,
+            summary=f"NOC loop decision envelope for {run_id or 'incident'}",
+            payload={
+                "phase": phase,
+                "loop_decision_envelope": envelope.model_dump(mode="json"),
+            },
+        )
+    )
+
     return events
+
+
+def _loop_decision_envelope(state: Mapping[str, Any], *, phase: str, run_id: str | None, trace_id: str | None) -> Any:
+    contracts = importlib.import_module("agent_core.contracts")
+    LoopDecisionEnvelope = getattr(contracts, "LoopDecisionEnvelope")
+    GovernanceControls = getattr(contracts, "GovernanceControls")
+
+    evidence_refs = _source_refs_from_evidence(_listish(state.get("evidence_log")))
+    proposals = _listish(state.get("proposals"))
+    executed_actions = _listish(state.get("executed_actions"))
+    verification_results = _listish(state.get("verification_results"))
+    operator_decision = state.get("operator_decision")
+    safe_phase = _safe_token(phase, limit=64) or "unknown"
+    safe_run_id = _safe_token(run_id)
+    safe_trace_id = _safe_token(trace_id)
+    case_id = _safe_token(state.get("case_id") or state.get("incident_id"))
+    fingerprint = _safe_token(state.get("fingerprint") or state.get("resource_id") or case_id) or ""
+    decision = _decision_from_state(state)
+    proposed_action: dict[str, Any] = {
+        "proposal_count": len(proposals),
+        "executed_action_count": len(executed_actions),
+        "verification_result_count": len(verification_results),
+    }
+    first_proposal = proposals[0] if proposals else None
+    if isinstance(first_proposal, Mapping):
+        proposed_action["first_proposal"] = _proposal_summary(_jsonish(first_proposal), index=1)
+    if executed_actions:
+        proposed_action["action_statuses"] = [
+            _status_from_mapping(action) for action in executed_actions if isinstance(action, Mapping)
+        ][:10]
+    human_outcome = {}
+    if isinstance(operator_decision, Mapping):
+        human_outcome = {
+            "decision": _string_or_none(operator_decision.get("decision")),
+            "operator": _string_or_none(operator_decision.get("operator")),
+            "status": _string_or_none(state.get("approval_state")),
+        }
+    return LoopDecisionEnvelope(
+        envelope_id=f"ldec_noc_{_stable_hash([safe_run_id, safe_phase, fingerprint, decision])}",
+        loop="noc",
+        environment="production",
+        graph_id=GRAPH_ID,
+        node_id="graph_runtime",
+        agent_role="noc_duty",
+        run_id=safe_run_id,
+        trace_id=safe_trace_id,
+        input_event={
+            "phase": safe_phase,
+            "incident_id": _safe_token(state.get("incident_id")),
+            "case_number": _safe_token(state.get("case_number"), limit=80),
+            "resource_id": _safe_token(state.get("resource_id")),
+            "approval_state": _safe_token(state.get("approval_state"), limit=80),
+            "untrusted_loop_text": True,
+            "model_consumption_allowed": False,
+        },
+        retrieved_context=evidence_refs,
+        decision=decision,
+        evidence_refs=evidence_refs,
+        proposed_action=proposed_action,
+        human_outcome={key: value for key, value in human_outcome.items() if value},
+        governance=GovernanceControls(
+            sensitivity_class="internal",
+            approval_tier="operator" if proposals or executed_actions else "none",
+            risk_class="medium",
+            learning_allowed=True,
+            never_learn=False,
+            policy_ids=["noc-loop-decision.v1"],
+            rationale="NOC graph decisions are emitted as sanitized loop decision envelopes for replay.",
+        ),
+        case_id=case_id,
+        fingerprint=fingerprint,
+        policy_version="noc-loop-decision.v1",
+    )
+
+
+def _decision_from_state(state: Mapping[str, Any]) -> str:
+    if _listish(state.get("proposals")) or _listish(state.get("executed_actions")):
+        return "draft"
+    if str(state.get("approval_state") or "").lower() in {"waiting_approval", "pending"}:
+        return "question"
+    if _listish(state.get("evidence_log")):
+        return "notify"
+    return "stay_silent"
+
+
+def _source_refs_from_evidence(evidence: list[Any]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    for index, item in enumerate(evidence[:12], start=1):
+        if isinstance(item, Mapping):
+            ref = _safe_text(
+                item.get("ref")
+                or item.get("evidence_id")
+                or item.get("source")
+                or item.get("tool")
+                or item.get("summary")
+                or f"noc:evidence:{index}",
+                limit=180,
+            )
+            kind = _safe_text(item.get("kind") or item.get("source") or "runtime_evidence", limit=64)
+        else:
+            ref = _safe_text(item, limit=180) or f"noc:evidence:{index}"
+            kind = "runtime_evidence"
+        if ref:
+            refs.append({"kind": kind, "ref": ref})
+    return refs
 
 
 def _graph_summary(state: Mapping[str, Any], *, phase: str) -> str:
@@ -317,3 +443,8 @@ def _jsonish(value: Any) -> Any:
 def _short(value: Any) -> str:
     text = json.dumps(_jsonish(value), sort_keys=True)
     return text if len(text) <= 160 else text[:157] + "..."
+
+
+def _stable_hash(parts: list[Any]) -> str:
+    payload = json.dumps(_jsonish(parts), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
