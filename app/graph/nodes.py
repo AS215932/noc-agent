@@ -254,6 +254,16 @@ class NodeRunner:
 
     async def _execute_real_action(self, state: WorkflowState, action: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
         action_class = action.get("type")
+        standing_grant = str(decision.get("operator") or "") == "standing-grant"
+        if standing_grant and action_class not in _STANDING_GRANT_SUPPORTED:
+            return {
+                "action": action,
+                "ok": False,
+                "result": {
+                    "error_type": "policy_blocked",
+                    "sanitized_error": "Action class is not covered by a standing grant",
+                },
+            }
         arguments = dict(action.get("inputs") or {})
         arguments["action_authorization"] = _action_authorization(state, action)
         tool_name = None
@@ -268,6 +278,24 @@ class NodeRunner:
                 "comment": arguments.get("comment") or decision.get("comment", "Approved by NOC operator."),
                 "action_authorization": arguments["action_authorization"],
             }
+            if standing_grant:
+                # Envelope enforcement: a standing-grant ack may only hit a
+                # unique WARNING problem, always expires, and never notifies.
+                if not await self._icinga_is_unique_warning(
+                    str(arguments.get("host_name") or ""), arguments.get("service_name")
+                ):
+                    return {
+                        "action": action,
+                        "ok": False,
+                        "result": {
+                            "error_type": "policy_blocked",
+                            "sanitized_error": "Standing grant requires a unique WARNING-state Icinga problem",
+                        },
+                    }
+                arguments["ack_ttl_seconds"] = max(
+                    60, int(os.getenv("NOC_STANDING_GRANT_ACK_TTL_S", "86400") or 86400)
+                )
+                arguments["notify"] = False
         if tool_name is None:
             return {"action": action, "ok": False, "result": {"error_type": "policy_blocked", "sanitized_error": "Unsupported action type"}}
         try:
@@ -283,6 +311,40 @@ class NodeRunner:
             "result": _jsonish(result),
             "ok": bool(isinstance(result, dict) and result.get("ok")),
         }
+
+    async def _icinga_is_unique_warning(self, host: str, service: Any) -> bool:
+        """True iff exactly one Icinga service problem matches host(+service)
+        and it is WARNING (state 1). Mirrors _auto_snooze_icinga_ack's guard:
+        never ack a CRITICAL, never ack ambiguously."""
+        if not host:
+            return False
+        try:
+            res = await self.runtime.mcp_runtime.call_tool(
+                "hyrule", "icinga_list_problems", {"object_type": "service", "limit": 100}
+            )
+        except Exception:
+            return False
+        if not isinstance(res, dict):
+            return False
+        wanted_service = str(service or "").strip().lower()
+        matches = 0
+        for problem in res.get("problems") or []:
+            if not isinstance(problem, dict):
+                continue
+            if str(problem.get("host") or "").strip() != host:
+                continue
+            name = str(problem.get("name") or "")
+            svc = (name.split("!", 1)[1] if "!" in name else name).strip().lower()
+            if wanted_service and wanted_service not in {svc, name.strip().lower()}:
+                continue
+            try:
+                state_value = int(float(problem.get("state")))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return False
+            if state_value != 1:
+                return False
+            matches += 1
+        return matches == 1
 
     async def _prepare_noop_guard(self, state: WorkflowState, action: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
         auth = _action_authorization(state, action, action_class="noop_rollback_guard")
@@ -395,6 +457,21 @@ class NodeRunner:
         return FunctionToolset([link_to_parent_case])
 
     async def approval_interrupt(self, state: WorkflowState) -> dict[str, Any]:
+        granted = _standing_grant_decision(state)
+        if granted is not None:
+            # Tier-0 standing grant: every structured action is in the operator-
+            # configured grant set, so execution proceeds without a per-incident
+            # approval — still fully audited (operator-decision trace, Discord
+            # line, insight record) and still envelope-enforced at execution.
+            await self._announce_standing_grant(state, granted)
+            update = {
+                "current_step": "approval_interrupt",
+                "updated_at": utc_now(),
+                "operator_decision": granted,
+                "approval_state": "approved",
+            }
+            assert_json_serializable_state(update)
+            return update
         decision = interrupt({"incident_id": state["incident_id"], "approval_state": "waiting_approval"})
         update = {
             "current_step": "approval_interrupt",
@@ -404,6 +481,24 @@ class NodeRunner:
         }
         assert_json_serializable_state(update)
         return update
+
+    async def _announce_standing_grant(self, state: WorkflowState, decision: dict[str, Any]) -> None:
+        try:
+            from app.discord import Verbosity, send_discord_notification
+
+            actions = _stored_structured_actions(state)
+            await send_discord_notification(
+                title="🪪 Standing grant executed (no per-incident approval)",
+                description=(
+                    f"Case {state.get('case_number') or state['incident_id']}: "
+                    f"{', '.join(str(a.get('type')) for a in actions)} on "
+                    f"{state.get('resource_id', '')} — {decision.get('comment', '')}"
+                ),
+                color=0x3498DB,
+                level=Verbosity.INFO,
+            )
+        except Exception:  # audit post is advisory; execution trace still records it
+            return
 
 
 def _evidence_item(item: DiagnosticEvidence) -> EvidenceItem:
@@ -518,6 +613,37 @@ def _approved_icinga_ack_actions(state: WorkflowState, proposed: list[str] | Non
 
 def _flag(name: str) -> bool:
     return os.getenv(name, "0") == "1"
+
+
+def _standing_grant_classes() -> set[str]:
+    raw = os.getenv("NOC_STANDING_GRANT_ACTION_CLASSES", "")
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+# The only action class implemented as a Tier-0 standing grant. Its execution
+# envelope (unique WARNING-only target, TTL'd ack, notify=False) is exactly what
+# _auto_snooze_icinga_ack already exercises autonomously.
+_STANDING_GRANT_SUPPORTED = {"acknowledge_icinga"}
+
+
+def _standing_grant_decision(state: WorkflowState) -> dict[str, Any] | None:
+    """A synthetic approved decision when every structured action is covered by
+    the operator's standing grant. Mixed or unsupported action sets always fall
+    back to per-incident human approval."""
+    classes = _standing_grant_classes() & _STANDING_GRANT_SUPPORTED
+    if not classes or not _flag("NOC_ENABLE_APPROVED_EXECUTION"):
+        return None
+    actions = _stored_structured_actions(state)
+    if not actions:
+        return None
+    if any(str(action.get("type")) not in classes for action in actions):
+        return None
+    return {
+        "decision": "approved",
+        "operator": "standing-grant",
+        "comment": f"standing grant covers: {', '.join(sorted(classes))}",
+        "decided_at": utc_now(),
+    }
 
 
 def _action_authorization(
