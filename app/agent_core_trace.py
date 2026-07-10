@@ -73,6 +73,9 @@ def _insight_decision_event(insight: Mapping[str, Any], *, input_event: Mapping[
     InsightDecisionRecord = getattr(contracts, "InsightDecisionRecord")
 
     validated = InsightDecisionRecord.model_validate(dict(insight))
+    # Correlate with the proactive cycle when the insight carries no explicit
+    # trace id, so consumers can join the insight stream back to its cycle.
+    trace_id = validated.trace_id or _string_or_none(input_event.get("cycle_id"))
     envelope = LoopDecisionEnvelope(
         envelope_id=(
             f"ldec_noc_{_stable_hash([validated.insight_id, validated.fingerprint, validated.action_selected])}"
@@ -83,7 +86,7 @@ def _insight_decision_event(insight: Mapping[str, Any], *, input_event: Mapping[
         node_id="proactive_loop",
         agent_role="noc_duty",
         run_id=_string_or_none(input_event.get("cycle_id")) or validated.run_id,
-        trace_id=validated.trace_id,
+        trace_id=trace_id,
         input_event={
             **_jsonish(dict(input_event)),
             "candidate_type": validated.candidate_type,
@@ -119,6 +122,11 @@ def _insight_decision_event(insight: Mapping[str, Any], *, input_event: Mapping[
         payload={
             "loop_decision_envelope": envelope.model_dump(mode="json"),
             "insight_decision_record": validated.model_dump(mode="json"),
+            # support_facts derive from hotspot text (sanitized but
+            # attacker-influenceable telemetry) — same guard fields as the
+            # graph state traces.
+            "untrusted_loop_text": True,
+            "model_consumption_allowed": False,
         },
     )
 

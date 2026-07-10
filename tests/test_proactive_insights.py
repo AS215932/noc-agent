@@ -540,3 +540,34 @@ async def test_loop_retries_records_when_delivery_fails(tmp_path, monkeypatch):
     # nothing was marked, so the same decisions are retried next cycle
     assert len(attempts) == 2
     assert attempts[1] >= 1
+
+
+def test_emitted_envelope_carries_guards_and_cycle_trace_id(tmp_path, monkeypatch):
+    import json as json_module
+
+    import app.agent_core_trace as trace_mod
+
+    trace_path = tmp_path / "trace.jsonl"
+    monkeypatch.setenv(trace_mod.FLAG_ENV, "1")
+    monkeypatch.setenv(f"{trace_mod.FLAG_ENV}_PATH", str(trace_path))
+    record = {
+        "insight_id": "ins_noc_guard",
+        "loop": "noc",
+        "fingerprint": "fp_guard",
+        "sampling_class": "surfaced",
+        "candidate_type": "hotspot",
+        "candidate_source": "proactive_scanner:disk_fill",
+        "action_selected": "notify",
+        "support_facts": ["disk free 5%"],
+    }
+    delivered = trace_mod.emit_loop_decision_envelopes(
+        [record], input_event={"cycle_id": "cyc_guard", "outcome": "scanned"}
+    )
+    assert delivered == 1
+    event = json_module.loads(trace_path.read_text(encoding="utf-8").strip())
+    # untrusted-telemetry guard fields on the payload itself
+    assert event["payload"]["untrusted_loop_text"] is True
+    assert event["payload"]["model_consumption_allowed"] is False
+    # no explicit trace_id on the insight -> correlate with the cycle
+    assert event["trace_id"] == "cyc_guard"
+    assert event["payload"]["loop_decision_envelope"]["trace_id"] == "cyc_guard"
