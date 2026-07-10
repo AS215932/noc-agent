@@ -95,6 +95,9 @@ class ProactiveLoopSettings:
     # Base URL for linking a hotspot's digest line to its NOC case
     # (e.g. https://noc.servify.network). Empty → show the case number only.
     control_public_url: str = ""
+    # Base URL of the Agentic Observatory for linking a hotspot's digest line
+    # to its insight-decision history (empty → no link).
+    observatory_public_url: str = ""
     memory_dir: str = "/var/lib/noc-agent/memory"
     state_dir: str = "/var/lib/noc-agent/proactive"
     ruleset_version: str = "1"
@@ -275,6 +278,7 @@ def load_proactive_settings() -> ProactiveLoopSettings:
         handoff_repo=_env_str("NOC_PROACTIVE_HANDOFF_REPO", base.handoff_repo),
         severity_floor=_env_str("NOC_PROACTIVE_SEVERITY_FLOOR", base.severity_floor).upper(),
         control_public_url=_env_str("NOC_CONTROL_PUBLIC_URL", base.control_public_url),
+        observatory_public_url=_env_str("NOC_OBSERVATORY_PUBLIC_URL", base.observatory_public_url),
         memory_dir=_env_str("NOC_PROACTIVE_MEMORY_DIR", base.memory_dir),
         state_dir=_env_str("NOC_PROACTIVE_STATE_DIR", base.state_dir),
         ruleset_version=_env_str("NOC_PROACTIVE_RULESET_VERSION", base.ruleset_version),
@@ -392,6 +396,7 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
         handoff_repo=_str_value(table, "handoff_repo", defaults.handoff_repo, errors),
         severity_floor=_str_value(table, "severity_floor", defaults.severity_floor, errors),
         control_public_url=_str_value(table, "control_public_url", defaults.control_public_url, errors),
+        observatory_public_url=_str_value(table, "observatory_public_url", defaults.observatory_public_url, errors),
         memory_dir=_str_value(table, "memory_dir", defaults.memory_dir, errors),
         state_dir=_str_value(table, "state_dir", defaults.state_dir, errors),
         ruleset_version=_str_value(table, "ruleset_version", defaults.ruleset_version, errors),

@@ -786,7 +786,14 @@ class ProactiveLoop:
         fields = []
         for hotspot in top:
             case = await self._case_for_hotspot(hotspot)
-            fields.append(_hotspot_field(hotspot, case=case, public_url=self.settings.control_public_url))
+            fields.append(
+                _hotspot_field(
+                    hotspot,
+                    case=case,
+                    public_url=self.settings.control_public_url,
+                    observatory_url=self.settings.observatory_public_url,
+                )
+            )
         await send_discord_notification(
             title=f"{prefix}: {len(report.hotspots)} hotspot(s)",
             description="\n".join(lines),
@@ -917,7 +924,11 @@ def _format_ttl(seconds: int) -> str:
 
 
 def _hotspot_field(
-    hotspot: Hotspot, *, case: dict[str, Any] | None = None, public_url: str = ""
+    hotspot: Hotspot,
+    *,
+    case: dict[str, Any] | None = None,
+    public_url: str = "",
+    observatory_url: str = "",
 ) -> dict[str, Any]:
     emoji = _SEVERITY_EMOJI.get(hotspot.severity, "•")
     checks = "; ".join(hotspot.recommended_checks[:2])
@@ -927,6 +938,10 @@ def _hotspot_field(
     if hotspot.warrants_change:
         value += "\n⚙️ candidate for config change (handoff)"
     meta = [f"ack id: `{hotspot.fingerprint()[:12]}`"]
+    if observatory_url:
+        meta.append(
+            f"[insights]({observatory_url.rstrip('/')}/insights?fingerprint={hotspot.fingerprint()})"
+        )
     if case:
         number = case.get("case_number") or case.get("incident_id") or ""
         if number:
