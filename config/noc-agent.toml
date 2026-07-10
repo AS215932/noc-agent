@@ -1,6 +1,8 @@
 [model]
 primary = "openrouter:deepseek/deepseek-v4-pro"
-fallbacks = ["openrouter:anthropic/claude-sonnet-4.6"]
+# venice:<model-id> entries use Venice.AI's OpenAI-compatible endpoint via
+# VENICE_API_KEY — a provider-redundant fallback for OpenRouter quota events.
+fallbacks = ["openrouter:anthropic/claude-sonnet-4.6", "venice:deepseek-v4-pro"]
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"

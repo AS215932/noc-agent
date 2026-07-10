@@ -2993,6 +2993,7 @@ def _missing_model_provider_config(active_models: list[str], provider_api_key_en
         "openai": "OPENAI_API_KEY",
         "openai-chat": "OPENAI_API_KEY",
         "openai-responses": "OPENAI_API_KEY",
+        "venice": "VENICE_API_KEY",
     }
     for provider, env_name in direct_provider_envs.items():
         if provider in providers and not os.getenv(env_name):
