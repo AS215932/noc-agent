@@ -1671,6 +1671,7 @@ dependencies = [
     { name = "google-genai" },
     { name = "httpx" },
     { name = "langgraph" },
+    { name = "langgraph-checkpoint-postgres" },
     { name = "langgraph-checkpoint-redis" },
     { name = "mcp" },
     { name = "prometheus-client" },
@@ -1686,9 +1687,6 @@ dependencies = [
 [package.optional-dependencies]
 anthropic = [
     { name = "anthropic" },
-]
-postgres = [
-    { name = "langgraph-checkpoint-postgres" },
 ]
 
 [package.dev-dependencies]
@@ -1711,7 +1709,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=1.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "langgraph", specifier = ">=1.0.0" },
-    { name = "langgraph-checkpoint-postgres", marker = "extra == 'postgres'", specifier = ">=3.0" },
+    { name = "langgraph-checkpoint-postgres", specifier = ">=3.0" },
     { name = "langgraph-checkpoint-redis", specifier = ">=0.4.1" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "prometheus-client", specifier = ">=0.25.0" },
@@ -1723,7 +1721,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=24.4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]
-provides-extras = ["anthropic", "postgres"]
+provides-extras = ["anthropic"]
 
 [package.metadata.requires-dev]
 dev = [

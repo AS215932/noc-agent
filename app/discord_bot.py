@@ -1134,6 +1134,8 @@ def _missing_config() -> list[str]:
         model_config = load_model_config()
         if any(model.startswith("openrouter:") for model in model_config.active_model_chain):
             required.append(model_config.provider_api_key_envs.get("openrouter", "OPENROUTER_API_KEY"))
+        if any(model.startswith("venice:") for model in model_config.active_model_chain):
+            required.append(model_config.provider_api_key_envs.get("venice", "VENICE_API_KEY"))
         if any(model.startswith(("google:", "google-gla:", "google-vertex:")) or model.startswith("gemini") for model in model_config.active_model_chain):
             if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
                 required.append("GOOGLE_API_KEY or GEMINI_API_KEY")

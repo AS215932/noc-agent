@@ -15,6 +15,7 @@ DEFAULT_GEMINI_QUOTA_METRIC = "generativelanguage.googleapis.com/generate_reques
 DEFAULT_GEMINI_QUOTA_SERVICE = "generativelanguage.googleapis.com"
 DEFAULT_GEMINI_QUOTA_USAGE_METRIC_TYPE = "serviceruntime.googleapis.com/quota/rate/net_usage"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+VENICE_DEFAULT_BASE_URL = "https://api.venice.ai/api/v1"
 
 GEMINI_QUOTA_CONFIGURED = Gauge(
     "noc_agent_gemini_quota_configured",
@@ -161,7 +162,30 @@ class ProviderCreditStatus:
         }
 
 
+@dataclass(frozen=True)
+class VeniceKeyStatus:
+    status: str
+    message: str
+    balance_usd: float | None = None
+    balance_diem: float | None = None
+    access_permitted: bool | None = None
+    api_tier: str | None = None
+    next_epoch_begins: str | None = None
+
+    def health_value(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "message": self.message,
+            "balance_usd": self.balance_usd,
+            "balance_diem": self.balance_diem,
+            "access_permitted": self.access_permitted,
+            "api_tier": self.api_tier,
+            "next_epoch_begins": self.next_epoch_begins,
+        }
+
+
 _OPENROUTER_CACHE: tuple[float, str, ProviderCreditStatus] | None = None
+_VENICE_CACHE: tuple[float, str, ProviderCreditStatus] | None = None
 
 
 def check_model_provider_credits(config: Any | None = None) -> ProviderCreditStatus:
@@ -188,6 +212,11 @@ def check_model_provider_credits(config: Any | None = None) -> ProviderCreditSta
         gemini = check_gemini_quota()
         providers["google"] = gemini.health_value()
         statuses.append(gemini.status)
+
+    if any(_provider_from_model(model) == "venice" for model in models):
+        venice = check_venice_credits()
+        providers.update(venice.providers)
+        statuses.append(venice.status)
 
     if not providers:
         return ProviderCreditStatus(status="ok", message="No model providers require credit monitoring.")
@@ -367,6 +396,95 @@ def _openrouter_result(key: OpenRouterKeyStatus, account: OpenRouterAccountCredi
         message="OpenRouter credit probe completed.",
         providers={"openrouter": provider},
     )
+
+
+def check_venice_credits() -> ProviderCreditStatus:
+    api_key = os.getenv("VENICE_API_KEY")
+    cache_key = f"venice:{bool(api_key)}"
+    global _VENICE_CACHE
+    now = time.monotonic()
+    if _VENICE_CACHE is not None:
+        cached_at, cached_key, cached = _VENICE_CACHE
+        if cached_key == cache_key and now - cached_at <= _venice_env_float("VENICE_CREDIT_PROBE_CACHE_SECONDS", 60.0):
+            return cached
+
+    if not api_key:
+        key_status = VeniceKeyStatus(status="not_configured", message="VENICE_API_KEY is not configured.")
+    else:
+        key_status = _check_venice_key(api_key)
+
+    result = ProviderCreditStatus(
+        status=key_status.status,
+        message="Venice credit probe completed.",
+        providers={"venice": {"status": key_status.status, "key": key_status.health_value()}},
+    )
+    _VENICE_CACHE = (now, cache_key, result)
+    return result
+
+
+def _check_venice_key(api_key: str) -> VeniceKeyStatus:
+    try:
+        base = os.getenv("VENICE_BASE_URL", VENICE_DEFAULT_BASE_URL).rstrip("/")
+        response = httpx.get(
+            f"{base}/api_keys/rate_limits",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=_venice_env_float("VENICE_CREDIT_PROBE_TIMEOUT_SECONDS", 5.0),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        balances = data.get("balances") if isinstance(data.get("balances"), dict) else {}
+        balance_usd = _maybe_float(balances.get("USD"))
+        balance_diem = _maybe_float(balances.get("DIEM"))
+        access = data.get("accessPermitted") if isinstance(data.get("accessPermitted"), bool) else None
+        tier = data.get("apiTier")
+        tier_id = str(tier.get("id")) if isinstance(tier, dict) and tier.get("id") is not None else None
+        parts = [value for value in (balance_usd, balance_diem) if value is not None]
+        remaining = sum(parts) if parts else None
+        critical = _venice_env_float("VENICE_CRITICAL_REMAINING_USD", 1.0)
+        warn = _venice_env_float("VENICE_WARN_REMAINING_USD", 5.0)
+        status = "ok"
+        message = "Venice key rate-limit query completed."
+        if access is False:
+            status = "degraded"
+            message = "Venice API key is not permitted to consume inference APIs."
+        elif remaining is not None and remaining <= critical:
+            status = "degraded"
+            message = "Venice remaining balance is at or below the critical threshold."
+        elif remaining is not None and remaining <= warn:
+            status = "degraded"
+            message = "Venice remaining balance is at or below the warning threshold."
+        return VeniceKeyStatus(
+            status=status,
+            message=message,
+            balance_usd=balance_usd,
+            balance_diem=balance_diem,
+            access_permitted=access,
+            api_tier=tier_id,
+            next_epoch_begins=str(data.get("nextEpochBegins")) if data.get("nextEpochBegins") is not None else None,
+        )
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in {401, 403}:
+            return VeniceKeyStatus(status="degraded", message="Venice key query was rejected by authentication/authorization.")
+        return VeniceKeyStatus(status="degraded", message=f"Venice key query failed safely: HTTP {code}")
+    except (httpx.TimeoutException, TimeoutError):
+        return VeniceKeyStatus(status="degraded", message="Venice key query timed out safely.")
+    except Exception:
+        return VeniceKeyStatus(status="degraded", message="Venice key query failed safely.")
+
+
+def _venice_env_float(env_name: str, default: float) -> float:
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < 0:
+        return default
+    return value
 
 
 def check_gemini_quota() -> QuotaStatus:

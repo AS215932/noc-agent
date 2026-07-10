@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 from app.config import DEFAULT_PRIMARY_MODEL, NocAgentSettings, load_settings
 from app.model_metrics import record_fallback_attempt, set_model_config
@@ -11,6 +14,10 @@ from app.safe_errors import classify_exception
 
 
 DEFAULT_MODEL = DEFAULT_PRIMARY_MODEL
+
+# Venice.AI has no PydanticAI provider; venice: entries are constructed as
+# OpenAI-compatible models against this endpoint (see _resolve_model).
+VENICE_BASE_URL = "https://api.venice.ai/api/v1"
 
 
 @dataclass(frozen=True)
@@ -84,12 +91,33 @@ def load_model_config() -> AgentModelConfig:
 
 def build_agent_model() -> Model | KnownModelName | str:
     config = load_model_config()
-    if len(config.active_model_chain) < 2:
-        return config.active_model_chain[0]
+    chain = [_resolve_model(name) for name in config.active_model_chain]
+    if len(chain) < 2:
+        return chain[0]
     return FallbackModel(
-        config.active_model_chain[0],
-        *config.active_model_chain[1:],
+        chain[0],
+        *chain[1:],
         fallback_on=[_record_fallback_exception, ModelAPIError],
+    )
+
+
+def _resolve_model(model_name: str) -> Model | str:
+    # PydanticAI's infer_model() rejects the venice: prefix, so venice
+    # entries must be constructed explicitly; every other entry stays a
+    # string for infer_model() to resolve.
+    if not model_name.startswith("venice:"):
+        return model_name
+    return OpenAIChatModel(
+        model_name.split(":", 1)[1],
+        provider=OpenAIProvider(
+            base_url=os.getenv("VENICE_BASE_URL", VENICE_BASE_URL),
+            api_key=os.getenv("VENICE_API_KEY"),
+        ),
+        settings=ModelSettings(
+            # Venice appends its own default system prompt unless disabled;
+            # provider failover must not alter the agent's instructions.
+            extra_body={"venice_parameters": {"include_venice_system_prompt": False}},
+        ),
     )
 
 
@@ -141,6 +169,7 @@ def _is_unsupported(model_name: str) -> bool:
         "openai-responses",
         "openrouter",
         "test",
+        "venice",
         "xai",
     }:
         return False
@@ -182,6 +211,9 @@ def _missing_credential_reason(model_name: str, settings: NocAgentSettings) -> s
     elif provider == "xai":
         if not os.getenv("XAI_API_KEY"):
             return "XAI_API_KEY is required"
+    elif provider == "venice":
+        if not os.getenv("VENICE_API_KEY"):
+            return "VENICE_API_KEY is required"
     return None
 
 
@@ -210,4 +242,5 @@ def _provider_api_key_envs(settings: NocAgentSettings) -> dict[str, str]:
         "groq": "GROQ_API_KEY",
         "cohere": "COHERE_API_KEY",
         "xai": "XAI_API_KEY",
+        "venice": "VENICE_API_KEY",
     }

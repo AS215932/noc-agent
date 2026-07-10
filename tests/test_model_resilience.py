@@ -6,6 +6,7 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
 
 from app.agent import DiagnosticSynthesis
@@ -13,7 +14,7 @@ from app.cases import CaseService, InMemoryCaseStore
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.cases.notifications import observations_from_alertmanager
 from app.main import health_model, investigate_alert, metrics
-from app.model_config import load_model_config
+from app.model_config import build_agent_model, load_model_config
 from app.model_metrics import STATE
 from app.safe_errors import classify_exception
 
@@ -77,12 +78,13 @@ def test_default_model_config_uses_openrouter_chain(monkeypatch):
     monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
     monkeypatch.delenv("NOC_AGENT_CONFIG", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("VENICE_API_KEY", raising=False)
 
     config = load_model_config()
 
     assert config.configured_models == [
-        "openrouter:deepseek/deepseek-v4-pro",
-        "openrouter:anthropic/claude-sonnet-4.6",
+        "openrouter:z-ai/glm-5.2",
+        "openrouter:deepseek/deepseek-v4-flash",
     ]
     assert config.unsupported_models == []
     assert config.missing_credentials == []
@@ -161,6 +163,44 @@ def test_model_config_builds_active_fallback_chain(monkeypatch):
         "anthropic:claude-sonnet-4-5",
     ]
     assert config.missing_credentials == []
+
+
+def test_venice_missing_key_is_reported_without_marking_model_unsupported(monkeypatch):
+    monkeypatch.setenv("AGENT_MODEL", "openrouter:z-ai/glm-5.2")
+    monkeypatch.setenv("AGENT_FALLBACK_MODELS", "venice:zai-org-glm-5-2")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("VENICE_API_KEY", raising=False)
+
+    config = load_model_config()
+
+    assert config.unsupported_models == []
+    assert any("VENICE_API_KEY" in item for item in config.missing_credentials)
+    assert config.active_model_chain == ["openrouter:z-ai/glm-5.2"]
+    assert config.provider_api_key_envs["venice"] == "VENICE_API_KEY"
+
+
+def test_venice_fallback_builds_openai_compatible_model(monkeypatch):
+    monkeypatch.setenv("AGENT_MODEL", "openrouter:z-ai/glm-5.2")
+    monkeypatch.setenv("AGENT_FALLBACK_MODELS", "venice:zai-org-glm-5-2")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
+    monkeypatch.delenv("VENICE_BASE_URL", raising=False)
+
+    config = load_model_config()
+    assert config.active_model_chain == [
+        "openrouter:z-ai/glm-5.2",
+        "venice:zai-org-glm-5-2",
+    ]
+
+    model = build_agent_model()
+    assert isinstance(model, FallbackModel)
+    venice_model = model.models[-1]
+    assert isinstance(venice_model, OpenAIChatModel)
+    assert venice_model.model_name == "zai-org-glm-5-2"
+    assert str(venice_model.client.base_url).startswith("https://api.venice.ai/api/v1")
+    assert (venice_model.settings or {}).get("extra_body") == {
+        "venice_parameters": {"include_venice_system_prompt": False}
+    }
 
 
 @pytest.mark.asyncio
