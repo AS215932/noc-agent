@@ -17,6 +17,7 @@ dependencies = [
     "google-cloud-monitoring>=2.30.0",
     "langgraph>=1.0.0",
     "langgraph-checkpoint-redis>=0.4.1",
+    "langgraph-checkpoint-postgres>=3.0",
     "redis>=5.2.1",
     "discord.py>=2.5.0",
     "pyjwt[crypto]>=2.9",
@@ -26,9 +27,6 @@ dependencies = [
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
-postgres = [
-    "langgraph-checkpoint-postgres>=3.0",
-]
 
 [dependency-groups]
 dev = [

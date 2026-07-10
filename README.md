@@ -203,7 +203,7 @@ case store and creates the current schema on startup. Install the optional
 Postgres support in deployments that enable this path:
 
 ```bash
-uv sync --extra postgres
+uv sync  # langgraph-checkpoint-postgres is a hard dependency
 ```
 
 Without a DSN, shadow mode uses in-memory storage for local/dev canaries. Set
