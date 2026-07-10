@@ -9,8 +9,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 
-DEFAULT_PRIMARY_MODEL = "openrouter:deepseek/deepseek-v4-pro"
-DEFAULT_FALLBACK_MODELS = ["openrouter:anthropic/claude-sonnet-4.6"]
+DEFAULT_PRIMARY_MODEL = "openrouter:z-ai/glm-5.2"
+# Venice entries are deliberately absent from the bundled defaults: a missing
+# credential degrades /health/model, so deployments opt into venice fallbacks
+# via config/env once VENICE_API_KEY is provisioned (production does this in
+# network-operations host_vars).
+DEFAULT_FALLBACK_MODELS = ["openrouter:deepseek/deepseek-v4-flash"]
 DEFAULT_CONFIG_PATHS = (
     Path("/etc/noc-agent/config.toml"),
     Path(__file__).resolve().parent.parent / "config" / "noc-agent.toml",
