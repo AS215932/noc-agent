@@ -78,15 +78,13 @@ def test_default_model_config_uses_openrouter_chain(monkeypatch):
     monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
     monkeypatch.delenv("NOC_AGENT_CONFIG", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
-    monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
+    monkeypatch.delenv("VENICE_API_KEY", raising=False)
 
     config = load_model_config()
 
     assert config.configured_models == [
         "openrouter:z-ai/glm-5.2",
-        "venice:zai-org-glm-5-2",
         "openrouter:deepseek/deepseek-v4-flash",
-        "venice:deepseek-v4-flash",
     ]
     assert config.unsupported_models == []
     assert config.missing_credentials == []
@@ -200,6 +198,9 @@ def test_venice_fallback_builds_openai_compatible_model(monkeypatch):
     assert isinstance(venice_model, OpenAIChatModel)
     assert venice_model.model_name == "zai-org-glm-5-2"
     assert str(venice_model.client.base_url).startswith("https://api.venice.ai/api/v1")
+    assert (venice_model.settings or {}).get("extra_body") == {
+        "venice_parameters": {"include_venice_system_prompt": False}
+    }
 
 
 @pytest.mark.asyncio

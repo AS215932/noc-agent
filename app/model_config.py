@@ -6,6 +6,7 @@ from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 from app.config import DEFAULT_PRIMARY_MODEL, NocAgentSettings, load_settings
 from app.model_metrics import record_fallback_attempt, set_model_config
@@ -111,6 +112,11 @@ def _resolve_model(model_name: str) -> Model | str:
         provider=OpenAIProvider(
             base_url=os.getenv("VENICE_BASE_URL", VENICE_BASE_URL),
             api_key=os.getenv("VENICE_API_KEY"),
+        ),
+        settings=ModelSettings(
+            # Venice appends its own default system prompt unless disabled;
+            # provider failover must not alter the agent's instructions.
+            extra_body={"venice_parameters": {"include_venice_system_prompt": False}},
         ),
     )
 

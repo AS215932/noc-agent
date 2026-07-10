@@ -1,7 +1,7 @@
 import httpx
 
 from app.config import NocAgentSettings, OpenRouterProviderSettings, ProviderSettings, load_settings
-from app.quota import DEFAULT_GEMINI_QUOTA_USAGE_METRIC_TYPE, _build_usage_filter, check_openrouter_credits
+from app.quota import DEFAULT_GEMINI_QUOTA_USAGE_METRIC_TYPE, _build_usage_filter, check_openrouter_credits, check_venice_credits
 
 
 def test_build_usage_filter_uses_consumer_quota_metric_label():
@@ -241,3 +241,95 @@ def test_openrouter_account_credit_probe_uses_management_key(monkeypatch):
     assert status.status == "ok"
     assert status.providers["openrouter"]["account"]["total_credits"] == 100
     assert status.providers["openrouter"]["account"]["remaining"] == 75
+
+
+def test_venice_credit_probe_success(monkeypatch):
+    monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
+    monkeypatch.setattr("app.quota._VENICE_CACHE", None)
+
+    def fake_get(url, **kwargs):
+        assert url.endswith("/api_keys/rate_limits")
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "accessPermitted": True,
+                    "apiTier": {"id": "paid", "isCharged": True},
+                    "balances": {"USD": 42.5, "DIEM": 10.0},
+                    "nextEpochBegins": "2026-07-11T00:00:00Z",
+                }
+            },
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    result = check_venice_credits()
+
+    assert result.status == "ok"
+    venice = result.providers["venice"]
+    assert venice["key"]["balance_usd"] == 42.5
+    assert venice["key"]["balance_diem"] == 10.0
+    assert venice["key"]["access_permitted"] is True
+
+
+def test_venice_credit_probe_degrades_on_low_balance(monkeypatch):
+    monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
+    monkeypatch.setattr("app.quota._VENICE_CACHE", None)
+
+    def fake_get(url, **kwargs):
+        return httpx.Response(
+            200,
+            json={"data": {"accessPermitted": True, "balances": {"USD": 0.5, "DIEM": 0.0}}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    result = check_venice_credits()
+
+    assert result.status == "degraded"
+    assert "critical threshold" in result.providers["venice"]["key"]["message"]
+
+
+def test_venice_credit_probe_degrades_when_access_not_permitted(monkeypatch):
+    monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
+    monkeypatch.setattr("app.quota._VENICE_CACHE", None)
+
+    def fake_get(url, **kwargs):
+        return httpx.Response(
+            200,
+            json={"data": {"accessPermitted": False, "balances": {"USD": 100.0, "DIEM": 5.0}}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    result = check_venice_credits()
+
+    assert result.status == "degraded"
+    assert "not permitted" in result.providers["venice"]["key"]["message"]
+
+
+def test_venice_credit_probe_degrades_on_auth_failure(monkeypatch):
+    monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
+    monkeypatch.setattr("app.quota._VENICE_CACHE", None)
+
+    def fake_get(url, **kwargs):
+        return httpx.Response(401, json={"error": "bad key"}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("app.quota.httpx.get", fake_get)
+
+    result = check_venice_credits()
+
+    assert result.status == "degraded"
+    assert "authentication" in result.providers["venice"]["key"]["message"]
+
+
+def test_venice_credit_probe_not_configured_without_key(monkeypatch):
+    monkeypatch.delenv("VENICE_API_KEY", raising=False)
+    monkeypatch.setattr("app.quota._VENICE_CACHE", None)
+
+    result = check_venice_credits()
+
+    assert result.status == "not_configured"
