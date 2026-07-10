@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from typing import Any
 from uuid import uuid4
@@ -315,6 +316,16 @@ class NodeRunner:
             "ok": bool(isinstance(result, dict) and result.get("ok")),
         }
 
+    async def _grant_envelope_holds(self, state: WorkflowState) -> bool:
+        """True iff every structured action's execution envelope holds right
+        now (for acknowledge_icinga: a unique WARNING-state target exists)."""
+        for action in _stored_structured_actions(state):
+            inputs = action.get("inputs") if isinstance(action.get("inputs"), dict) else {}
+            host = str(inputs.get("host") or inputs.get("host_name") or "")
+            if not await self._icinga_is_unique_warning(host, inputs.get("service") or inputs.get("service_name")):
+                return False
+        return True
+
     async def _icinga_is_unique_warning(self, host: str, service: Any) -> bool:
         """True iff exactly one Icinga service problem matches host(+service)
         and it is WARNING (state 1). Mirrors _auto_snooze_icinga_ack's guard:
@@ -410,6 +421,13 @@ class NodeRunner:
             action = item.get("action") or {}
             inputs = action.get("inputs") if isinstance(action.get("inputs"), dict) else action
             host = str(inputs.get("host") or inputs.get("host_name") or "")
+            if action.get("type") == "acknowledge_icinga":
+                # An ack has no host-health postcondition — its success is fully
+                # determined by the (already checked) tool result. The host-up
+                # probe below is for actions that mutate service state and would
+                # spuriously fail acks on hosts without a Prometheus mapping.
+                results.append({"host": host, "ok": True, "method": "ack_execution_result", "attempts": []})
+                continue
             instance = _prometheus_instance_for(host)
             if not instance:
                 results.append({"host": host, "ok": False, "error": "No Prometheus instance mapping for host", "attempts": []})
@@ -461,12 +479,20 @@ class NodeRunner:
 
     async def approval_interrupt(self, state: WorkflowState) -> dict[str, Any]:
         granted = _standing_grant_decision(state)
+        if granted is not None and not await self._grant_envelope_holds(state):
+            # The envelope does not hold right now (no unique WARNING target),
+            # so do NOT take the no-interrupt path: once the grant branch runs,
+            # the thread finishes at END and a later manual approval has no
+            # interrupt to resume. Falling through keeps the case at a real,
+            # resumable approval point. The execution-time envelope check stays
+            # as TOCTOU defense for grants that pass here.
+            granted = None
         if granted is not None:
             # Tier-0 standing grant: every structured action is in the operator-
-            # configured grant set, so execution proceeds without a per-incident
-            # approval — still fully audited (operator-decision trace, Discord
-            # line posted AFTER execution with the real outcome, insight record)
-            # and still envelope-enforced at execution.
+            # configured grant set AND the execution envelope holds, so execution
+            # proceeds without a per-incident approval — still fully audited
+            # (operator-decision trace, Discord line posted AFTER execution with
+            # the real outcome, insight record).
             update = {
                 "current_step": "approval_interrupt",
                 "updated_at": utc_now(),
@@ -605,9 +631,15 @@ def _approved_restart_actions(state: WorkflowState, proposed: list[str] | None =
     ]
 
 
+_ACK_INTENT_RE = re.compile(r"\b(?:ack|acked|acknowledge[ds]?|acknowledg(?:e)?ment)\b", re.IGNORECASE)
+
+
 def _approved_icinga_ack_actions(state: WorkflowState, proposed: list[str] | None = None) -> list[dict[str, Any]]:
-    text = " ".join([_flatten_text(proposed or []), _flatten_text(state.get("normalized_alert", {}))]).lower()
-    if "ack" not in text and "acknowledge" not in text:
+    # Ack intent must come from the loop-authored remediation proposal as a
+    # whole word — never from raw alert text, where attacker-influenceable
+    # strings (or incidental substrings like "blackbox"/"packet") could mint
+    # an ack action that a standing grant would then execute unattended.
+    if not _ACK_INTENT_RE.search(_flatten_text(proposed or [])):
         return []
     labels = ((state.get("normalized_alert") or {}).get("commonLabels") or {})
     host = labels.get("host") or labels.get("hostname")

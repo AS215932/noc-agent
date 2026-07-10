@@ -83,15 +83,27 @@ def test_grant_synthesizes_approved_decision(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_approval_interrupt_skips_interrupt_under_grant(monkeypatch):
+async def test_approval_interrupt_skips_interrupt_when_envelope_holds(monkeypatch):
     monkeypatch.setenv("NOC_STANDING_GRANT_ACTION_CLASSES", "acknowledge_icinga")
     monkeypatch.setenv("NOC_ENABLE_APPROVED_EXECUTION", "1")
     state = {**_ack_state(), "case_number": "NOC-9", "resource_id": "mon", "thread_id": "t1"}
     # interrupt() raises outside a langgraph run; reaching a returned update at
     # all proves the grant path bypassed it.
-    update = await _runner(FakeMCP()).approval_interrupt(state)
+    update = await _runner(FakeMCP(problems=[_warning()])).approval_interrupt(state)
     assert update["approval_state"] == "approved"
     assert update["operator_decision"]["operator"] == "standing-grant"
+
+
+@pytest.mark.asyncio
+async def test_approval_interrupt_falls_through_when_envelope_blocked(monkeypatch):
+    monkeypatch.setenv("NOC_STANDING_GRANT_ACTION_CLASSES", "acknowledge_icinga")
+    monkeypatch.setenv("NOC_ENABLE_APPROVED_EXECUTION", "1")
+    state = {**_ack_state(), "case_number": "NOC-9", "resource_id": "mon", "thread_id": "t1"}
+    # CRITICAL problem -> envelope does not hold -> the node must reach the real
+    # interrupt() (which raises outside a langgraph run), keeping the case at a
+    # resumable approval point instead of running the thread to END.
+    with pytest.raises(Exception):
+        await _runner(FakeMCP(problems=[_warning(state=2)])).approval_interrupt(state)
 
 
 @pytest.mark.asyncio
@@ -224,3 +236,52 @@ async def test_standing_grant_terminal_state_is_persisted(monkeypatch):
     assert failed is not None
     assert failed["status"] == "waiting_approval"
     assert memory2.case_updates[-1]["status"] == "waiting_approval"
+
+
+@pytest.mark.asyncio
+async def test_verify_remediation_accepts_ack_by_execution_result(monkeypatch):
+    monkeypatch.setenv("NOC_ENABLE_APPROVED_EXECUTION", "1")
+    monkeypatch.delenv("NOC_ENABLE_NOOP_ROLLBACK_GUARDS", raising=False)
+    runner = _runner(FakeMCP())
+    state = {
+        **_ack_state(),
+        "approval_state": "executed",
+        "executed_actions": [
+            {
+                "action": {
+                    "action_id": "act-1",
+                    "type": "acknowledge_icinga",
+                    "inputs": {"host": "mon", "service": "disk"},
+                },
+                "execution_mode": "real_action",
+                "ok": True,
+                "result": {"ok": True},
+            }
+        ],
+    }
+    update = await runner.verify_remediation(state)
+    # mon has no Prometheus instance mapping; an ack must not be host-up probed
+    assert update["approval_state"] == "verified"
+    assert update["verification_results"][0]["method"] == "ack_execution_result"
+
+
+def test_ack_intent_requires_whole_word_in_proposal():
+    from app.graph.nodes import _approved_icinga_ack_actions
+
+    alert = {"commonLabels": {"host": "mon", "service": "blackbox-icmp"}}
+    # incidental substrings ("blackbox", "packet") and alert-only text must not
+    # mint an ack action
+    assert (
+        _approved_icinga_ack_actions(
+            {"normalized_alert": alert}, ["Investigate blackbox-icmp packet loss on mon"]
+        )
+        == []
+    )
+    assert _approved_icinga_ack_actions({"normalized_alert": alert}, []) == []
+    # explicit proposal intent does
+    actions = _approved_icinga_ack_actions(
+        {"normalized_alert": alert}, ["Acknowledge the disk warning on mon"]
+    )
+    assert len(actions) == 1
+    assert actions[0]["type"] == "acknowledge_icinga"
+    assert actions[0]["inputs"]["host"] == "mon"
