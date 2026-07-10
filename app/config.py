@@ -9,8 +9,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 
-DEFAULT_PRIMARY_MODEL = "openrouter:deepseek/deepseek-v4-pro"
-DEFAULT_FALLBACK_MODELS = ["openrouter:anthropic/claude-sonnet-4.6"]
+DEFAULT_PRIMARY_MODEL = "openrouter:z-ai/glm-5.2"
+DEFAULT_FALLBACK_MODELS = [
+    "venice:zai-org-glm-5-2",
+    "openrouter:deepseek/deepseek-v4-flash",
+    "venice:deepseek-v4-flash",
+]
 DEFAULT_CONFIG_PATHS = (
     Path("/etc/noc-agent/config.toml"),
     Path(__file__).resolve().parent.parent / "config" / "noc-agent.toml",

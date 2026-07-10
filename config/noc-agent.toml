@@ -1,8 +1,14 @@
 [model]
-primary = "openrouter:deepseek/deepseek-v4-pro"
+primary = "openrouter:z-ai/glm-5.2"
 # venice:<model-id> entries use Venice.AI's OpenAI-compatible endpoint via
-# VENICE_API_KEY — a provider-redundant fallback for OpenRouter quota events.
-fallbacks = ["openrouter:anthropic/claude-sonnet-4.6", "venice:deepseek-v4-pro"]
+# VENICE_API_KEY — provider-redundant fallbacks for OpenRouter quota events.
+# GLM 5.2 rides on both providers; DeepSeek V4 Flash is the cheaper
+# alternative when GLM 5.2 is unavailable.
+fallbacks = [
+  "venice:zai-org-glm-5-2",
+  "openrouter:deepseek/deepseek-v4-flash",
+  "venice:deepseek-v4-flash",
+]
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"

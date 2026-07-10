@@ -410,12 +410,17 @@ Model selection is configurable via TOML. Lookup order is:
 3. `config/noc-agent.toml`
 4. built-in defaults
 
-The default chain is OpenRouter DeepSeek V4 Pro with Claude Sonnet 4.6 as a fallback:
+The default chain is GLM 5.2 on both OpenRouter and Venice.AI, with DeepSeek V4
+Flash as the cheaper alternative on each provider:
 
 ```toml
 [model]
-primary = "openrouter:deepseek/deepseek-v4-pro"
-fallbacks = ["openrouter:anthropic/claude-sonnet-4.6"]
+primary = "openrouter:z-ai/glm-5.2"
+fallbacks = [
+  "venice:zai-org-glm-5-2",
+  "openrouter:deepseek/deepseek-v4-flash",
+  "venice:deepseek-v4-flash",
+]
 ```
 
 Any OpenRouter model can be selected with `openrouter:<model-slug>`. Secrets stay in environment variables, not in the config file. `AGENT_MODEL` and `AGENT_FALLBACK_MODELS` still override the config file for emergency changes.
@@ -425,13 +430,7 @@ Venice.AI is supported as a provider-redundant fallback with `venice:<model-id>`
 through Venice's OpenAI-compatible endpoint and authenticate with `VENICE_API_KEY`
 (`VENICE_BASE_URL` overrides the default `https://api.venice.ai/api/v1`). Because
 Venice is a separate provider, an OpenRouter key-limit or quota event does not take
-the whole chain down:
-
-```toml
-[model]
-primary = "openrouter:deepseek/deepseek-v4-pro"
-fallbacks = ["openrouter:anthropic/claude-sonnet-4.6", "venice:deepseek-v4-pro"]
-```
+the whole chain down.
 
 Venice exposes no credit-probe API (balances only appear in response headers), so
 `/health/model` reports no quota entry for it — a venice-only chain reports

@@ -83,9 +83,10 @@ def test_default_model_config_uses_openrouter_chain(monkeypatch):
     config = load_model_config()
 
     assert config.configured_models == [
-        "openrouter:deepseek/deepseek-v4-pro",
-        "openrouter:anthropic/claude-sonnet-4.6",
-        "venice:deepseek-v4-pro",
+        "openrouter:z-ai/glm-5.2",
+        "venice:zai-org-glm-5-2",
+        "openrouter:deepseek/deepseek-v4-flash",
+        "venice:deepseek-v4-flash",
     ]
     assert config.unsupported_models == []
     assert config.missing_credentials == []
@@ -167,8 +168,8 @@ def test_model_config_builds_active_fallback_chain(monkeypatch):
 
 
 def test_venice_missing_key_is_reported_without_marking_model_unsupported(monkeypatch):
-    monkeypatch.setenv("AGENT_MODEL", "openrouter:deepseek/deepseek-v4-pro")
-    monkeypatch.setenv("AGENT_FALLBACK_MODELS", "venice:deepseek-v4-pro")
+    monkeypatch.setenv("AGENT_MODEL", "openrouter:z-ai/glm-5.2")
+    monkeypatch.setenv("AGENT_FALLBACK_MODELS", "venice:zai-org-glm-5-2")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.delenv("VENICE_API_KEY", raising=False)
 
@@ -176,28 +177,28 @@ def test_venice_missing_key_is_reported_without_marking_model_unsupported(monkey
 
     assert config.unsupported_models == []
     assert any("VENICE_API_KEY" in item for item in config.missing_credentials)
-    assert config.active_model_chain == ["openrouter:deepseek/deepseek-v4-pro"]
+    assert config.active_model_chain == ["openrouter:z-ai/glm-5.2"]
     assert config.provider_api_key_envs["venice"] == "VENICE_API_KEY"
 
 
 def test_venice_fallback_builds_openai_compatible_model(monkeypatch):
-    monkeypatch.setenv("AGENT_MODEL", "openrouter:deepseek/deepseek-v4-pro")
-    monkeypatch.setenv("AGENT_FALLBACK_MODELS", "venice:deepseek-v4-pro")
+    monkeypatch.setenv("AGENT_MODEL", "openrouter:z-ai/glm-5.2")
+    monkeypatch.setenv("AGENT_FALLBACK_MODELS", "venice:zai-org-glm-5-2")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setenv("VENICE_API_KEY", "test-venice-key")
     monkeypatch.delenv("VENICE_BASE_URL", raising=False)
 
     config = load_model_config()
     assert config.active_model_chain == [
-        "openrouter:deepseek/deepseek-v4-pro",
-        "venice:deepseek-v4-pro",
+        "openrouter:z-ai/glm-5.2",
+        "venice:zai-org-glm-5-2",
     ]
 
     model = build_agent_model()
     assert isinstance(model, FallbackModel)
     venice_model = model.models[-1]
     assert isinstance(venice_model, OpenAIChatModel)
-    assert venice_model.model_name == "deepseek-v4-pro"
+    assert venice_model.model_name == "zai-org-glm-5-2"
     assert str(venice_model.client.base_url).startswith("https://api.venice.ai/api/v1")
 
 
