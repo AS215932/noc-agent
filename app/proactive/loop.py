@@ -131,6 +131,8 @@ class ProactiveLoop:
         # trustworthy reported set, carried through a degraded (query-failed) scan.
         self._last_deep_hotspots: list[Hotspot] = []
         self._last_effective: list[Hotspot] = []
+        # Lazy OKF citation lookup for insight records (built on first use).
+        self._insight_knowledge_lookup: Any | None = None
 
     # --- lifecycle --------------------------------------------------------
 
@@ -227,7 +229,15 @@ class ProactiveLoop:
                 self._last_deep_scan = time.time()
             report.outcome = self._classify_outcome(report, gate, investigated)
             await self._persist_memory(report, do_deep)
-            await self._safe_report(report, gate)
+            digest_due, posted = await self._safe_report(report, gate)
+            await self._emit_insight_records(
+                report,
+                gate,
+                effective=effective,
+                digest_due=digest_due,
+                posted=posted,
+                deep=do_deep,
+            )
         except Exception as exc:
             safe = classify_exception(exc)
             report.outcome = "error"
@@ -274,6 +284,7 @@ class ProactiveLoop:
             report.cost_usd = round(report.cost_usd + outcome.cost_usd, 6)
             if outcome.handoff_url:
                 report.handoffs.append(outcome.handoff_url)
+                report.handoffs_by_key[hotspot.key] = outcome.handoff_url
             if use_case_service:
                 await self._case_service_record_investigation(hotspot, outcome)
         if not use_case_service:
@@ -714,8 +725,15 @@ class ProactiveLoop:
         stale = (now - self._last_report_ts) >= max(1, self.settings.report_reassert_s)
         return (changed or stale), signature, now
 
-    async def _safe_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:
+    async def _safe_report(
+        self, report: ProactiveCycleReport, gate: GateDecision
+    ) -> tuple[bool, bool]:
+        """Post the digest when due; return ``(due, posted)`` — the dedup
+        gate's decision and whether delivery actually succeeded. The insight
+        records need both: a failed send is still a notify decision, not
+        deliberate silence."""
         should, signature, now = self._report_decision(report)
+        posted = False
         if should:
             try:
                 await self._reporter(report, gate)
@@ -726,12 +744,14 @@ class ProactiveLoop:
                 # Commit de-dup state only after a successful send, so a transient
                 # webhook failure doesn't suppress the next retry.
                 self._last_report_signature, self._last_report_ts = signature, now
+                posted = True
                 await self._case_service_mark_reported_hotspots(report)
         try:
             await _heartbeat(report)
         except Exception as exc:
             safe = classify_exception(exc)
             log_exception("proactive_heartbeat_failed", exc, category=safe.category)
+        return should, posted
 
     async def _case_service_mark_reported_hotspots(self, report: ProactiveCycleReport) -> None:
         if not (self.case_service_control and self.case_service is not None):
@@ -775,7 +795,14 @@ class ProactiveLoop:
         fields = []
         for hotspot in top:
             case = await self._case_for_hotspot(hotspot)
-            fields.append(_hotspot_field(hotspot, case=case, public_url=self.settings.control_public_url))
+            fields.append(
+                _hotspot_field(
+                    hotspot,
+                    case=case,
+                    public_url=self.settings.control_public_url,
+                    observatory_url=self.settings.observatory_public_url,
+                )
+            )
         await send_discord_notification(
             title=f"{prefix}: {len(report.hotspots)} hotspot(s)",
             description="\n".join(lines),
@@ -800,6 +827,103 @@ class ProactiveLoop:
         except Exception:  # linking is advisory; never break the digest
             return None
 
+    # --- insight records ----------------------------------------------------
+
+    def _knowledge_refs_lookup(self) -> Any | None:
+        """Lazy per-hotspot OKF citation lookup over the pinned knowledge export
+        (same sqlite the LHP knowledge context uses). None when disabled or the
+        export isn't present on this host."""
+        if not self.settings.insight_knowledge_citations:
+            return None
+        if getattr(self, "_insight_knowledge_lookup", None) is not None:
+            return self._insight_knowledge_lookup
+        sqlite_path = Path(self.loop_handoff_settings.knowledge_export_sqlite)
+        if not sqlite_path.exists():
+            return None
+        try:
+            from app.knowledge.retrieval import KnowledgeExportRetriever
+            from app.proactive.insights import knowledge_refs_fn
+
+            retriever = KnowledgeExportRetriever(
+                sqlite_path, manifest_path=self.loop_handoff_settings.knowledge_export_manifest
+            )
+            self._insight_knowledge_lookup = knowledge_refs_fn(retriever)
+        except Exception as exc:  # citations are advisory
+            safe = classify_exception(exc)
+            log_exception("proactive_insight_knowledge_init_failed", exc, category=safe.category)
+            return None
+        return self._insight_knowledge_lookup
+
+    async def _emit_insight_records(
+        self,
+        report: ProactiveCycleReport,
+        gate: GateDecision,
+        *,
+        effective: list[Hotspot],
+        digest_due: bool,
+        posted: bool,
+        deep: bool,
+    ) -> int:
+        """Best-effort: record this cycle's surface/withhold decisions (incl.
+        deliberate silence) as agent-core insight records. Must never break a
+        cycle; a state/emission failure only loses observability."""
+        if not self.settings.insight_records_enabled:
+            return 0
+        try:
+            from app import agent_core_trace
+            from app.proactive.insights import InsightEmissionState, build_cycle_insights
+
+            case_ids: dict[str, str] = {}
+            for hotspot in report.hotspots[: self.settings.insight_max_per_cycle]:
+                case = await self._case_for_hotspot(hotspot)
+                if case and case.get("incident_id"):
+                    case_ids[hotspot.fingerprint()] = str(case["incident_id"])
+            records = build_cycle_insights(
+                report,
+                gate,
+                self.settings,
+                effective=effective,
+                digest_due=digest_due,
+                posted=posted,
+                deep=deep,
+                suppression_entry=self._suppression_entry_for_hotspot,
+                case_ids=case_ids,
+                knowledge_refs=self._knowledge_refs_lookup(),
+            )
+            state = InsightEmissionState(
+                self._state_dir / "insight-emissions.json",
+                reassert_s=self.settings.insight_reassert_s,
+            )
+            due = state.pending(records)
+            if not due:
+                return 0
+            delivered = agent_core_trace.emit_loop_decision_envelopes(
+                due,
+                input_event={
+                    "cycle_id": report.cycle_id,
+                    "outcome": report.outcome,
+                    "shadow": self.settings.shadow,
+                    "untrusted_loop_text": True,
+                    "model_consumption_allowed": False,
+                },
+            )
+            # Stamp the dedup state only on full delivery: a disabled sink or a
+            # collector outage must retry these decisions next cycle instead of
+            # silently losing them until the reassert window.
+            if delivered == len(due):
+                state.mark(due)
+            log.info(
+                "proactive_insights_emitted",
+                built=len(records),
+                due=len(due),
+                delivered=delivered,
+            )
+            return delivered
+        except Exception as exc:
+            safe = classify_exception(exc)
+            log_exception("proactive_insight_emit_failed", exc, category=safe.category)
+            return 0
+
 
 def _sev_rank(severity: str) -> int:
     return {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(str(severity).upper(), 0)
@@ -816,7 +940,11 @@ def _format_ttl(seconds: int) -> str:
 
 
 def _hotspot_field(
-    hotspot: Hotspot, *, case: dict[str, Any] | None = None, public_url: str = ""
+    hotspot: Hotspot,
+    *,
+    case: dict[str, Any] | None = None,
+    public_url: str = "",
+    observatory_url: str = "",
 ) -> dict[str, Any]:
     emoji = _SEVERITY_EMOJI.get(hotspot.severity, "•")
     checks = "; ".join(hotspot.recommended_checks[:2])
@@ -826,6 +954,10 @@ def _hotspot_field(
     if hotspot.warrants_change:
         value += "\n⚙️ candidate for config change (handoff)"
     meta = [f"ack id: `{hotspot.fingerprint()[:12]}`"]
+    if observatory_url:
+        meta.append(
+            f"[insights]({observatory_url.rstrip('/')}/insights?fingerprint={hotspot.fingerprint()})"
+        )
     if case:
         number = case.get("case_number") or case.get("incident_id") or ""
         if number:

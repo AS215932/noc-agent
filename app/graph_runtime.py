@@ -98,15 +98,23 @@ async def run_investigation_graph(
     )
     result_state = {key: value for key, value in result_state.items() if key != "__interrupt__"}
     synthesis = DiagnosticSynthesis.model_validate(result_state["diagnostic_synthesis"])
-    await memory.update_case(
-        incident_id,
-        {
-            "status": "waiting_approval",
-            "thread_id": thread_id,
-            "diagnostic_summary": synthesis.incident_summary,
-            "case_context": await memory.case_context(incident_id),
-        },
-    )
+    grant_decision = result_state.get("operator_decision") or {}
+    if isinstance(grant_decision, dict) and grant_decision.get("operator") == "standing-grant":
+        # A standing grant skipped the interrupt, so this invocation ran all
+        # the way through execution/verification — persist the terminal state
+        # exactly like the manual record_operator_decision path instead of
+        # stamping the case back to waiting_approval.
+        await _persist_final_decision(memory, incident_id, grant_decision, result_state)
+    else:
+        await memory.update_case(
+            incident_id,
+            {
+                "status": "waiting_approval",
+                "thread_id": thread_id,
+                "diagnostic_summary": synthesis.incident_summary,
+                "case_context": await memory.case_context(incident_id),
+            },
+        )
     emit_state_trace(result_state, phase="investigation")
     return synthesis, result_state
 
@@ -129,21 +137,59 @@ async def record_operator_decision(
     final_state = None
     if status == "approved" and summary.get("thread_id"):
         final_state = await resume_investigation(incident_id, decision, mcp_runtime=mcp_runtime, graph_memory=memory)
+    if final_state is not None:
+        summary = await _persist_final_decision(memory, incident_id, decision, final_state) or summary
+    else:
+        summary.update(
+            {
+                "status": "approved" if status == "approved" else "rejected" if status == "rejected" else "finalized",
+                "operator_decision": decision,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await memory.put_summary(incident_id, summary)
+        await memory.update_case(
+            incident_id,
+            {
+                "status": "waiting_approval" if summary["status"] == "waiting_approval" else "resolved",
+                "decision_status": summary["status"],
+                "operator_decision": decision,
+                "executed_actions": summary.get("executed_actions", []),
+                "verification_results": summary.get("verification_results", []),
+            },
+        )
+    emit_state_trace(final_state if final_state is not None else summary, phase="resume")
+    return summary
+
+
+async def _persist_final_decision(
+    memory: Any,
+    incident_id: str,
+    decision: dict[str, Any],
+    final_state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Persist a decided-and-executed graph outcome to the case/summary.
+
+    Shared by the manual approval resume path and the standing-grant path (the
+    latter never interrupts, so the initial invocation is the one that carries
+    the terminal execution/verification state)."""
+    summary = await memory.get_summary(incident_id)
+    if not summary:
+        return None
     summary.update(
         {
-            "status": "approved" if status == "approved" else "rejected" if status == "rejected" else "finalized",
+            "status": "approved",
             "operator_decision": decision,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    if final_state is not None:
-        summary["approval_state"] = final_state.get("approval_state", summary["status"])
-        summary["executed_actions"] = list(final_state.get("executed_actions", []))
-        summary["verification_results"] = list(final_state.get("verification_results", []))
-        if final_state.get("approval_state") == "verified":
-            summary["status"] = "resolved"
-        elif final_state.get("approval_state") in {"verification_failed", "execution_failed", "approved_no_executable_action"}:
-            summary["status"] = "waiting_approval"
+    summary["approval_state"] = final_state.get("approval_state", summary["status"])
+    summary["executed_actions"] = list(final_state.get("executed_actions", []))
+    summary["verification_results"] = list(final_state.get("verification_results", []))
+    if final_state.get("approval_state") == "verified":
+        summary["status"] = "resolved"
+    elif final_state.get("approval_state") in {"verification_failed", "execution_failed", "approved_no_executable_action"}:
+        summary["status"] = "waiting_approval"
     await memory.put_summary(incident_id, summary)
     await memory.update_case(
         incident_id,
@@ -155,7 +201,6 @@ async def record_operator_decision(
             "verification_results": summary.get("verification_results", []),
         },
     )
-    emit_state_trace(final_state if final_state is not None else summary, phase="resume")
     return summary
 
 

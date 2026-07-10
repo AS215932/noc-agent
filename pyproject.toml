@@ -65,7 +65,7 @@ python_version = "3.14"
 ignore_missing_imports = true
 
 [tool.uv.sources]
-agent-core = { git = "https://github.com/AS215932/agent-core", tag = "v0.7.0" }
+agent-core = { git = "https://github.com/AS215932/agent-core", tag = "v0.8.0" }
 
 [[tool.mypy.overrides]]
 module = [

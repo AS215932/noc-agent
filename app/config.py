@@ -99,9 +99,24 @@ class ProactiveLoopSettings:
     # Base URL for linking a hotspot's digest line to its NOC case
     # (e.g. https://noc.servify.network). Empty → show the case number only.
     control_public_url: str = ""
+    # Base URL of the Agentic Observatory for linking a hotspot's digest line
+    # to its insight-decision history (empty → no link).
+    observatory_public_url: str = ""
     memory_dir: str = "/var/lib/noc-agent/memory"
     state_dir: str = "/var/lib/noc-agent/proactive"
     ruleset_version: str = "1"
+    # Insight-decision records (agent-core InsightDecisionRecord per surface/
+    # withhold decision, incl. deliberate silence). Read-only reporting; ships
+    # off. Citations additionally require the pinned knowledge export
+    # ([loop_handoff].knowledge_export_sqlite) to be present.
+    insight_records_enabled: bool = False
+    insight_knowledge_citations: bool = False
+    # Re-emit an unchanged per-fingerprint decision at most this often (seconds);
+    # the loop runs every interval_s, so this bounds stream volume.
+    insight_reassert_s: int = 21600
+    insight_max_per_cycle: int = 32
+    # Hotspot score at or above which expected_utility saturates at 1.0.
+    insight_score_norm: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -267,9 +282,17 @@ def load_proactive_settings() -> ProactiveLoopSettings:
         handoff_repo=_env_str("NOC_PROACTIVE_HANDOFF_REPO", base.handoff_repo),
         severity_floor=_env_str("NOC_PROACTIVE_SEVERITY_FLOOR", base.severity_floor).upper(),
         control_public_url=_env_str("NOC_CONTROL_PUBLIC_URL", base.control_public_url),
+        observatory_public_url=_env_str("NOC_OBSERVATORY_PUBLIC_URL", base.observatory_public_url),
         memory_dir=_env_str("NOC_PROACTIVE_MEMORY_DIR", base.memory_dir),
         state_dir=_env_str("NOC_PROACTIVE_STATE_DIR", base.state_dir),
         ruleset_version=_env_str("NOC_PROACTIVE_RULESET_VERSION", base.ruleset_version),
+        insight_records_enabled=_env_bool("NOC_INSIGHT_RECORDS_ENABLED", base.insight_records_enabled),
+        insight_knowledge_citations=_env_bool(
+            "NOC_INSIGHT_KNOWLEDGE_CITATIONS", base.insight_knowledge_citations
+        ),
+        insight_reassert_s=_env_int("NOC_INSIGHT_REASSERT_S", base.insight_reassert_s),
+        insight_max_per_cycle=_env_int("NOC_INSIGHT_MAX_PER_CYCLE", base.insight_max_per_cycle),
+        insight_score_norm=_env_float("NOC_INSIGHT_SCORE_NORM", base.insight_score_norm),
     )
 
 
@@ -377,9 +400,19 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
         handoff_repo=_str_value(table, "handoff_repo", defaults.handoff_repo, errors),
         severity_floor=_str_value(table, "severity_floor", defaults.severity_floor, errors),
         control_public_url=_str_value(table, "control_public_url", defaults.control_public_url, errors),
+        observatory_public_url=_str_value(table, "observatory_public_url", defaults.observatory_public_url, errors),
         memory_dir=_str_value(table, "memory_dir", defaults.memory_dir, errors),
         state_dir=_str_value(table, "state_dir", defaults.state_dir, errors),
         ruleset_version=_str_value(table, "ruleset_version", defaults.ruleset_version, errors),
+        insight_records_enabled=_bool_value(
+            table, "insight_records_enabled", defaults.insight_records_enabled, errors
+        ),
+        insight_knowledge_citations=_bool_value(
+            table, "insight_knowledge_citations", defaults.insight_knowledge_citations, errors
+        ),
+        insight_reassert_s=_int_value(table, "insight_reassert_s", defaults.insight_reassert_s, errors),
+        insight_max_per_cycle=_int_value(table, "insight_max_per_cycle", defaults.insight_max_per_cycle, errors),
+        insight_score_norm=_float_value(table, "insight_score_norm", defaults.insight_score_norm, errors),
     )
 
 

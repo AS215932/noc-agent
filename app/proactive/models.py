@@ -208,6 +208,8 @@ class ProactiveCycleReport(BaseModel):
     investigated: list[str] = Field(default_factory=list)
     auto_snoozed: list[str] = Field(default_factory=list)
     handoffs: list[str] = Field(default_factory=list)
+    # hotspot key -> handoff URL, so insight records can tell draft from notify.
+    handoffs_by_key: dict[str, str] = Field(default_factory=dict)
     cost_usd: float = 0.0
     decision_id: str | None = None
     errors: list[str] = Field(default_factory=list)
