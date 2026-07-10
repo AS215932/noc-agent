@@ -98,6 +98,18 @@ class ProactiveLoopSettings:
     memory_dir: str = "/var/lib/noc-agent/memory"
     state_dir: str = "/var/lib/noc-agent/proactive"
     ruleset_version: str = "1"
+    # Insight-decision records (agent-core InsightDecisionRecord per surface/
+    # withhold decision, incl. deliberate silence). Read-only reporting; ships
+    # off. Citations additionally require the pinned knowledge export
+    # ([loop_handoff].knowledge_export_sqlite) to be present.
+    insight_records_enabled: bool = False
+    insight_knowledge_citations: bool = False
+    # Re-emit an unchanged per-fingerprint decision at most this often (seconds);
+    # the loop runs every interval_s, so this bounds stream volume.
+    insight_reassert_s: int = 21600
+    insight_max_per_cycle: int = 32
+    # Hotspot score at or above which expected_utility saturates at 1.0.
+    insight_score_norm: float = 100.0
 
 
 @dataclass(frozen=True)
@@ -266,6 +278,13 @@ def load_proactive_settings() -> ProactiveLoopSettings:
         memory_dir=_env_str("NOC_PROACTIVE_MEMORY_DIR", base.memory_dir),
         state_dir=_env_str("NOC_PROACTIVE_STATE_DIR", base.state_dir),
         ruleset_version=_env_str("NOC_PROACTIVE_RULESET_VERSION", base.ruleset_version),
+        insight_records_enabled=_env_bool("NOC_INSIGHT_RECORDS_ENABLED", base.insight_records_enabled),
+        insight_knowledge_citations=_env_bool(
+            "NOC_INSIGHT_KNOWLEDGE_CITATIONS", base.insight_knowledge_citations
+        ),
+        insight_reassert_s=_env_int("NOC_INSIGHT_REASSERT_S", base.insight_reassert_s),
+        insight_max_per_cycle=_env_int("NOC_INSIGHT_MAX_PER_CYCLE", base.insight_max_per_cycle),
+        insight_score_norm=_env_float("NOC_INSIGHT_SCORE_NORM", base.insight_score_norm),
     )
 
 
@@ -376,6 +395,15 @@ def _proactive_settings(table: Any, errors: list[str]) -> ProactiveLoopSettings:
         memory_dir=_str_value(table, "memory_dir", defaults.memory_dir, errors),
         state_dir=_str_value(table, "state_dir", defaults.state_dir, errors),
         ruleset_version=_str_value(table, "ruleset_version", defaults.ruleset_version, errors),
+        insight_records_enabled=_bool_value(
+            table, "insight_records_enabled", defaults.insight_records_enabled, errors
+        ),
+        insight_knowledge_citations=_bool_value(
+            table, "insight_knowledge_citations", defaults.insight_knowledge_citations, errors
+        ),
+        insight_reassert_s=_int_value(table, "insight_reassert_s", defaults.insight_reassert_s, errors),
+        insight_max_per_cycle=_int_value(table, "insight_max_per_cycle", defaults.insight_max_per_cycle, errors),
+        insight_score_norm=_float_value(table, "insight_score_norm", defaults.insight_score_norm, errors),
     )
 
 
