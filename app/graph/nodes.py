@@ -243,6 +243,8 @@ class NodeRunner:
             approval_state = "noop_guards_prepared" if noop_guards else "executed"
         else:
             approval_state = "execution_failed"
+        if str(decision.get("operator") or "") == "standing-grant":
+            await self._announce_standing_grant(state, decision, approval_state=approval_state)
         update = {
             "current_step": "execute_approved_remediation",
             "updated_at": utc_now(),
@@ -292,9 +294,10 @@ class NodeRunner:
                             "sanitized_error": "Standing grant requires a unique WARNING-state Icinga problem",
                         },
                     }
-                arguments["ack_ttl_seconds"] = max(
-                    60, int(os.getenv("NOC_STANDING_GRANT_ACK_TTL_S", "86400") or 86400)
-                )
+                # The MCP tool takes an absolute `expiry` epoch (see
+                # app/icinga_ack.py's TTL conversion), not a TTL argument.
+                ttl = max(60, int(os.getenv("NOC_STANDING_GRANT_ACK_TTL_S", "86400") or 86400))
+                arguments["expiry"] = int(time.time()) + ttl
                 arguments["notify"] = False
         if tool_name is None:
             return {"action": action, "ok": False, "result": {"error_type": "policy_blocked", "sanitized_error": "Unsupported action type"}}
@@ -462,8 +465,8 @@ class NodeRunner:
             # Tier-0 standing grant: every structured action is in the operator-
             # configured grant set, so execution proceeds without a per-incident
             # approval — still fully audited (operator-decision trace, Discord
-            # line, insight record) and still envelope-enforced at execution.
-            await self._announce_standing_grant(state, granted)
+            # line posted AFTER execution with the real outcome, insight record)
+            # and still envelope-enforced at execution.
             update = {
                 "current_step": "approval_interrupt",
                 "updated_at": utc_now(),
@@ -482,19 +485,28 @@ class NodeRunner:
         assert_json_serializable_state(update)
         return update
 
-    async def _announce_standing_grant(self, state: WorkflowState, decision: dict[str, Any]) -> None:
+    async def _announce_standing_grant(
+        self, state: WorkflowState, decision: dict[str, Any], *, approval_state: str
+    ) -> None:
+        """Post the standing-grant audit line AFTER execution, reflecting the
+        real outcome (an envelope block must not read as 'executed')."""
         try:
             from app.discord import Verbosity, send_discord_notification
 
+            executed = approval_state == "executed"
             actions = _stored_structured_actions(state)
             await send_discord_notification(
-                title="🪪 Standing grant executed (no per-incident approval)",
+                title=(
+                    "🪪 Standing grant executed (no per-incident approval)"
+                    if executed
+                    else f"🪪 Standing grant blocked ({approval_state})"
+                ),
                 description=(
                     f"Case {state.get('case_number') or state['incident_id']}: "
                     f"{', '.join(str(a.get('type')) for a in actions)} on "
                     f"{state.get('resource_id', '')} — {decision.get('comment', '')}"
                 ),
-                color=0x3498DB,
+                color=0x3498DB if executed else 0xE67E22,
                 level=Verbosity.INFO,
             )
         except Exception:  # audit post is advisory; execution trace still records it

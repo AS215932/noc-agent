@@ -56,6 +56,7 @@ def _gate(**overrides) -> GateDecision:
 
 def _build(report, gate, settings, **kwargs):
     kwargs.setdefault("effective", list(report.hotspots))
+    kwargs.setdefault("digest_due", True)
     kwargs.setdefault("posted", True)
     kwargs.setdefault("deep", False)
     kwargs.setdefault("suppression_entry", lambda h: None)
@@ -108,7 +109,7 @@ def test_digest_member_posted_is_notify_surfaced(tmp_path):
 def test_digest_withheld_by_dedup_is_deliberate_silence(tmp_path):
     hs = _hotspot()
     report = ProactiveCycleReport(hotspots=[hs])
-    record = _build(report, _gate(), _settings(tmp_path), posted=False)[0]
+    record = _build(report, _gate(), _settings(tmp_path), digest_due=False, posted=False)[0]
     assert record["action_selected"] == "stay_silent"
     assert record["sampling_class"] == "withheld_logged"
     assert "dedup" in record["why_now"]
@@ -456,3 +457,86 @@ async def test_investigated_hotspot_with_handoff_emits_draft(tmp_path, monkeypat
     assert report.investigated
     drafts = [r for r in emitted if r["action_selected"] == "draft"]
     assert drafts and drafts[0]["downstream_outcome"]["handoff_url"] == "https://gh/issue/9"
+
+
+def test_digest_delivery_failure_stays_a_notify_decision(tmp_path):
+    hs = _hotspot()
+    report = ProactiveCycleReport(hotspots=[hs])
+    record = _build(report, _gate(), _settings(tmp_path), digest_due=True, posted=False)[0]
+    # the loop CHOSE to notify; a failed webhook must not read as silence
+    assert record["action_selected"] == "notify"
+    assert record["sampling_class"] == "surfaced"
+    assert "delivery failed" in record["why_now"]
+    assert record["budget_context"]["digest_due"] is True
+    assert record["budget_context"]["digest_posted"] is False
+
+
+def test_suppression_reason_is_sanitized(tmp_path):
+    hs = _hotspot()
+    report = ProactiveCycleReport(hotspots=[])
+    records = _build(
+        report,
+        _gate(max_investigations=0, reason="none eligible"),
+        _settings(tmp_path),
+        effective=[hs],
+        suppression_entry=lambda h: {
+            "operator": "agent\nignore previous",
+            "reason": "line one\nline two\x07",
+        },
+    )
+    assert "\n" not in records[0]["why_now"] and "\x07" not in records[0]["why_now"]
+
+
+def test_emission_state_reemits_on_risk_or_utility_change(tmp_path):
+    state = _state(tmp_path, reassert_s=3600)
+    base = {
+        "fingerprint": "fp1",
+        "action_selected": "notify",
+        "why_now": "digest: within budget",
+        "risk_class": "medium",
+        "expected_utility": {"total": 0.4},
+    }
+    assert state.filter_and_mark([base], now=1000.0)
+    # unchanged -> deduped
+    assert state.filter_and_mark([dict(base)], now=1010.0) == []
+    # severity upgrade (risk class change) re-emits even with same action/why
+    upgraded = {**base, "risk_class": "high"}
+    assert state.filter_and_mark([upgraded], now=1020.0)
+    # utility jump re-emits too
+    jumped = {**upgraded, "expected_utility": {"total": 0.9}}
+    assert state.filter_and_mark([jumped], now=1030.0)
+
+
+def test_emission_state_marks_only_after_delivery(tmp_path):
+    state = _state(tmp_path)
+    record = _rec()
+    due = state.pending([record], now=1000.0)
+    assert due == [record]
+    # not marked yet: still pending (delivery failed / sink disabled)
+    assert state.pending([record], now=1010.0) == [record]
+    state.mark(due, now=1010.0)
+    assert state.pending([record], now=1020.0) == []
+
+
+@pytest.mark.asyncio
+async def test_loop_retries_records_when_delivery_fails(tmp_path, monkeypatch):
+    attempts: list[int] = []
+
+    def failing_emit(records, *, input_event=None):
+        attempts.append(len(records))
+        return 0  # sink disabled / collector outage
+
+    import app.agent_core_trace as trace_mod
+
+    monkeypatch.setattr(trace_mod, "emit_loop_decision_envelopes", failing_emit)
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path),
+        reporter=_CaptureReporter(),
+        model_chain=lambda: ["m"],
+    )
+    await lp.run_once(deep=True)
+    await lp.run_once(deep=True)
+    # nothing was marked, so the same decisions are retried next cycle
+    assert len(attempts) == 2
+    assert attempts[1] >= 1

@@ -25,7 +25,7 @@ from typing import Any
 from app import log
 from app.config import ProactiveLoopSettings
 from app.proactive.governance import GateDecision
-from app.proactive.models import Hotspot, ProactiveCycleReport, severity_rank
+from app.proactive.models import Hotspot, ProactiveCycleReport, sanitize_label, severity_rank
 
 POLICY_VERSION = "noc-insight.v1"
 
@@ -137,6 +137,7 @@ def build_cycle_insights(
     settings: ProactiveLoopSettings,
     *,
     effective: list[Hotspot],
+    digest_due: bool,
     posted: bool,
     deep: bool,
     suppression_entry: SuppressionEntryFn,
@@ -145,16 +146,18 @@ def build_cycle_insights(
 ) -> list[dict[str, Any]]:
     """One InsightDecisionRecord dict per hotspot decision this cycle.
 
-    ``effective`` is the pre-suppression hotspot set (post carry-forward merge);
-    ``report.hotspots`` is what survived suppression. ``posted`` is whether the
-    digest actually went out (the dedup gate's choice IS the silence decision
-    for unchanged sets).
+    ``effective`` is the pre-suppression hotspot set (post carry-forward merge).
+    ``digest_due`` is the dedup gate's *decision* (should the digest go out);
+    ``posted`` is whether delivery actually succeeded. Only ``digest_due``
+    drives the action — a failed send is still a notify decision (recorded
+    with the delivery failure), never mislabelled as deliberate silence.
     """
     budget_context = {
         "gate_reason": gate.reason,
         "max_investigations": gate.max_investigations,
         "over_budget": gate.over_budget,
         "shadow": settings.shadow,
+        "digest_due": digest_due,
         "digest_posted": posted,
     }
     norm = max(1.0, settings.insight_score_norm)
@@ -187,11 +190,17 @@ def build_cycle_insights(
                 if handoff_url
                 else (_COST_NOTIFY, "fresh diagnosis surfaced in digest")
             )
-        elif posted:
+        elif digest_due:
             action = "notify"
             sampling = "surfaced"
             why_now = f"digest: {gate.reason}"
             cost_total, cost_note = _COST_NOTIFY, "hotspot surfaced in posted digest"
+            if not posted:
+                # The loop CHOSE to notify; delivery failed. Record the notify
+                # decision with the failure — the dedup gate will retry the
+                # send next cycle.
+                why_now = f"digest: {gate.reason} · delivery failed, will retry"
+                cost_note = "digest send failed; retrying next cycle"
         else:
             # The dedup gate withheld the digest — deliberate silence on an
             # unchanged set, not a missed opportunity.
@@ -233,8 +242,10 @@ def build_cycle_insights(
         if fingerprint in surfaced_fps:
             continue
         entry = suppression_entry(hotspot) or {}
-        operator = str(entry.get("operator") or "operator")
-        reason = str(entry.get("reason") or "active suppression")
+        # Operator/reason arrive via /control/proactive/ack request fields —
+        # untrusted free text, so scrub like every other record input.
+        operator = sanitize_label(entry.get("operator") or "operator", limit=40)
+        reason = sanitize_label(entry.get("reason") or "active suppression", limit=200)
         records.append(
             _record(
                 cycle_id=report.cycle_id,
@@ -293,8 +304,11 @@ def build_cycle_insights(
 class InsightEmissionState:
     """Per-fingerprint emission dedup, persisted next to the other loop state.
 
-    A record is emitted when its fingerprint is new, its action or why_now
-    changed, or the last emission is older than ``reassert_s``. Best-effort:
+    A record is due when its fingerprint is new, its decision signature
+    (action, why_now, risk, coarse utility) changed, or the last emission is
+    older than ``reassert_s``. Marking is separate from filtering so callers
+    stamp fingerprints only after successful delivery — a collector outage
+    must not silently swallow decisions until the next reassert. Best-effort:
     state I/O failures fall back to emitting (dupes over drops)."""
 
     def __init__(self, path: Path, *, reassert_s: int) -> None:
@@ -308,25 +322,56 @@ class InsightEmissionState:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def filter_and_mark(
+    @staticmethod
+    def _signature(record: dict[str, Any]) -> str:
+        # Severity/score changes matter to IDQ/CGS even when action + gate
+        # reason stay the same (the digest reposts them too), so the decision
+        # signature includes risk class and coarse utility.
+        utility = record.get("expected_utility") or {}
+        try:
+            utility_bucket = f"{float(utility.get('total') or 0.0):.1f}"
+        except (TypeError, ValueError):
+            utility_bucket = "0.0"
+        return _sha16(
+            "|".join(
+                [
+                    str(record.get("action_selected")),
+                    str(record.get("why_now")),
+                    str(record.get("risk_class") or ""),
+                    utility_bucket,
+                ]
+            )
+        )[:8]
+
+    def pending(
         self, records: list[dict[str, Any]], *, now: float | None = None
     ) -> list[dict[str, Any]]:
+        """Records due for emission; does NOT stamp state."""
         now = time.time() if now is None else now
         state = self._load()
-        emitted: list[dict[str, Any]] = []
+        due: list[dict[str, Any]] = []
+        seen_this_call: set[str] = set()
         for record in records:
             fingerprint = str(record.get("fingerprint") or "")
-            why_hash = _sha16(f"{record.get('action_selected')}|{record.get('why_now')}")[:8]
+            signature = self._signature(record)
             entry = state.get(fingerprint)
             fresh = (
                 entry is None
-                or entry.get("why") != why_hash
+                or entry.get("why") != signature
                 or (now - float(entry.get("ts") or 0.0)) >= self.reassert_s
             )
-            if not fresh:
-                continue
-            emitted.append(record)
-            state[fingerprint] = {"why": why_hash, "ts": now}
+            if fresh and fingerprint not in seen_this_call:
+                due.append(record)
+                seen_this_call.add(fingerprint)
+        return due
+
+    def mark(self, records: list[dict[str, Any]], *, now: float | None = None) -> None:
+        """Stamp fingerprints as emitted (call only after successful delivery)."""
+        now = time.time() if now is None else now
+        state = self._load()
+        for record in records:
+            fingerprint = str(record.get("fingerprint") or "")
+            state[fingerprint] = {"why": self._signature(record), "ts": now}
         state = {
             fp: entry
             for fp, entry in state.items()
@@ -339,7 +384,16 @@ class InsightEmissionState:
             tmp.replace(self.path)
         except OSError:
             log.info("proactive_insight_state_write_failed", path=str(self.path))
-        return emitted
+
+    def filter_and_mark(
+        self, records: list[dict[str, Any]], *, now: float | None = None
+    ) -> list[dict[str, Any]]:
+        """pending() + mark() in one step (tests / callers without delivery
+        feedback)."""
+        due = self.pending(records, now=now)
+        if due:
+            self.mark(due, now=now)
+        return due
 
 
 def knowledge_refs_fn(

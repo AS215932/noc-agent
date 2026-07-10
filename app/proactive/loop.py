@@ -229,9 +229,14 @@ class ProactiveLoop:
                 self._last_deep_scan = time.time()
             report.outcome = self._classify_outcome(report, gate, investigated)
             await self._persist_memory(report, do_deep)
-            posted = await self._safe_report(report, gate)
+            digest_due, posted = await self._safe_report(report, gate)
             await self._emit_insight_records(
-                report, gate, effective=effective, posted=posted, deep=do_deep
+                report,
+                gate,
+                effective=effective,
+                digest_due=digest_due,
+                posted=posted,
+                deep=do_deep,
             )
         except Exception as exc:
             safe = classify_exception(exc)
@@ -720,9 +725,13 @@ class ProactiveLoop:
         stale = (now - self._last_report_ts) >= max(1, self.settings.report_reassert_s)
         return (changed or stale), signature, now
 
-    async def _safe_report(self, report: ProactiveCycleReport, gate: GateDecision) -> bool:
-        """Post the digest when due; return whether it actually went out (the
-        insight records need the surface-vs-withhold outcome)."""
+    async def _safe_report(
+        self, report: ProactiveCycleReport, gate: GateDecision
+    ) -> tuple[bool, bool]:
+        """Post the digest when due; return ``(due, posted)`` — the dedup
+        gate's decision and whether delivery actually succeeded. The insight
+        records need both: a failed send is still a notify decision, not
+        deliberate silence."""
         should, signature, now = self._report_decision(report)
         posted = False
         if should:
@@ -742,7 +751,7 @@ class ProactiveLoop:
         except Exception as exc:
             safe = classify_exception(exc)
             log_exception("proactive_heartbeat_failed", exc, category=safe.category)
-        return posted
+        return should, posted
 
     async def _case_service_mark_reported_hotspots(self, report: ProactiveCycleReport) -> None:
         if not (self.case_service_control and self.case_service is not None):
@@ -851,6 +860,7 @@ class ProactiveLoop:
         gate: GateDecision,
         *,
         effective: list[Hotspot],
+        digest_due: bool,
         posted: bool,
         deep: bool,
     ) -> int:
@@ -873,6 +883,7 @@ class ProactiveLoop:
                 gate,
                 self.settings,
                 effective=effective,
+                digest_due=digest_due,
                 posted=posted,
                 deep=deep,
                 suppression_entry=self._suppression_entry_for_hotspot,
@@ -883,7 +894,7 @@ class ProactiveLoop:
                 self._state_dir / "insight-emissions.json",
                 reassert_s=self.settings.insight_reassert_s,
             )
-            due = state.filter_and_mark(records)
+            due = state.pending(records)
             if not due:
                 return 0
             delivered = agent_core_trace.emit_loop_decision_envelopes(
@@ -896,6 +907,11 @@ class ProactiveLoop:
                     "model_consumption_allowed": False,
                 },
             )
+            # Stamp the dedup state only on full delivery: a disabled sink or a
+            # collector outage must retry these decisions next cycle instead of
+            # silently losing them until the reassert window.
+            if delivered == len(due):
+                state.mark(due)
             log.info(
                 "proactive_insights_emitted",
                 built=len(records),
