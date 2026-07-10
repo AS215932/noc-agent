@@ -203,7 +203,7 @@ case store and creates the current schema on startup. Install the optional
 Postgres support in deployments that enable this path:
 
 ```bash
-uv sync --extra postgres
+uv sync  # langgraph-checkpoint-postgres is a hard dependency
 ```
 
 Without a DSN, shadow mode uses in-memory storage for local/dev canaries. Set
@@ -410,15 +410,43 @@ Model selection is configurable via TOML. Lookup order is:
 3. `config/noc-agent.toml`
 4. built-in defaults
 
-The default chain is OpenRouter DeepSeek V4 Pro with Claude Sonnet 4.6 as a fallback:
+The bundled default chain is GLM 5.2 with DeepSeek V4 Flash as the cheaper
+alternative, both on OpenRouter:
 
 ```toml
 [model]
-primary = "openrouter:deepseek/deepseek-v4-pro"
-fallbacks = ["openrouter:anthropic/claude-sonnet-4.6"]
+primary = "openrouter:z-ai/glm-5.2"
+fallbacks = ["openrouter:deepseek/deepseek-v4-flash"]
 ```
 
 Any OpenRouter model can be selected with `openrouter:<model-slug>`. Secrets stay in environment variables, not in the config file. `AGENT_MODEL` and `AGENT_FALLBACK_MODELS` still override the config file for emergency changes.
+
+Venice.AI is supported as a provider-redundant fallback with `venice:<model-id>`
+(model IDs from `https://api.venice.ai/api/v1/models`). Venice entries are served
+through Venice's OpenAI-compatible endpoint and authenticate with `VENICE_API_KEY`
+(`VENICE_BASE_URL` overrides the default `https://api.venice.ai/api/v1`). Venice's
+default system prompt is disabled on these entries
+(`venice_parameters.include_venice_system_prompt: false`) so provider failover
+does not alter the agent's instructions. Because Venice is a separate provider,
+an OpenRouter key-limit or quota event does not take the whole chain down.
+Venice fallbacks are opt-in — enabling them without `VENICE_API_KEY` degrades
+`/health/model` with a missing credential. The production chain is:
+
+```toml
+[model]
+primary = "openrouter:z-ai/glm-5.2"
+fallbacks = [
+  "venice:zai-org-glm-5-2",
+  "openrouter:deepseek/deepseek-v4-flash",
+  "venice:deepseek-v4-flash",
+]
+```
+
+Venice quota is probed via `GET /api_keys/rate_limits`: `/health/model` reports
+the key's USD/Diem balances and degrades when `accessPermitted` is false or the
+remaining balance crosses the thresholds (`VENICE_WARN_REMAINING_USD` /
+`VENICE_CRITICAL_REMAINING_USD`, defaults 5/1; probe timeout and cache via
+`VENICE_CREDIT_PROBE_TIMEOUT_SECONDS` / `VENICE_CREDIT_PROBE_CACHE_SECONDS`).
 
 Google/Gemini remains supported for future use:
 
