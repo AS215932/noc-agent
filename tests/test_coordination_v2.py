@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 from agent_core.contracts import HandoffEnvelope, HandoffRecord
+from agent_core.coordination import CoordinatorError
 
 from app.cases.models import AtomicCaseProjection
 from app.coordination import NocCoordinatorWorker
@@ -111,6 +112,51 @@ async def test_noc_worker_refuses_mutating_or_heavy_snapshot_tools() -> None:
             "noc.network_snapshot.read",
             {"tool": "tcpdump_capture", "arguments": {"host": "rtr"}},
         )
+    with pytest.raises(ValueError, match="one bounded show command"):
+        await worker._dispatch(
+            "noc.network_snapshot.read",
+            {
+                "tool": "frr_vtysh_cmd",
+                "arguments": {
+                    "host": "rtr",
+                    "command": "show bgp; configure terminal",
+                },
+            },
+        )
+    with pytest.raises(ValueError, match="unsupported keys"):
+        await worker._dispatch(
+            "noc.network_snapshot.read",
+            {
+                "tool": "firewall_state",
+                "arguments": {"host": "rtr", "apply": True},
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_noc_worker_skips_a_handoff_claimed_by_another_worker() -> None:
+    envelope = HandoffEnvelope(
+        source_loop="soc",
+        target_loop="noc",
+        capability="noc.network_snapshot.read",
+        payload={"tool": "firewall_state", "arguments": {"host": "rtr"}},
+        idempotency_key="snapshot:claim-race",
+    )
+
+    class ClaimConflict(FakeClient):
+        async def claim(self, handoff_id: str):
+            raise CoordinatorError("coordinator POST /claim returned 409: already claimed")
+
+    client = ClaimConflict([HandoffRecord(envelope=envelope, status="queued")])
+    worker = NocCoordinatorWorker(
+        client,  # type: ignore[arg-type]
+        FakeMCP(),  # type: ignore[arg-type]
+        SimpleNamespace(store=FakeStore()),  # type: ignore[arg-type]
+    )
+    report = await worker.run_once()
+    assert report["completed"] == []
+    assert report["failed"] == []
+    assert client.results == []
 
 
 @pytest.mark.asyncio

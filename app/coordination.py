@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -44,6 +45,51 @@ SNAPSHOT_TOOLS = frozenset(
         "knot_zone_status",
     }
 )
+
+SNAPSHOT_ARGUMENT_KEYS: dict[str, frozenset[str]] = {
+    "icinga_list_problems": frozenset({"object_type", "limit"}),
+    "icinga_get_host_state": frozenset({"host"}),
+    "prometheus_list_targets": frozenset({"filter"}),
+    "prometheus_query": frozenset({"query"}),
+    "frr_vtysh_cmd": frozenset({"host", "command"}),
+    "path_explain": frozenset({"from_host", "to_addr", "protocol", "src_port"}),
+    "ecmp_path_select": frozenset(
+        {"from_host", "to_addr", "n_flows", "protocol", "vary"}
+    ),
+    "socket_listeners": frozenset({"host"}),
+    "firewall_state": frozenset({"host"}),
+    "pf_log_tail": frozenset({"host", "count", "filter", "since"}),
+    "nft_log_tail": frozenset({"host", "count", "filter", "since"}),
+    "ndp_state": frozenset({"host", "addr", "iface"}),
+    "arp_state": frozenset({"host", "addr", "iface"}),
+    "wg_show": frozenset({"host"}),
+    "vault_agent_status": frozenset({"host"}),
+    "os_service_status": frozenset({"host", "service"}),
+    "os_systemd_status": frozenset({"host", "unit"}),
+    "os_rcctl_check": frozenset({"host", "service"}),
+    "dns_dig": frozenset({"host", "target", "query_type", "nameserver"}),
+    "knot_zone_status": frozenset({"host"}),
+}
+
+
+def _validate_snapshot_arguments(tool: str, arguments: dict[str, Any]) -> None:
+    allowed = SNAPSHOT_ARGUMENT_KEYS.get(tool)
+    if allowed is None:
+        raise ValueError(f"snapshot tool {tool!r} has no argument contract")
+    unexpected = sorted(set(arguments) - allowed)
+    if unexpected:
+        raise ValueError(f"snapshot arguments contain unsupported keys: {unexpected}")
+    for key, value in arguments.items():
+        if isinstance(value, (dict, list, tuple, set)):
+            raise ValueError(f"snapshot argument {key!r} must be a scalar")
+        if isinstance(value, str) and len(value) > 4000:
+            raise ValueError(f"snapshot argument {key!r} exceeds 4000 characters")
+    if tool == "frr_vtysh_cmd":
+        command = str(arguments.get("command") or "").strip()
+        if not re.fullmatch(
+            r"show(?: [A-Za-z0-9_.:/,()\[\]-]+)+", command, re.IGNORECASE
+        ):
+            raise ValueError("frr_vtysh_cmd accepts one bounded show command only")
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -110,6 +156,14 @@ class NocCoordinatorWorker:
             handoff_id = record.envelope.handoff_id
             try:
                 await self.client.claim(handoff_id)
+            except CoordinatorError as exc:
+                if "returned 409" in str(exc):
+                    continue
+                report["failed"].append(
+                    {"handoff_id": handoff_id, "error": "coordinator claim failed"}
+                )
+                continue
+            try:
                 await self.client.progress(handoff_id, f"NOC processing {capability}")
                 payload = await self._dispatch(capability, record.envelope.payload)
                 await self.client.submit_result(
@@ -144,6 +198,7 @@ class NocCoordinatorWorker:
                 raise ValueError(f"tool {tool!r} is not allowed for coordinator snapshots")
             if not isinstance(arguments, dict):
                 raise ValueError("snapshot arguments must be an object")
+            _validate_snapshot_arguments(tool, arguments)
             result = await self.mcp_runtime.call_tool("hyrule", tool, arguments)
             return {
                 "summary": f"NOC returned bounded read-only snapshot {tool}",
@@ -255,12 +310,20 @@ async def run_worker() -> None:
         if runtime is None:
             raise RuntimeError("NOC CaseService runtime is required")
         worker = NocCoordinatorWorker(client, mcp, runtime)
+        failures = 0
         while True:
             try:
                 await worker.run_once()
+                failures = 0
             except Exception as exc:
-                log.warning("noc_coordinator_cycle_failed", error=type(exc).__name__)
-            await asyncio.sleep(interval)
+                failures += 1
+                log.warning(
+                    "noc_coordinator_cycle_failed",
+                    error=type(exc).__name__,
+                    consecutive_failures=failures,
+                )
+            delay = interval if failures == 0 else min(60, interval * (2 ** min(failures, 4)))
+            await asyncio.sleep(delay)
     finally:
         if runtime is not None:
             await runtime.close()
