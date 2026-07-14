@@ -1,4 +1,5 @@
 import copy
+from types import SimpleNamespace
 
 import pytest
 from fastapi import Response, status
@@ -238,9 +239,9 @@ async def test_investigate_alert_sanitizes_provider_failure(mock_alert_payload, 
             },
         )
 
-    send_discord = mocker.patch("app.discord.send_discord_notification")
     store = InMemoryCaseStore()
     service = CaseService(store)
+    mocker.patch("app.main.case_service_runtime", SimpleNamespace(service=service, store=store))
     observation = observations_from_alertmanager({**mock_alert_payload, "source": "alertmanager"})[0]
     observed = await service.observe(observation)
     assert observed.case is not None
@@ -255,12 +256,14 @@ async def test_investigate_alert_sanitizes_provider_failure(mock_alert_payload, 
         graph_memory=graph_memory,
     )
 
-    descriptions = [call.kwargs.get("description", "") for call in send_discord.call_args_list]
-    combined = "\n".join(descriptions)
+    stored = await store.get_case(observed.case.case_id)
+    assert stored is not None
+    combined = str(getattr(stored, "last_diagnosis", {}))
     assert "configured AI model quota is exhausted" in combined
     assert "quotaValue" not in combined
     assert "do-not-show" not in combined
     assert "generativelanguage.googleapis.com" not in combined
+    assert any(intent.intent_type == "report" for intent in await store.list_outbox(status="pending"))
 
 
 def test_safe_error_classifies_quota_without_leaking_body():
@@ -291,6 +294,7 @@ async def test_health_model_is_degraded_for_missing_model_credentials(monkeypatc
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert health["status"] == "degraded"
+    assert health["readiness"]["status"] == "unavailable"
     assert health["quota_monitoring"] == "not_configured"
     assert "test-google-key" not in str(health)
 
@@ -313,8 +317,10 @@ async def test_health_model_is_degraded_for_recent_runtime_failure_when_config_i
     response = Response()
     health = await health_model(response)
 
-    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.status_code == status.HTTP_200_OK
     assert health["status"] == "degraded"
+    assert health["readiness"]["status"] == "ok"
+    assert health["runtime_reliability"]["status"] == "degraded"
     assert health["quota_monitoring"] == "not_configured"
     assert health["last_failure_category"] == "unknown_infrastructure"
     assert health["last_failure_at"] == 123.0

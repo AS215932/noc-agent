@@ -173,7 +173,8 @@ async def test_grant_announce_fires_after_execution_with_outcome(monkeypatch):
     monkeypatch.setenv("NOC_APPROVAL_SIGNING_SECRET", "secret")
     announcements: list[str] = []
 
-    async def fake_notify(*, title, description, color, level):
+    async def fake_notify(*, title, description, color, level, route):
+        assert route == "network"
         announcements.append(title)
 
     import app.discord as discord_mod

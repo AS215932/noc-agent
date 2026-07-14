@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 from app.cases.models import ObservationRecord, SourceHealth
+from app.cases.notifications import notification_route_for
 from app.proactive.models import Hotspot
 
 
@@ -53,6 +54,7 @@ def observation_from_hotspot(
         resource=hotspot.resource,
         service=hotspot.category,
         severity=hotspot.severity,
+        notification_route=notification_route_for(detector=hotspot.rule_id, service=hotspot.category),
         status=status,
         observed_at=hotspot.detected_at,
         scan_cycle_id=cycle_id,

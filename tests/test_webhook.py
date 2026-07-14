@@ -10,8 +10,10 @@ from app.main import (
     IcingaNotification,
     _embedded_discord_bot_enabled,
     _record_reactive_case_investigation,
+    _release_case_outbox_lock,
     _release_mail_poller_lock,
     _shadow_observe_alert_payload,
+    _try_acquire_case_outbox_lock,
     _try_acquire_mail_poller_lock,
     _triage_fields,
     alertmanager_webhook,
@@ -160,6 +162,8 @@ async def test_health_config_reports_missing_mail_password(monkeypatch):
     for name in (
         "GEMINI_API_KEY",
         "DISCORD_WEBHOOK_URL",
+        "DISCORD_AI_WEBHOOK_URL",
+        "DISCORD_CI_WEBHOOK_URL",
         "HYRULE_MCP_CMD",
         "XO_MCP_CMD",
         "XO_TOKEN",
@@ -182,6 +186,8 @@ async def test_health_config_reports_missing_mail_password(monkeypatch):
 async def test_health_config_requires_openrouter_key_by_default(monkeypatch):
     for name in (
         "DISCORD_WEBHOOK_URL",
+        "DISCORD_AI_WEBHOOK_URL",
+        "DISCORD_CI_WEBHOOK_URL",
         "HYRULE_MCP_CMD",
         "XO_MCP_CMD",
         "XO_TOKEN",
@@ -207,6 +213,8 @@ async def test_health_config_requires_openrouter_key_by_default(monkeypatch):
 async def test_health_config_does_not_require_gemini_for_openrouter(monkeypatch):
     for name in (
         "DISCORD_WEBHOOK_URL",
+        "DISCORD_AI_WEBHOOK_URL",
+        "DISCORD_CI_WEBHOOK_URL",
         "HYRULE_MCP_CMD",
         "XO_MCP_CMD",
         "XO_TOKEN",
@@ -533,6 +541,24 @@ def test_mail_poller_lock_allows_only_one_owner(tmp_path, monkeypatch):
     finally:
         _release_mail_poller_lock(second_lock)
 
+
+def test_case_outbox_lock_allows_one_worker_and_failover(tmp_path, monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(main, "CASE_OUTBOX_LOCK_PATH", str(tmp_path / "case-outbox.lock"))
+    first_lock = _try_acquire_case_outbox_lock()
+    try:
+        assert first_lock is not None
+        assert _try_acquire_case_outbox_lock() is None
+    finally:
+        _release_case_outbox_lock(first_lock)
+
+    replacement_lock = _try_acquire_case_outbox_lock()
+    try:
+        assert replacement_lock is not None
+    finally:
+        _release_case_outbox_lock(replacement_lock)
+
 @pytest.mark.asyncio
 async def test_mail_poll_accepted(mocker):
     mocker.patch("app.main.process_mailbox_once")
@@ -548,8 +574,6 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload,
     it should send a summary to a specified Discord Webhook URL.
     This test serves as a design driver for creating the `discord.py` integration.
     """
-    mock_case_discord = mocker.patch("app.main.send_case_notification", return_value=None)
-    
     # We call the investigation function directly to avoid asyncio background_tasks complications
     from app.main import investigate_alert
     
@@ -569,11 +593,10 @@ async def test_webhook_triggers_discord_notification(mocker, mock_alert_payload,
     # Run the test directly overriding the model logic for the scope of the method call
     await investigate_alert(mock_alert_payload, model=TestModel(), case=graph_case, graph_memory=graph_memory)
 
-    assert mock_case_discord.call_count == 2
-    titles = [call.kwargs["title"] for call in mock_case_discord.call_args_list]
-    assert any(title.startswith("⏳ NOC:") for title in titles)
-    assert any(title.startswith("Detailed Report:") for title in titles)
-    assert not any("Finished" in title for title in titles)
+    # Investigation lifecycle changes are recorded on the case and delivered
+    # through the persistent-card outbox; no start/finish messages are emitted.
+    pending = await store.list_outbox(status="pending")
+    assert any(intent.intent_type == "report" for intent in pending)
 
 
 @pytest.mark.asyncio

@@ -134,10 +134,14 @@ class CaseService:
                     "case_id": case.case_id,
                     "status": case.status,
                     "severity": case.severity,
+                    "notification_route": case.notification_route,
                     "signal_signature": case.signal_signature,
+                    "diagnosis_signature": case.diagnosis_signature,
+                    "investigation_status": case.investigation_status,
                     "resolution_reason": case.resolution_reason,
                     "issue_url": case.issue_url,
                     "suppressed_until": case.suppressed_until,
+                    "acknowledged_at": case.acknowledged_at,
                 }
             ).encode("utf-8")
         ).hexdigest()[:16]
@@ -189,6 +193,104 @@ class CaseService:
                 actor_type="system",
                 policy_version=self.policy.policy_version,
                 payload={"state_signature": state_signature},
+            )
+        )
+        return case
+
+    async def record_discord_delivery(
+        self,
+        case_id: str,
+        *,
+        message_id: str,
+        channel_id: str = "",
+        state_signature: str = "",
+    ) -> AtomicCaseProjection:
+        """Persist the Discord card identity on the authoritative case.
+
+        Case projections are JSONB-backed, so these fields survive API worker
+        changes and restarts without a separate process-local cache.
+        """
+
+        case = await self._require_atomic_case(case_id)
+        now = utc_now()
+        case.discord_message_id = str(message_id or "")
+        case.discord_channel_id = str(channel_id or "")
+        case.discord_last_state_signature = str(state_signature or "")
+        case.updated_at = now
+        case.policy_version = self.policy.policy_version
+        case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
+        await self.store.append_event(
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="discord_card_recorded",
+                actor_type="system",
+                policy_version=self.policy.policy_version,
+                payload={
+                    "message_id": case.discord_message_id,
+                    "channel_id": case.discord_channel_id,
+                    "state_signature": case.discord_last_state_signature,
+                    "notification_route": case.notification_route,
+                },
+            )
+        )
+        return case
+
+    async def request_due_critical_reminders(
+        self,
+        *,
+        now: datetime | None = None,
+        interval_s: int = 21600,
+    ) -> list[OutboxIntent]:
+        """Enqueue one reminder per six-hour bucket for unacked critical cases."""
+
+        now = now or datetime.now(timezone.utc)
+        intents: list[OutboxIntent] = []
+        for projection in await self.store.list_cases(kind="atomic", limit=500):
+            if not isinstance(projection, AtomicCaseProjection):
+                continue
+            if projection.notification_route == "ci" or projection.severity != "HIGH":
+                continue
+            if (
+                _investigation_blocked_status(projection.status)
+                or projection.status == "recovered_pending"
+                or projection.acknowledged_at
+            ):
+                continue
+            suppressed_until = _parse_iso_time(projection.suppressed_until or projection.snoozed_until)
+            if suppressed_until is not None and now < suppressed_until:
+                continue
+            if not projection.discord_message_id:
+                continue
+            anchor = _parse_iso_time(projection.discord_last_reminder_at or projection.last_reported_at)
+            if anchor is None or (now - anchor) < timedelta(seconds=max(1, interval_s)):
+                continue
+            bucket = int(now.timestamp() // max(1, interval_s))
+            intent = await self.store.enqueue_outbox(
+                OutboxIntent(
+                    case_id=projection.case_id,
+                    intent_type="discord_update",
+                    idempotency_key=f"discord-reminder:{projection.case_id}:{bucket}",
+                    state_signature=self.report_state_signature(projection),
+                    payload={"action": "reminder", "bucket": bucket},
+                )
+            )
+            intents.append(intent)
+        return intents
+
+    async def mark_discord_reminder(self, case_id: str, *, reminded_at: str | None = None) -> AtomicCaseProjection:
+        case = await self._require_atomic_case(case_id)
+        now = reminded_at or utc_now()
+        case.discord_last_reminder_at = now
+        case.updated_at = now
+        case.policy_version = self.policy.policy_version
+        case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
+        await self.store.append_event(
+            CaseEvent(
+                case_id=case.case_id,
+                event_type="discord_critical_reminder_sent",
+                actor_type="system",
+                policy_version=self.policy.policy_version,
+                payload={"notification_route": case.notification_route},
             )
         )
         return case
@@ -296,6 +398,12 @@ class CaseService:
         if event_id:
             event_payload["event_id"] = event_id
         await self.store.append_event(CaseEvent(**event_payload))
+        if case.discord_message_id:
+            await self.request_report(
+                case,
+                state_signature=self.report_state_signature(case),
+                payload={"schema": "case_acknowledgement_v1", "model_consumption_allowed": False},
+            )
         return case
 
     async def suppress(
@@ -821,6 +929,7 @@ class CaseService:
             customer=observation.customer,
             service=observation.service,
             severity=observation.severity,
+            notification_route=observation.notification_route,
             status="investigating",
             opened_at=now,
             updated_at=now,
@@ -874,6 +983,7 @@ class CaseService:
         case.signal_signature = observation.signal_signature
         case.signal_snapshot = observation.signal_snapshot
         case.severity = observation.severity
+        case.notification_route = observation.notification_route
         case.status = "investigating" if case.status in {"recovered_pending", "resolved"} else case.status
         case.updated_at = now
         case.last_seen = observation.observed_at

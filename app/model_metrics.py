@@ -38,6 +38,11 @@ DISCORD_SANITIZED_FAILURES = Counter(
     "Sanitized infrastructure failures sent to Discord.",
     ["category"],
 )
+DISCORD_DELIVERIES = Counter(
+    "noc_agent_discord_delivery_total",
+    "Discord delivery attempts by card action, route, and outcome.",
+    ["action", "route", "outcome"],
+)
 MODEL_RUN_DURATION = Histogram(
     "noc_agent_model_run_duration_seconds",
     "End-to-end agent run duration.",
@@ -228,6 +233,14 @@ def record_failure(agent: str, started_at: float, safe: SafeError) -> None:
 
 def record_sanitized_discord_failure(category: str) -> None:
     DISCORD_SANITIZED_FAILURES.labels(category=category or "unknown_infrastructure").inc()
+
+
+def record_discord_delivery(*, action: str, route: str, outcome: str) -> None:
+    DISCORD_DELIVERIES.labels(
+        action=_metric_label(action),
+        route=_metric_label(route),
+        outcome=_metric_label(outcome),
+    ).inc()
 
 
 def set_case_service_runtime_enabled(enabled: bool, *, backend: str = "none") -> None:
