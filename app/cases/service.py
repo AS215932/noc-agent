@@ -399,6 +399,8 @@ class CaseService:
             event_payload["event_id"] = event_id
         await self.store.append_event(CaseEvent(**event_payload))
         if case.discord_message_id:
+            # The report handler receives discord_message_id and PATCHes the
+            # existing card; this does not create an acknowledgement duplicate.
             await self.request_report(
                 case,
                 state_signature=self.report_state_signature(case),

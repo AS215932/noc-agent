@@ -1685,28 +1685,22 @@ def _uses_deterministic_self_health_triage(alert_payload: dict) -> bool:
     """Self-health checks must not invoke the dependency they are checking."""
 
     labels = _labels(alert_payload)
-    subject = " ".join(
-        str(labels.get(key) or "")
-        for key in ("alertname", "service", "check_command", "job")
-    ).lower()
-    return any(
-        term in subject
-        for term in (
-            "engineering-loop",
-            "engineering_loop",
-            "noc-agent-model",
-            "noc_agent_model",
-            "noc-agent-mcp",
-            "noc_agent_mcp",
-            "noc-agent-config",
-            "noc-agent-health",
-            "model-fallback",
-            "allmodels",
-            "gemini",
-            "openrouter",
-            "venice",
-        )
-    )
+    identifiers = {
+        str(labels.get(key) or "").strip().lower()
+        for key in ("alertname", "service", "check_command")
+        if labels.get(key)
+    }
+    deterministic_detectors = {
+        "engineering-loop",
+        "engineering-loop-timer",
+        "noc-agent-health",
+        "noc-agent-config-health",
+        "noc-agent-mcp-health",
+        "noc-agent-model-health",
+        "nocagentmodelfallbackactive",
+        "nocagentallmodelsfailing",
+    }
+    return not identifiers.isdisjoint(deterministic_detectors)
 
 
 async def _record_deterministic_self_health_case(case, alert_payload: dict) -> None:

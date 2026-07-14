@@ -130,6 +130,8 @@ def build_discord_reminder_handler(
             raise KeyError(f"atomic case not found for reminder intent: {intent.case_id}")
         if case.acknowledged_at or case.status in {"resolved", "closed", "expired", "linked"}:
             return OutboxHandlerResult(payload_updates={"skipped": "no_longer_due"})
+        # A reminder is deliberately a new post: editing the case card does not
+        # create a new unread notification for the operator.
         delivery = await notifier(
             case_id=f"{case.case_id}:reminder",
             title=f"🔁 Unacknowledged critical: {case.title or case.detector or case.rule_id}",

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from app.discord import install_case_notifier, send_case_notification
+from app.discord import send_case_notification
 
 
 class FakeClient:
@@ -84,24 +84,21 @@ async def test_case_delivery_replaces_deleted_message_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ai_case_delivery_uses_bot_and_returns_persistent_id():
+async def test_ai_case_delivery_uses_bot_and_returns_persistent_id(monkeypatch):
     calls = []
 
     async def notifier(**kwargs):
         calls.append(kwargs)
         return SimpleNamespace(message_id="bot-message", channel_id="ai", action="updated")
 
-    install_case_notifier(notifier)
-    try:
-        result = await send_case_notification(
-            case_id="case-ai",
-            title="Model degraded",
-            description="Fallback active",
-            route="ai",
-            message_id="existing-message",
-        )
-    finally:
-        install_case_notifier(None)
+    monkeypatch.setattr("app.discord.CASE_BOT_NOTIFIER", notifier)
+    result = await send_case_notification(
+        case_id="case-ai",
+        title="Model degraded",
+        description="Fallback active",
+        route="ai",
+        message_id="existing-message",
+    )
 
     assert result is not None
     assert result.message_id == "bot-message"

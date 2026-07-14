@@ -16,6 +16,7 @@ from app.main import (
     _try_acquire_case_outbox_lock,
     _try_acquire_mail_poller_lock,
     _triage_fields,
+    _uses_deterministic_self_health_triage,
     alertmanager_webhook,
     health_cases,
     health_config,
@@ -156,6 +157,20 @@ def test_embedded_discord_bot_can_be_enabled(monkeypatch):
     monkeypatch.setenv("NOC_AGENT_START_EMBEDDED_BOT", "1")
 
     assert _embedded_discord_bot_enabled() is True
+
+
+def test_self_health_triage_bypass_uses_exact_detector_allowlist():
+    known = {
+        "commonLabels": {"alertname": "NOCAgentAllModelsFailing"},
+        "alerts": [{"labels": {"alertname": "NOCAgentAllModelsFailing"}}],
+    }
+    crafted = {
+        "commonLabels": {"alertname": "CustomerGeminiEdgeDown"},
+        "alerts": [{"labels": {"alertname": "CustomerGeminiEdgeDown"}}],
+    }
+
+    assert _uses_deterministic_self_health_triage(known) is True
+    assert _uses_deterministic_self_health_triage(crafted) is False
 
 @pytest.mark.asyncio
 async def test_health_config_reports_missing_mail_password(monkeypatch):
