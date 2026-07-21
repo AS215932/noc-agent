@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.cases import CaseHandoff, CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor, VerificationObjective
@@ -193,10 +195,108 @@ async def test_engineering_lhp_handoff_handler_creates_candidate_issue_and_deliv
 
 
 @pytest.mark.asyncio
-async def test_handoff_handler_reuses_existing_case_issue():
+async def test_engineering_lhp_handoff_handler_skips_cancelled_handoff():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing")
+    )
+    assert created.case is not None
+    handoff = CaseHandoff(
+        handoff_id="handoff_cancelled_delivery",
+        case_id=created.case.case_id,
+        target_loop="engineering",
+        objective="resolve low root filesystem condition",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        idempotency_key="cancelled-delivery:v1",
+    )
+    await service.request_lhp_handoff(handoff)
+    await service.cancel_lhp_handoff(
+        handoff.handoff_id,
+        actor_id="operator",
+        reason="stale handoff",
+        external_event_id="cancelled-delivery-event",
+    )
+    fake = FakeGitHub()
+    gh = GitHubHandoff(repo="AS215932/network-operations", token="t", requester=fake.request)
+    handler = build_engineering_lhp_handoff_handler(service, handoff_client=gh)
+
+    result = await handler(
+        OutboxIntent(
+            case_id=created.case.case_id,
+            intent_type="engineering_handoff_requested",
+            idempotency_key="in-flight-cancelled-delivery",
+            payload={"handoff_id": handoff.handoff_id},
+        )
+    )
+
+    assert result is not None
+    assert result.payload_updates["delivery_skipped"] is True
+    assert result.payload_updates["terminal_status"] == "cancelled"
+    assert fake.created == []
+
+
+@pytest.mark.asyncio
+async def test_engineering_lhp_delivery_serializes_concurrent_cancellation():
+    class BlockingGitHub(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            self.delivery_started = asyncio.Event()
+            self.release_delivery = asyncio.Event()
+
+        async def request(self, method, path, *, params=None, json=None):
+            if method == "GET" and path == "/search/issues":
+                self.delivery_started.set()
+                await self.release_delivery.wait()
+            return await super().request(method, path, params=params, json=json)
+
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing"))
+    assert created.case is not None
+    handoff = CaseHandoff(
+        handoff_id="handoff_delivery_cancel_race",
+        case_id=created.case.case_id,
+        target_loop="engineering",
+        objective="resolve low root filesystem condition",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        idempotency_key="delivery-cancel-race:v1",
+    )
+    requested = await service.request_lhp_handoff(handoff, enqueue_delivery=True)
+    assert requested.outbox_intent is not None
+    fake = BlockingGitHub()
+    gh = GitHubHandoff(repo="AS215932/network-operations", token="t", requester=fake.request)
+    handler = build_engineering_lhp_handoff_handler(service, handoff_client=gh)
+
+    delivery_task = asyncio.create_task(handler(requested.outbox_intent))
+    await fake.delivery_started.wait()
+    cancellation_task = asyncio.create_task(
+        service.cancel_lhp_handoff(
+            handoff.handoff_id,
+            actor_id="operator",
+            reason="cancel while delivery is running",
+            external_event_id="cancel_delivery_race_1",
+        )
+    )
+    await asyncio.sleep(0)
+    assert cancellation_task.done() is False
+
+    fake.release_delivery.set()
+    delivery_result = await delivery_task
+    cancellation_result = await cancellation_task
+
+    assert delivery_result.external_url.endswith("/issues/202")
+    assert cancellation_result.handoff.status == "cancelled"
+    assert len(fake.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_handoff_handler_reuses_existing_case_issue():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing")
+    )
     assert created.case is not None
     await service.record_handoff_result(created.case.case_id, issue_url="https://github.com/o/r/issues/1", issue_id="1")
     # Simulates an old queued handoff intent racing with the already-stamped case.

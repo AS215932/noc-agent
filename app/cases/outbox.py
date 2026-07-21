@@ -50,23 +50,31 @@ class OutboxProcessor:
                 skipped += 1
                 record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="skipped")
                 continue
-            processed += 1
             claimed = intent.model_copy(deep=True)
             claimed.status = "in_progress"
             claimed.attempts += 1
-            await self.store.update_outbox(claimed)
+            stored_claim = await self.store.update_outbox_if_status(claimed, expected_status=intent.status)
+            if stored_claim is None:
+                skipped += 1
+                record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="skipped")
+                continue
+            processed += 1
+            claimed = stored_claim
             try:
                 result = await handler(claimed)
             except Exception as exc:
-                failed += 1
                 errored = claimed.model_copy(deep=True)
                 errored.status = "failed"
                 errored.error = f"{type(exc).__name__}: {exc}"
                 errored.next_attempt_at = (datetime.now(timezone.utc) + timedelta(seconds=self.retry_backoff_s)).isoformat()
-                await self.store.update_outbox(errored)
-                record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="failed")
+                stored_error = await self.store.update_outbox_if_status(errored, expected_status="in_progress")
+                if stored_error is None:
+                    skipped += 1
+                    record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="skipped")
+                else:
+                    failed += 1
+                    record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="failed")
                 continue
-            succeeded += 1
             completed = claimed.model_copy(deep=True)
             completed.status = "succeeded"
             completed.completed_at = utc_now()
@@ -76,8 +84,13 @@ class OutboxProcessor:
                 completed.external_url = result.external_url
                 if result.payload_updates:
                     completed.payload.update(result.payload_updates)
-            await self.store.update_outbox(completed)
-            record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="succeeded")
+            stored_completion = await self.store.update_outbox_if_status(completed, expected_status="in_progress")
+            if stored_completion is None:
+                skipped += 1
+                record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="skipped")
+            else:
+                succeeded += 1
+                record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="succeeded")
         return OutboxProcessReport(processed=processed, succeeded=succeeded, failed=failed, skipped=skipped)
 
     async def _due_intents(self) -> list[OutboxIntent]:

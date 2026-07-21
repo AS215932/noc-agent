@@ -21,11 +21,13 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 LHP_SCHEMA_VERSION = "lhp.v1"
+LHP_APPROVAL_SCOPE_SCHEMA_VERSION = "lhp.v1.approval-scope.v1"
 DEFAULT_LHP_CALLBACK_MAX_BYTES = 65_536
 DEFAULT_TEXT_LIMIT = 1_000
 MAX_COLLECTION_ITEMS = 50
 MAX_MAPPING_ITEMS = 100
 MAX_PAYLOAD_DEPTH = 6
+MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF = 20
 
 LoopName = Literal["noc", "engineering", "knowledge", "soc"]
 HandoffStatus = Literal[
@@ -51,6 +53,7 @@ HandoffUpdateType = Literal[
     "implemented",
     "failed",
     "needs_human",
+    "cancelled",
 ]
 VerificationStatus = Literal["pending", "pass", "fail", "unknown", "skipped"]
 KnowledgeArtifactStatus = Literal["proposed", "approved", "rejected", "superseded", "deprecated", "published"]
@@ -411,6 +414,7 @@ class VerificationObjective(BaseModel):
     evidence_ref: str = ""
     failure_reason: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
+    result_payload: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
     schema_version: str = LHP_SCHEMA_VERSION
@@ -435,11 +439,115 @@ class VerificationObjective(BaseModel):
     def _required_texts(cls, value: Any, info: ValidationInfo) -> str:
         return require_lhp_text(value, field_name=info.field_name or "field", limit=800)
 
-    @field_validator("payload", mode="before")
+    @field_validator("payload", "result_payload", mode="before")
     @classmethod
     def _payload(cls, value: Any) -> dict[str, Any]:
         sanitized = sanitize_lhp_payload(value or {})
         return sanitized if isinstance(sanitized, dict) else {"value": sanitized}
+
+
+def build_lhp_approval_scope(
+    handoff: CaseHandoff,
+    objectives: list[VerificationObjective],
+) -> dict[str, Any]:
+    """Return the immutable request projection used for Engineering approval.
+
+    The full handoff fetch response intentionally contains mutable execution and
+    verification state.  That state remains useful for audit and execution
+    gating, but it must not make an already-approved request look new every time
+    a verifier updates its timestamps.
+    """
+
+    handoff_fields = {
+        "handoff_id",
+        "case_id",
+        "source_loop",
+        "target_loop",
+        "objective",
+        "objective_key",
+        "knowledge_scope",
+        "idempotency_key",
+        "fingerprint",
+        "resource",
+        "case_type",
+        "constraints",
+        "acceptance_criteria",
+        "knowledge_context_refs",
+        "payload",
+        "correlation_id",
+        "trace_id",
+        "created_by",
+        "expires_at",
+        "schema_version",
+    }
+    objective_fields = {
+        "objective_id",
+        "case_id",
+        "handoff_id",
+        "objective_key",
+        "objective_type",
+        "name",
+        "description",
+        "required_status",
+        "required",
+        "required_consecutive_passes",
+        "schema_version",
+    }
+    handoff_projection = handoff.model_dump(mode="json", include=handoff_fields)
+    handoff_projection["payload"] = _approval_payload_projection(handoff.payload)
+    handoff_projection["payload_hash"] = lhp_payload_hash(handoff.payload)
+    occurrence_id = str(handoff.payload.get("occurrence_id") or "")
+    if not occurrence_id:
+        occurrence_id = lhp_payload_hash(
+            {
+                "handoff_id": handoff.handoff_id,
+                "created_at": handoff.created_at,
+            }
+        )[:16]
+    case_identity = {
+        "case_id": handoff.case_id,
+        "fingerprint": handoff.fingerprint,
+        "occurrence_id": occurrence_id,
+    }
+    objective_definitions = []
+    for item in objectives:
+        definition = item.model_dump(mode="json", include=objective_fields)
+        definition["payload_hash"] = lhp_payload_hash(item.payload)
+        objective_definitions.append(definition)
+    objective_definitions.sort(key=lambda item: (str(item.get("objective_key", "")), str(item.get("objective_id", ""))))
+    return {
+        "schema_version": LHP_APPROVAL_SCOPE_SCHEMA_VERSION,
+        "case": case_identity,
+        "handoff": handoff_projection,
+        "verification_objectives": objective_definitions[:MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF],
+        "verification_objective_count": len(objective_definitions),
+        "verification_objectives_hash": lhp_payload_hash(objective_definitions),
+    }
+
+
+def _approval_payload_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Expose bounded routing fields while binding the complete payload by hash."""
+
+    selected = {
+        key: payload[key]
+        for key in ("schema", "occurrence_id", "change_domain", "expected_path_classes")
+        if key in payload
+    }
+    hotspot = payload.get("hotspot")
+    if isinstance(hotspot, dict):
+        selected["hotspot"] = {
+            key: hotspot[key]
+            for key in (
+                "rule_id",
+                "key",
+                "severity",
+                "warrants_change",
+                "change_rationale",
+                "recommended_checks",
+            )
+            if key in hotspot
+        }
+    return selected
 
 
 class KnowledgeArtifact(BaseModel):

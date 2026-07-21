@@ -87,6 +87,26 @@ async def test_disk_fill_ignores_healthy():
 
 
 @pytest.mark.asyncio
+async def test_disk_fill_only_warrants_change_for_high_or_projected_condition():
+    runtime = FakeMCPRuntime(
+        {
+            "node_filesystem_size_bytes": _vector(
+                ({"instance": "medium:9100", "mountpoint": "/"}, "0.197"),
+                ({"instance": "critical:9100", "mountpoint": "/"}, "0.09"),
+            ),
+            "predict_linear": _vector(),
+        }
+    )
+
+    hotspots = {item.resource: item for item in await scanner.rule_disk_fill(_ctx(runtime))}
+
+    assert hotspots["medium"].severity == "MEDIUM"
+    assert hotspots["medium"].warrants_change is False
+    assert hotspots["critical"].severity == "HIGH"
+    assert hotspots["critical"].warrants_change is True
+
+
+@pytest.mark.asyncio
 async def test_bgp_risk_non_established_then_flap_escalates():
     runtime = FakeMCPRuntime(
         {

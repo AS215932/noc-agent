@@ -8,8 +8,9 @@ and tested without a second source of truth.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Protocol, cast, runtime_checkable
+from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -18,6 +19,7 @@ from app.cases.lhp import (
     HandoffTransportDelivery,
     HandoffUpdate,
     KnowledgeArtifact,
+    MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
     OutcomeRecord,
     TERMINAL_HANDOFF_STATUSES,
     VERIFIER_ONLY_HANDOFF_STATUSES,
@@ -37,6 +39,25 @@ from app.cases.models import (
 )
 
 CaseProjection = AtomicCaseProjection | MetaCaseProjection
+TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
+
+
+def case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
+    if status in {"accepted", "in_progress", "change_planned"}:
+        return "handoff_in_progress"
+    if status == "implemented":
+        return "verification_pending"
+    if status == "blocked":
+        return "blocked"
+    if status == "failed":
+        return "failed"
+    if status == "needs_human":
+        return "needs_human"
+    if status in {"verified", "resolved"}:
+        return "verification_pending"
+    if status in {"cancelled", "expired"}:
+        return "investigating"
+    return "handoff_requested"
 
 
 @dataclass(frozen=True)
@@ -133,6 +154,10 @@ class CaseStore(Protocol):
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
+    async def update_outbox_if_status(
+        self, intent: OutboxIntent, *, expected_status: str
+    ) -> OutboxIntent | None: ...
+
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]: ...
 
     async def create_handoff_with_objectives(
@@ -157,12 +182,15 @@ class CaseStore(Protocol):
 
     async def update_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery: ...
 
+    def handoff_delivery_guard(self, handoff_id: str) -> AsyncContextManager[None]: ...
+
     async def append_handoff_update(
         self,
         update: HandoffUpdate,
         *,
         handoff_status: str | None = None,
         case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
         event: CaseEvent | None = None,
     ) -> HandoffUpdateResult: ...
 
@@ -279,6 +307,7 @@ class InMemoryCaseStore:
         self._callback_index: dict[tuple[str, str], str] = {}
         self._handoff_deliveries: dict[str, HandoffTransportDelivery] = {}
         self._handoff_delivery_index: dict[str, str] = {}
+        self._handoff_delivery_guards: dict[str, asyncio.Lock] = {}
         self._feedback: dict[str, OperatorFeedback] = {}
         self._traces: dict[str, TraceRecord] = {}
 
@@ -577,6 +606,20 @@ class InMemoryCaseStore:
             self._outbox_index[stored.idempotency_key] = stored.outbox_id
             return stored.model_copy(deep=True)
 
+    async def update_outbox_if_status(
+        self, intent: OutboxIntent, *, expected_status: str
+    ) -> OutboxIntent | None:
+        async with self._lock:
+            current = self._outbox.get(intent.outbox_id)
+            if current is None:
+                return None
+            if current.status != expected_status:
+                return None
+            stored = intent.model_copy(deep=True)
+            self._outbox[stored.outbox_id] = stored
+            self._outbox_index[stored.idempotency_key] = stored.outbox_id
+            return stored.model_copy(deep=True)
+
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
         async with self._lock:
             rows = list(self._outbox.values())
@@ -594,6 +637,10 @@ class InMemoryCaseStore:
         event: CaseEvent | None = None,
         outbox_intent: OutboxIntent | None = None,
     ) -> HandoffCreateResult:
+        if len(objectives) > MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF:
+            raise ValueError(
+                f"handoff cannot define more than {MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF} verification objectives"
+            )
         async with self._lock:
             case = self._require_atomic_case_locked(handoff.case_id)
             existing_handoff = self._existing_handoff_locked(handoff)
@@ -686,12 +733,22 @@ class InMemoryCaseStore:
             self._handoff_delivery_index[stored.idempotency_key] = stored.delivery_id
             return stored.model_copy(deep=True)
 
+    @asynccontextmanager
+    async def handoff_delivery_guard(self, handoff_id: str) -> AsyncIterator[None]:
+        """Serialize cancellation with external delivery for one handoff."""
+
+        async with self._lock:
+            guard = self._handoff_delivery_guards.setdefault(handoff_id, asyncio.Lock())
+        async with guard:
+            yield
+
     async def append_handoff_update(
         self,
         update: HandoffUpdate,
         *,
         handoff_status: str | None = None,
         case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
         event: CaseEvent | None = None,
     ) -> HandoffUpdateResult:
         async with self._lock:
@@ -726,9 +783,32 @@ class InMemoryCaseStore:
             if _handoff_active(updated_handoff.status):
                 self._active_handoff_index[_handoff_key(updated_handoff)] = updated_handoff.handoff_id
             updated_case = case.model_copy(deep=True)
-            if case_status is not None:
-                updated_case.status = case_status
-            updated_case.handoff_status = updated_handoff.status
+            if target_status in TERMINAL_HANDOFF_STATUSES:
+                surviving_handoffs = [
+                    item
+                    for item in self._handoffs.values()
+                    if item.case_id == updated_handoff.case_id
+                    and item.handoff_id != updated_handoff.handoff_id
+                    and item.status not in TERMINAL_HANDOFF_STATUSES
+                ]
+                surviving_handoff = max(
+                    surviving_handoffs,
+                    key=lambda item: (item.updated_at, item.created_at, item.handoff_id),
+                    default=None,
+                )
+                if case.status not in TERMINAL_CASE_STATUSES:
+                    updated_case.status = (
+                        case_status_for_handoff(surviving_handoff.status)
+                        if surviving_handoff is not None
+                        else "investigating"
+                    )
+                updated_case.handoff_status = (
+                    surviving_handoff.status if surviving_handoff is not None else updated_handoff.status
+                )
+            else:
+                if case_status is not None:
+                    updated_case.status = case_status
+                updated_case.handoff_status = case_handoff_status or updated_handoff.status
             updated_case.last_handoff_at = stored_update.created_at
             updated_case.updated_at = stored_update.created_at
             self._cases[updated_case.case_id] = updated_case
@@ -782,7 +862,13 @@ class InMemoryCaseStore:
             rows = [
                 row
                 for row in self._verification_objectives.values()
-                if row.status not in {"pass", "skipped"} and (not row.next_check_at or row.next_check_at <= now)
+                if row.status not in {"pass", "skipped"}
+                and (not row.next_check_at or row.next_check_at <= now)
+                and (
+                    not row.handoff_id
+                    or self._handoffs.get(row.handoff_id) is None
+                    or self._handoffs[row.handoff_id].status not in TERMINAL_HANDOFF_STATUSES
+                )
             ]
             rows.sort(key=lambda row: (row.next_check_at or "", row.created_at, row.objective_id))
             return [row.model_copy(deep=True) for row in rows[: _bounded_limit(limit)]]

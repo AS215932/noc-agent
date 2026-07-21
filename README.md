@@ -384,6 +384,7 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_REQUIRE_POSTGRES` (default `0`; fail loud if Postgres is required but unavailable)
 - `NOC_DATABASE_POOL_MIN_SIZE` / `NOC_DATABASE_POOL_MAX_SIZE`
 - `NOC_DATABASE_COMMAND_TIMEOUT_S` / `NOC_DATABASE_STATEMENT_TIMEOUT_MS` / `NOC_DATABASE_LOCK_TIMEOUT_MS`
+- `NOC_HANDOFF_DELIVERY_LOCK_TIMEOUT_S` (default `120`; bounds cancellation waits while an external handoff delivery holds the cross-process guard)
 - `HYRULE_MCP_URL`
 - `NOC_CONTROL_TOKEN`
 - `NOC_LOOP_CONSOLE_SECRET` (HMAC secret for internal `/loop-console/v1/*` CaseService API calls)

@@ -18,6 +18,7 @@ class DatabaseSettings:
     pool_min_size: int = 1
     pool_max_size: int = 5
     command_timeout_s: float = 10.0
+    handoff_delivery_lock_timeout_s: float = 120.0
     statement_timeout_ms: int = 10000
     lock_timeout_ms: int = 5000
 
@@ -39,6 +40,7 @@ def load_database_settings() -> DatabaseSettings:
         pool_min_size=_env_int("NOC_DATABASE_POOL_MIN_SIZE", 1),
         pool_max_size=_env_int("NOC_DATABASE_POOL_MAX_SIZE", 5),
         command_timeout_s=_env_float("NOC_DATABASE_COMMAND_TIMEOUT_S", 10.0),
+        handoff_delivery_lock_timeout_s=_env_float("NOC_HANDOFF_DELIVERY_LOCK_TIMEOUT_S", 120.0),
         statement_timeout_ms=_env_int("NOC_DATABASE_STATEMENT_TIMEOUT_MS", 10000),
         lock_timeout_ms=_env_int("NOC_DATABASE_LOCK_TIMEOUT_MS", 5000),
     )

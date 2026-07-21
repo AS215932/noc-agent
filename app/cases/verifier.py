@@ -205,9 +205,9 @@ def _apply_check_result(
     if result.payload:
         safe_payload = sanitize_lhp_payload(result.payload)
         if isinstance(safe_payload, dict):
-            updated.payload.update(safe_payload)
+            updated.result_payload.update(safe_payload)
         else:
-            updated.payload["checker_payload"] = safe_payload
+            updated.result_payload["checker_payload"] = safe_payload
     if result.status == "pass":
         updated.consecutive_pass_count += 1
         updated.status = "pass" if updated.consecutive_pass_count >= updated.required_consecutive_passes else "pending"

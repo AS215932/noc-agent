@@ -16,15 +16,16 @@ from typing import Any, Literal, cast
 from app.cases.lhp import (
     CallbackInboxRecord,
     CaseHandoff,
-    HandoffStatus,
     HandoffTransportDelivery,
     HandoffUpdate,
     KnowledgeArtifact,
     OutcomeRecord,
+    MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
     VerificationObjective,
     sanitize_lhp_payload,
 )
 from app.cases.models import (
+    ActorType,
     AliasType,
     AtomicCaseProjection,
     CaseEvent,
@@ -38,7 +39,13 @@ from app.cases.models import (
     utc_now,
 )
 from app.cases.policy import CasePolicy
-from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult
+from app.cases.store import (
+    CallbackClaimResult,
+    CaseStore,
+    HandoffCreateResult,
+    HandoffUpdateResult,
+    case_status_for_handoff,
+)
 from app.model_metrics import (
     record_lhp_case_resolved,
     record_lhp_handoff_request,
@@ -398,6 +405,11 @@ class CaseService:
         event, and outbox intent atomically.
         """
 
+        requested_objectives = objectives or []
+        if len(requested_objectives) > MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF:
+            raise ValueError(
+                f"handoff cannot define more than {MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF} verification objectives"
+            )
         case = await self._require_atomic_case(handoff.case_id)
         event = CaseEvent(
             case_id=case.case_id,
@@ -423,7 +435,7 @@ class CaseService:
             )
         result = await self.store.create_handoff_with_objectives(
             handoff,
-            objectives=objectives or [],
+            objectives=requested_objectives,
             case_status="handoff_requested",
             event=event,
             outbox_intent=outbox_intent,
@@ -528,25 +540,39 @@ class CaseService:
         record_lhp_knowledge_event(kind="artifact_proposed", outcome="enqueued")
         return intent
 
-    async def record_lhp_handoff_update(self, update: HandoffUpdate) -> HandoffUpdateResult:
+    async def record_lhp_handoff_update(
+        self,
+        update: HandoffUpdate,
+        *,
+        case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
+        event_actor_type: ActorType | None = None,
+        event_actor_id: str = "",
+        event_reason: str = "",
+    ) -> HandoffUpdateResult:
+        event_payload = {
+            "handoff_id": update.handoff_id,
+            "update_id": update.update_id,
+            "update_type": update.update_type,
+            "status": update.status,
+            "external_event_id": update.external_event_id,
+        }
+        if event_reason:
+            event_payload["reason"] = update.summary or event_reason
         event = CaseEvent(
             case_id=update.case_id,
             event_type="lhp_handoff_update_recorded",
-            actor_type="system" if update.source_loop == "noc" else "monitor",
+            actor_type=event_actor_type or ("system" if update.source_loop == "noc" else "monitor"),
+            actor_id=event_actor_id,
             source=update.source_loop,
             correlation_id=update.correlation_id,
             policy_version=self.policy.policy_version,
-            payload={
-                "handoff_id": update.handoff_id,
-                "update_id": update.update_id,
-                "update_type": update.update_type,
-                "status": update.status,
-                "external_event_id": update.external_event_id,
-            },
+            payload=event_payload,
         )
         result = await self.store.append_handoff_update(
             update,
-            case_status=_case_status_for_handoff(update.status),
+            case_status=case_status or case_status_for_handoff(update.status),
+            case_handoff_status=case_handoff_status,
             event=event,
         )
         record_lhp_handoff_update(
@@ -556,6 +582,66 @@ class CaseService:
             outcome="created" if result.created else "deduplicated",
         )
         return result
+
+    async def cancel_lhp_handoff(
+        self,
+        handoff_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        external_event_id: str,
+    ) -> HandoffUpdateResult:
+        """Cancel one handoff through the same atomic transition ledger."""
+
+        async with self.store.handoff_delivery_guard(handoff_id):
+            handoff = await self.store.get_handoff(handoff_id)
+            if handoff is None:
+                raise KeyError(f"handoff not found: {handoff_id}")
+            result = await self.record_lhp_handoff_update(
+                HandoffUpdate(
+                    handoff_id=handoff.handoff_id,
+                    case_id=handoff.case_id,
+                    source_loop="noc",
+                    update_type="cancelled",
+                    status="cancelled",
+                    summary=reason,
+                    external_event_id=external_event_id,
+                    correlation_id=handoff.correlation_id,
+                    payload={"actor_id": actor_id, "reason": reason, "source": "loop_console"},
+                ),
+                event_actor_type="operator",
+                event_actor_id=actor_id,
+                event_reason=reason,
+            )
+            await self._abandon_handoff_delivery_intents(handoff.handoff_id)
+            await self._skip_cancelled_handoff_objectives(handoff)
+            return result
+
+    async def _abandon_handoff_delivery_intents(self, handoff_id: str) -> None:
+        for intent in await self.store.list_outbox():
+            if (
+                intent.intent_type != "engineering_handoff_requested"
+                or str(intent.payload.get("handoff_id") or "") != handoff_id
+                or intent.status in {"succeeded", "abandoned"}
+            ):
+                continue
+            abandoned = intent.model_copy(deep=True)
+            abandoned.status = "abandoned"
+            abandoned.completed_at = abandoned.completed_at or utc_now()
+            abandoned.error = "handoff_cancelled"
+            await self.store.update_outbox_if_status(abandoned, expected_status=intent.status)
+
+    async def _skip_cancelled_handoff_objectives(self, handoff: CaseHandoff) -> None:
+        objectives = await self.store.list_verification_objectives(case_id=handoff.case_id)
+        for objective in objectives:
+            if objective.handoff_id != handoff.handoff_id or objective.status != "pending":
+                continue
+            skipped = objective.model_copy(deep=True)
+            skipped.status = "skipped"
+            skipped.failure_reason = "handoff_cancelled"
+            skipped.next_check_at = ""
+            skipped.updated_at = utc_now()
+            await self.record_lhp_verification_result(skipped)
 
     async def upsert_lhp_verification_objective(self, objective: VerificationObjective) -> VerificationObjective:
         event = CaseEvent(
@@ -953,22 +1039,6 @@ def _investigation_signature(case: AtomicCaseProjection) -> str:
 
 def _investigation_blocked_status(status: str) -> bool:
     return str(status or "") in {"resolved", "closed", "expired", "linked"}
-
-
-def _case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
-    if status in {"accepted", "in_progress", "change_planned"}:
-        return "handoff_in_progress"
-    if status == "implemented":
-        return "verification_pending"
-    if status == "blocked":
-        return "blocked"
-    if status == "failed":
-        return "failed"
-    if status == "needs_human":
-        return "needs_human"
-    if status in {"verified", "resolved"}:
-        return "verification_pending"
-    return "handoff_requested"
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:
