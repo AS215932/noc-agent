@@ -534,6 +534,7 @@ class CaseService:
         update: HandoffUpdate,
         *,
         case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
     ) -> HandoffUpdateResult:
         event = CaseEvent(
             case_id=update.case_id,
@@ -553,6 +554,7 @@ class CaseService:
         result = await self.store.append_handoff_update(
             update,
             case_status=case_status or _case_status_for_handoff(update.status),
+            case_handoff_status=case_handoff_status,
             event=event,
         )
         record_lhp_handoff_update(
@@ -573,37 +575,40 @@ class CaseService:
     ) -> HandoffUpdateResult:
         """Cancel one handoff through the same atomic transition ledger."""
 
-        handoff = await self.store.get_handoff(handoff_id)
-        if handoff is None:
-            raise KeyError(f"handoff not found: {handoff_id}")
-        case = await self._require_atomic_case(handoff.case_id)
-        handoffs = await self.store.list_handoffs(case_id=handoff.case_id)
-        other_active_handoffs = [
-            item
-            for item in handoffs
-            if item.handoff_id != handoff.handoff_id and item.status not in TERMINAL_HANDOFF_STATUSES
-        ]
-        if case.status in _TERMINAL_CASE_STATUSES or other_active_handoffs:
-            cancellation_case_status = case.status
-        else:
-            cancellation_case_status = "investigating"
-        result = await self.record_lhp_handoff_update(
-            HandoffUpdate(
-                handoff_id=handoff.handoff_id,
-                case_id=handoff.case_id,
-                source_loop="noc",
-                update_type="cancelled",
-                status="cancelled",
-                summary=reason,
-                external_event_id=external_event_id,
-                correlation_id=handoff.correlation_id,
-                payload={"actor_id": actor_id, "reason": reason, "source": "loop_console"},
-            ),
-            case_status=cancellation_case_status,
-        )
-        await self._abandon_handoff_delivery_intents(handoff.handoff_id)
-        await self._skip_cancelled_handoff_objectives(handoff)
-        return result
+        async with self.store.handoff_delivery_guard(handoff_id):
+            handoff = await self.store.get_handoff(handoff_id)
+            if handoff is None:
+                raise KeyError(f"handoff not found: {handoff_id}")
+            case = await self._require_atomic_case(handoff.case_id)
+            handoffs = await self.store.list_handoffs(case_id=handoff.case_id)
+            other_active_handoffs = [
+                item
+                for item in handoffs
+                if item.handoff_id != handoff.handoff_id and item.status not in TERMINAL_HANDOFF_STATUSES
+            ]
+            if case.status in _TERMINAL_CASE_STATUSES or other_active_handoffs:
+                cancellation_case_status = case.status
+            else:
+                cancellation_case_status = "investigating"
+            sibling_handoff_status = other_active_handoffs[0].status if other_active_handoffs else None
+            result = await self.record_lhp_handoff_update(
+                HandoffUpdate(
+                    handoff_id=handoff.handoff_id,
+                    case_id=handoff.case_id,
+                    source_loop="noc",
+                    update_type="cancelled",
+                    status="cancelled",
+                    summary=reason,
+                    external_event_id=external_event_id,
+                    correlation_id=handoff.correlation_id,
+                    payload={"actor_id": actor_id, "reason": reason, "source": "loop_console"},
+                ),
+                case_status=cancellation_case_status,
+                case_handoff_status=sibling_handoff_status,
+            )
+            await self._abandon_handoff_delivery_intents(handoff.handoff_id)
+            await self._skip_cancelled_handoff_objectives(handoff)
+            return result
 
     async def _abandon_handoff_delivery_intents(self, handoff_id: str) -> None:
         for intent in await self.store.list_outbox():

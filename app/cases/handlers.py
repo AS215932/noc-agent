@@ -107,10 +107,7 @@ def build_engineering_lhp_handoff_handler(
     handoff_client: GitHubHandoff,
     control_public_url: str = "",
 ) -> OutboxHandler:
-    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
-        handoff_id = str(intent.payload.get("handoff_id") or "").strip()
-        if not handoff_id:
-            raise ValueError("engineering handoff intent requires handoff_id")
+    async def deliver(intent: OutboxIntent, handoff_id: str) -> OutboxHandlerResult:
         handoff = await case_service.get_lhp_handoff(handoff_id)
         if handoff is None:
             raise KeyError(f"LHP handoff not found: {handoff_id}")
@@ -132,7 +129,10 @@ def build_engineering_lhp_handoff_handler(
                 transport="github_issue",
                 status="in_progress",
                 idempotency_key=f"engineering_handoff_delivery:{handoff.handoff_id}:github_issue",
-                payload={"outbox_id": intent.outbox_id, "payload_hash": lhp_payload_hash(handoff.model_dump(mode="json"))},
+                payload={
+                    "outbox_id": intent.outbox_id,
+                    "payload_hash": lhp_payload_hash(handoff.model_dump(mode="json")),
+                },
             )
         )
         if delivery.status == "succeeded" and delivery.external_url:
@@ -200,8 +200,19 @@ def build_engineering_lhp_handoff_handler(
         return OutboxHandlerResult(
             external_id=issue_id,
             external_url=url,
-            payload_updates={"handoff_id": handoff.handoff_id, "delivery_id": delivery.delivery_id, "payload_hash": payload_hash},
+            payload_updates={
+                "handoff_id": handoff.handoff_id,
+                "delivery_id": delivery.delivery_id,
+                "payload_hash": payload_hash,
+            },
         )
+
+    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+        handoff_id = str(intent.payload.get("handoff_id") or "").strip()
+        if not handoff_id:
+            raise ValueError("engineering handoff intent requires handoff_id")
+        async with case_service.store.handoff_delivery_guard(handoff_id):
+            return await deliver(intent, handoff_id)
 
     return handle
 

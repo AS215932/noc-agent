@@ -47,6 +47,7 @@ def build_disk_handoff_request(
             "case_id": case.case_id,
             "opened_at": case.opened_at,
             "previous_resolution_at": case.resolved_at or "",
+            "previous_handoff_at": case.last_handoff_at or "",
         }
     )[:16]
     hotspot_payload = sanitize_lhp_payload(

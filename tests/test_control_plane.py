@@ -235,6 +235,7 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
     assert fetched["approval_scope"]["handoff"]["handoff_id"] == handoff.handoff_id
     assert "status" not in fetched["approval_scope"]["handoff"]
     assert len(fetched["verification_objectives"]) == 20
+    assert len(fetched["approval_scope"]["verification_objectives"]) == 25
     assert len(fetched["knowledge_artifacts"]) == 10
 
     mutable_objective = (await service.list_lhp_verification_objectives(case_id=created.case.case_id))[0]
@@ -249,6 +250,19 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
     assert refreshed["payload_hash"] != fetched["payload_hash"]
     assert refreshed["approval_scope_hash"] == fetched["approval_scope_hash"]
 
+    contract_objective = next(
+        item
+        for item in await service.list_lhp_verification_objectives(case_id=created.case.case_id)
+        if item.objective_key == "objective_24"
+    )
+    contract_objective.payload = {"endpoint": "/health/changed"}
+    await service.record_lhp_verification_result(contract_objective)
+    contract_changed = await engineering_lhp_handoff_fetch(
+        handoff.handoff_id,
+        _LoopRequest(method="GET", path=f"/loop-handoff/v1/engineering/handoffs/{handoff.handoff_id}"),
+    )
+    assert contract_changed["approval_scope_hash"] != fetched["approval_scope_hash"]
+
     current_case = await store.get_case(created.case.case_id)
     assert current_case is not None
     current_case.resolved_at = "2026-07-21T19:35:00+00:00"
@@ -258,7 +272,7 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
         handoff.handoff_id,
         _LoopRequest(method="GET", path=f"/loop-handoff/v1/engineering/handoffs/{handoff.handoff_id}"),
     )
-    assert resolved["approval_scope_hash"] == fetched["approval_scope_hash"]
+    assert resolved["approval_scope_hash"] == contract_changed["approval_scope_hash"]
 
     callback_body = HandoffUpdate(
         case_id=created.case.case_id,

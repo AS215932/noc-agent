@@ -8,8 +8,9 @@ and tested without a second source of truth.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Protocol, cast, runtime_checkable
+from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -157,12 +158,15 @@ class CaseStore(Protocol):
 
     async def update_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery: ...
 
+    def handoff_delivery_guard(self, handoff_id: str) -> AsyncContextManager[None]: ...
+
     async def append_handoff_update(
         self,
         update: HandoffUpdate,
         *,
         handoff_status: str | None = None,
         case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
         event: CaseEvent | None = None,
     ) -> HandoffUpdateResult: ...
 
@@ -279,6 +283,7 @@ class InMemoryCaseStore:
         self._callback_index: dict[tuple[str, str], str] = {}
         self._handoff_deliveries: dict[str, HandoffTransportDelivery] = {}
         self._handoff_delivery_index: dict[str, str] = {}
+        self._handoff_delivery_guards: dict[str, asyncio.Lock] = {}
         self._feedback: dict[str, OperatorFeedback] = {}
         self._traces: dict[str, TraceRecord] = {}
 
@@ -686,12 +691,22 @@ class InMemoryCaseStore:
             self._handoff_delivery_index[stored.idempotency_key] = stored.delivery_id
             return stored.model_copy(deep=True)
 
+    @asynccontextmanager
+    async def handoff_delivery_guard(self, handoff_id: str) -> AsyncIterator[None]:
+        """Serialize cancellation with external delivery for one handoff."""
+
+        async with self._lock:
+            guard = self._handoff_delivery_guards.setdefault(handoff_id, asyncio.Lock())
+        async with guard:
+            yield
+
     async def append_handoff_update(
         self,
         update: HandoffUpdate,
         *,
         handoff_status: str | None = None,
         case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
         event: CaseEvent | None = None,
     ) -> HandoffUpdateResult:
         async with self._lock:
@@ -728,7 +743,7 @@ class InMemoryCaseStore:
             updated_case = case.model_copy(deep=True)
             if case_status is not None:
                 updated_case.status = case_status
-            updated_case.handoff_status = updated_handoff.status
+            updated_case.handoff_status = case_handoff_status or updated_handoff.status
             updated_case.last_handoff_at = stored_update.created_at
             updated_case.updated_at = stored_update.created_at
             self._cases[updated_case.case_id] = updated_case

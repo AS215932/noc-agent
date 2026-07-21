@@ -199,6 +199,42 @@ async def test_cancelling_stale_handoff_preserves_resolved_case_state():
 
 
 @pytest.mark.asyncio
+async def test_cancelling_one_handoff_preserves_active_sibling_projection():
+    service, case = await _service_with_case()
+    cancelled = CaseHandoff(
+        handoff_id="handoff_cancel_one",
+        case_id=case.case_id,
+        target_loop="engineering",
+        objective="resolve disk condition",
+        objective_key="resolve-disk-one-v1",
+        idempotency_key="case_lhp_1:engineering:resolve-disk-one:v1",
+    )
+    sibling = CaseHandoff(
+        handoff_id="handoff_keep_sibling",
+        case_id=case.case_id,
+        target_loop="engineering",
+        objective="resolve another disk condition",
+        objective_key="resolve-disk-two-v1",
+        idempotency_key="case_lhp_1:engineering:resolve-disk-two:v1",
+    )
+    await service.request_lhp_handoff(cancelled)
+    await service.request_lhp_handoff(sibling)
+
+    result = await service.cancel_lhp_handoff(
+        cancelled.handoff_id,
+        actor_id="operator",
+        reason="cancel only the first scope",
+        external_event_id="cancel_one_of_two_1",
+    )
+    stored_case = await service.store.get_case(case.case_id)
+
+    assert result.case.status == "handoff_requested"
+    assert result.case.handoff_status == "requested"
+    assert isinstance(stored_case, AtomicCaseProjection)
+    assert stored_case.handoff_status == "requested"
+
+
+@pytest.mark.asyncio
 async def test_lhp_callback_claims_are_idempotent_before_state_mutation():
     service, case = await _service_with_case()
     callback = CallbackInboxRecord(

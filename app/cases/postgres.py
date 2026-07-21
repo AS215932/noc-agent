@@ -8,7 +8,8 @@ the schema in :mod:`app.db.schema`.
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, cast
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -801,12 +802,24 @@ class PostgresCaseStore:
     async def update_handoff_delivery(self, delivery: HandoffTransportDelivery) -> HandoffTransportDelivery:
         return await _record_handoff_delivery(self.pool, delivery, upsert=False)
 
+    @asynccontextmanager
+    async def handoff_delivery_guard(self, handoff_id: str) -> AsyncIterator[None]:
+        """Serialize cancellation with external delivery across app processes."""
+
+        lock_key = _advisory_lock_key("handoff-delivery", {"handoff_id": handoff_id})
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SET LOCAL lock_timeout = '0'")
+            await conn.execute("SET LOCAL statement_timeout = '0'")
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
+            yield
+
     async def append_handoff_update(
         self,
         update: HandoffUpdate,
         *,
         handoff_status: str | None = None,
         case_status: CaseStatus | None = None,
+        case_handoff_status: str | None = None,
         event: CaseEvent | None = None,
     ) -> HandoffUpdateResult:
         lock_key = _advisory_lock_key(
@@ -858,7 +871,7 @@ class PostgresCaseStore:
             updated_case = case.model_copy(deep=True)
             if case_status is not None:
                 updated_case.status = case_status
-            updated_case.handoff_status = updated_handoff.status
+            updated_case.handoff_status = case_handoff_status or updated_handoff.status
             updated_case.last_handoff_at = stored_update.created_at
             updated_case.updated_at = stored_update.created_at
             await _update_case_projection(conn, updated_case)

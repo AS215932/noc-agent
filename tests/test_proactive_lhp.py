@@ -1,5 +1,9 @@
+import pytest
+
 from app.cases.lhp import CaseHandoff, build_lhp_approval_scope, lhp_payload_hash, lhp_payload_size
 from app.cases.models import AtomicCaseProjection
+from app.cases.service import CaseService
+from app.cases.store import InMemoryCaseStore
 from app.proactive.lhp import build_disk_handoff_request, disk_resource_parts, is_disk_handoff_hotspot
 from app.proactive.models import Hotspot, HotspotEvidence
 
@@ -92,6 +96,47 @@ def test_disk_handoff_idempotency_is_stable_within_case_occurrence():
     assert ":v2:" in first.handoff.idempotency_key
     assert {item.objective_key for item in first.objectives}.isdisjoint(
         {item.objective_key for item in reopened.objectives}
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_disk_occurrence_can_create_a_new_handoff():
+    hotspot = Hotspot(
+        rule_id="disk_fill",
+        key="host:/",
+        category="disk",
+        severity="HIGH",
+        resource="host",
+        warrants_change=True,
+    )
+    case = AtomicCaseProjection(
+        case_id="case_cancelled_occurrence",
+        fingerprint=hotspot.fingerprint(),
+        opened_at="2026-07-01T00:00:00+00:00",
+    )
+    store = InMemoryCaseStore()
+    await store.upsert_case(case)
+    service = CaseService(store)
+
+    first = build_disk_handoff_request(hotspot, case, cycle_id="cycle_1")
+    first_result = await service.request_lhp_handoff(first.handoff, objectives=first.objectives)
+    await service.cancel_lhp_handoff(
+        first_result.handoff.handoff_id,
+        actor_id="operator",
+        reason="monitor-only occurrence",
+        external_event_id="cancel_disk_occurrence_1",
+    )
+    current_case = await store.get_case(case.case_id)
+    assert isinstance(current_case, AtomicCaseProjection)
+
+    retry = build_disk_handoff_request(hotspot, current_case, cycle_id="cycle_2")
+    retry_result = await service.request_lhp_handoff(retry.handoff, objectives=retry.objectives)
+
+    assert retry.handoff.idempotency_key != first.handoff.idempotency_key
+    assert retry_result.created is True
+    assert retry_result.handoff.handoff_id != first_result.handoff.handoff_id
+    assert {item.objective_key for item in retry.objectives}.isdisjoint(
+        {item.objective_key for item in first.objectives}
     )
 
 

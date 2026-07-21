@@ -2776,13 +2776,13 @@ async def engineering_lhp_handoff_fetch(handoff_id: str, request: Request):
         raise HTTPException(status_code=404, detail="LHP case not found")
     objectives = await runtime.service.list_lhp_verification_objectives(case_id=handoff.case_id)
     artifacts = await runtime.service.list_lhp_knowledge_artifacts(case_id=handoff.case_id)
-    handoff_objectives = [item for item in objectives if item.handoff_id == handoff.handoff_id][:20]
+    handoff_objectives = [item for item in objectives if item.handoff_id == handoff.handoff_id]
     approval_scope = build_lhp_approval_scope(handoff, handoff_objectives)
     payload = {
         "schema_version": "lhp.v1",
         "handoff": handoff.model_dump(mode="json"),
         "case": _case_service_case_summary(case),
-        "verification_objectives": [item.model_dump(mode="json") for item in handoff_objectives],
+        "verification_objectives": [item.model_dump(mode="json") for item in handoff_objectives[:20]],
         "knowledge_artifacts": [
             item.model_dump(mode="json") for item in artifacts if item.handoff_id in {"", handoff.handoff_id}
         ][:10],

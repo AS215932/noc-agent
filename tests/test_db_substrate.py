@@ -126,6 +126,54 @@ def test_postgres_store_reports_missing_asyncpg_as_optional_dependency():
         assert _load_asyncpg().__name__ == "asyncpg"
 
 
+@pytest.mark.asyncio
+async def test_postgres_handoff_delivery_guard_uses_cross_process_advisory_lock():
+    class _Transaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Conn:
+        def __init__(self):
+            self.queries = []
+
+        def transaction(self):
+            return _Transaction()
+
+        async def execute(self, query, *args):
+            self.queries.append((query, args))
+
+    class _Acquire:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def __aenter__(self):
+            return self.conn
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _Pool:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def acquire(self):
+            return _Acquire(self.conn)
+
+    conn = _Conn()
+    store = PostgresCaseStore(_Pool(conn))
+
+    async with store.handoff_delivery_guard("handoff_1"):
+        pass
+
+    queries = [query for query, _args in conn.queries]
+    assert "SET LOCAL lock_timeout = '0'" in queries
+    assert "SET LOCAL statement_timeout = '0'" in queries
+    assert any("pg_advisory_xact_lock" in query for query in queries)
+
+
 def test_database_settings_defaults_do_not_require_postgres(monkeypatch):
     for key in list(os.environ):
         if key.startswith("NOC_DATABASE") or key in {"DATABASE_URL", "NOC_REQUIRE_POSTGRES"}:
