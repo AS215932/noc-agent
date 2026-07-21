@@ -39,6 +39,25 @@ from app.cases.models import (
 )
 
 CaseProjection = AtomicCaseProjection | MetaCaseProjection
+TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
+
+
+def case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
+    if status in {"accepted", "in_progress", "change_planned"}:
+        return "handoff_in_progress"
+    if status == "implemented":
+        return "verification_pending"
+    if status == "blocked":
+        return "blocked"
+    if status == "failed":
+        return "failed"
+    if status == "needs_human":
+        return "needs_human"
+    if status in {"verified", "resolved"}:
+        return "verification_pending"
+    if status in {"cancelled", "expired"}:
+        return "investigating"
+    return "handoff_requested"
 
 
 @dataclass(frozen=True)
@@ -134,6 +153,10 @@ class CaseStore(Protocol):
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
+
+    async def update_outbox_if_status(
+        self, intent: OutboxIntent, *, expected_status: str
+    ) -> OutboxIntent | None: ...
 
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]: ...
 
@@ -583,6 +606,20 @@ class InMemoryCaseStore:
             self._outbox_index[stored.idempotency_key] = stored.outbox_id
             return stored.model_copy(deep=True)
 
+    async def update_outbox_if_status(
+        self, intent: OutboxIntent, *, expected_status: str
+    ) -> OutboxIntent | None:
+        async with self._lock:
+            current = self._outbox.get(intent.outbox_id)
+            if current is None:
+                return None
+            if current.status != expected_status:
+                return None
+            stored = intent.model_copy(deep=True)
+            self._outbox[stored.outbox_id] = stored
+            self._outbox_index[stored.idempotency_key] = stored.outbox_id
+            return stored.model_copy(deep=True)
+
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
         async with self._lock:
             rows = list(self._outbox.values())
@@ -746,9 +783,32 @@ class InMemoryCaseStore:
             if _handoff_active(updated_handoff.status):
                 self._active_handoff_index[_handoff_key(updated_handoff)] = updated_handoff.handoff_id
             updated_case = case.model_copy(deep=True)
-            if case_status is not None:
-                updated_case.status = case_status
-            updated_case.handoff_status = case_handoff_status or updated_handoff.status
+            if target_status in TERMINAL_HANDOFF_STATUSES:
+                surviving_handoffs = [
+                    item
+                    for item in self._handoffs.values()
+                    if item.case_id == updated_handoff.case_id
+                    and item.handoff_id != updated_handoff.handoff_id
+                    and item.status not in TERMINAL_HANDOFF_STATUSES
+                ]
+                surviving_handoff = max(
+                    surviving_handoffs,
+                    key=lambda item: (item.updated_at, item.created_at, item.handoff_id),
+                    default=None,
+                )
+                if case.status not in TERMINAL_CASE_STATUSES:
+                    updated_case.status = (
+                        case_status_for_handoff(surviving_handoff.status)
+                        if surviving_handoff is not None
+                        else "investigating"
+                    )
+                updated_case.handoff_status = (
+                    surviving_handoff.status if surviving_handoff is not None else updated_handoff.status
+                )
+            else:
+                if case_status is not None:
+                    updated_case.status = case_status
+                updated_case.handoff_status = case_handoff_status or updated_handoff.status
             updated_case.last_handoff_at = stored_update.created_at
             updated_case.updated_at = stored_update.created_at
             self._cases[updated_case.case_id] = updated_case

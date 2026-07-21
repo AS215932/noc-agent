@@ -195,6 +195,15 @@ async def test_noc_can_cancel_handoff_idempotently_and_resume_case_monitoring():
     assert stored_objective.failure_reason == "handoff_cancelled"
     outbox = await service.store.list_outbox()
     assert outbox[0].status == "abandoned"
+    cancellation_events = [
+        event
+        for event in await service.store.case_events(case.case_id)
+        if event.event_type == "lhp_handoff_update_recorded" and event.payload.get("status") == "cancelled"
+    ]
+    assert len(cancellation_events) == 1
+    assert cancellation_events[0].actor_type == "operator"
+    assert cancellation_events[0].actor_id == "operator"
+    assert cancellation_events[0].payload["reason"] == "handoff was created for a monitor-only condition"
 
 
 @pytest.mark.asyncio
@@ -300,6 +309,17 @@ async def test_cancelling_one_handoff_preserves_active_sibling_projection():
             correlation_id=cancelled.correlation_id,
         )
     )
+    await service.record_lhp_handoff_update(
+        HandoffUpdate(
+            case_id=case.case_id,
+            handoff_id=sibling.handoff_id,
+            source_loop="engineering",
+            update_type="accepted",
+            status="accepted",
+            external_event_id="sibling_accepted_before_cancel_1",
+            correlation_id=sibling.correlation_id,
+        )
+    )
 
     result = await service.cancel_lhp_handoff(
         cancelled.handoff_id,
@@ -309,10 +329,10 @@ async def test_cancelling_one_handoff_preserves_active_sibling_projection():
     )
     stored_case = await service.store.get_case(case.case_id)
 
-    assert result.case.status == "handoff_requested"
-    assert result.case.handoff_status == "requested"
+    assert result.case.status == "handoff_in_progress"
+    assert result.case.handoff_status == "accepted"
     assert isinstance(stored_case, AtomicCaseProjection)
-    assert stored_case.handoff_status == "requested"
+    assert stored_case.handoff_status == "accepted"
 
 
 @pytest.mark.asyncio

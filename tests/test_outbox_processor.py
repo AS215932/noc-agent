@@ -53,6 +53,32 @@ async def test_outbox_processor_marks_failures_retryable():
 
 
 @pytest.mark.asyncio
+async def test_outbox_processor_preserves_concurrent_abandonment():
+    store = InMemoryCaseStore()
+    intent = await store.enqueue_outbox(
+        OutboxIntent(case_id="case_1", intent_type="handoff", idempotency_key="handoff:cancelled")
+    )
+
+    async def cancelled_while_handler_finishes(row: OutboxIntent):
+        abandoned = row.model_copy(
+            update={"status": "abandoned", "completed_at": "2026-07-21T20:00:00+00:00", "error": "cancelled"}
+        )
+        assert await store.update_outbox_if_status(abandoned, expected_status="in_progress") is not None
+        return OutboxHandlerResult(external_id="stale-result", external_url="https://example.invalid/stale")
+
+    report = await OutboxProcessor(store, {"handoff": cancelled_while_handler_finishes}).process_pending()
+
+    assert report.processed == 1
+    assert report.succeeded == 0
+    assert report.skipped == 1
+    stored = next(row for row in await store.list_outbox() if row.outbox_id == intent.outbox_id)
+    assert stored.status == "abandoned"
+    assert stored.error == "cancelled"
+    assert stored.external_id == ""
+    assert stored.external_url == ""
+
+
+@pytest.mark.asyncio
 async def test_outbox_processor_skips_unknown_intent_types_without_claiming():
     store = InMemoryCaseStore()
     await store.enqueue_outbox(OutboxIntent(case_id="case_1", intent_type="knowledge_candidate", idempotency_key="kc:1"))

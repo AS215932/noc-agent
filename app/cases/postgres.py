@@ -21,6 +21,7 @@ from app.cases.lhp import (
     KnowledgeArtifact,
     MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
     OutcomeRecord,
+    TERMINAL_HANDOFF_STATUSES,
     VERIFIER_ONLY_HANDOFF_STATUSES,
     VerificationObjective,
     lhp_payload_hash,
@@ -43,6 +44,8 @@ from app.cases.store import (
     CaseProjection,
     HandoffCreateResult,
     HandoffUpdateResult,
+    TERMINAL_CASE_STATUSES,
+    case_status_for_handoff,
 )
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
@@ -80,8 +83,9 @@ class _GuardAwarePool:
 
 
 class PostgresCaseStore:
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, *, handoff_delivery_lock_timeout_s: float = 120.0) -> None:
         self._raw_pool = pool
+        self._handoff_delivery_lock_timeout_s = max(1.0, handoff_delivery_lock_timeout_s)
         self._guarded_connection: ContextVar[Any | None] = ContextVar(
             "postgres_case_store_guarded_connection", default=None
         )
@@ -104,7 +108,7 @@ class PostgresCaseStore:
                 "lock_timeout": str(settings.lock_timeout_ms),
             },
         )
-        return cls(pool)
+        return cls(pool, handoff_delivery_lock_timeout_s=settings.handoff_delivery_lock_timeout_s)
 
     async def close(self) -> None:
         await self.pool.close()
@@ -670,6 +674,40 @@ class PostgresCaseStore:
             raise KeyError(f"outbox intent not found: {intent.outbox_id}")
         return OutboxIntent.model_validate(_row_payload(row))
 
+    async def update_outbox_if_status(
+        self, intent: OutboxIntent, *, expected_status: str
+    ) -> OutboxIntent | None:
+        payload = intent.model_dump(mode="json")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE side_effect_outbox SET
+                    status = $2,
+                    attempts = $3,
+                    next_attempt_at = $4,
+                    completed_at = $5,
+                    external_id = $6,
+                    external_url = $7,
+                    error = $8,
+                    payload = $9::jsonb,
+                    schema_version = $10
+                WHERE outbox_id = $1 AND status = $11
+                RETURNING payload
+                """,
+                intent.outbox_id,
+                intent.status,
+                intent.attempts,
+                intent.next_attempt_at,
+                intent.completed_at,
+                intent.external_id,
+                intent.external_url,
+                intent.error,
+                json.dumps(payload),
+                intent.schema_version,
+                expected_status,
+            )
+        return OutboxIntent.model_validate(_row_payload(row)) if row else None
+
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
         async with self.pool.acquire() as conn:
             if status:
@@ -851,7 +889,11 @@ class PostgresCaseStore:
         async with self._raw_pool.acquire() as conn, conn.transaction():
             await conn.execute("SET LOCAL lock_timeout = '0'")
             await conn.execute("SET LOCAL statement_timeout = '0'")
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                lock_key,
+                timeout=self._handoff_delivery_lock_timeout_s,
+            )
             token = self._guarded_connection.set(conn)
             try:
                 yield
@@ -894,16 +936,18 @@ class PostgresCaseStore:
                 if not isinstance(case, AtomicCaseProjection):
                     raise KeyError(f"atomic case not found: {handoff.case_id}")
                 return HandoffUpdateResult(existing_update, handoff, case, None, False)
+            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", update.case_id)
+            case = _case_from_payload(_row_payload(case_row)) if case_row else None
+            if not isinstance(case, AtomicCaseProjection):
+                raise KeyError(f"atomic case not found: {update.case_id}")
             handoff_row = await conn.fetchrow(
                 "SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", update.handoff_id
             )
             if not handoff_row:
                 raise KeyError(f"handoff not found: {update.handoff_id}")
             handoff = CaseHandoff.model_validate(_row_payload(handoff_row))
-            case_row = await conn.fetchrow("SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", handoff.case_id)
-            case = _case_from_payload(_row_payload(case_row)) if case_row else None
-            if not isinstance(case, AtomicCaseProjection):
-                raise KeyError(f"atomic case not found: {handoff.case_id}")
+            if handoff.case_id != update.case_id:
+                raise ValueError("handoff update case_id must match handoff case_id")
             target_status = cast(HandoffStatus, handoff_status or update.status)
             if target_status in VERIFIER_ONLY_HANDOFF_STATUSES:
                 raise ValueError("verified/resolved require the dedicated NOC verifier path")
@@ -914,9 +958,35 @@ class PostgresCaseStore:
             updated_handoff.updated_at = stored_update.created_at
             updated_handoff = await _update_case_handoff(conn, updated_handoff)
             updated_case = case.model_copy(deep=True)
-            if case_status is not None:
-                updated_case.status = case_status
-            updated_case.handoff_status = case_handoff_status or updated_handoff.status
+            if target_status in TERMINAL_HANDOFF_STATUSES:
+                surviving_row = await conn.fetchrow(
+                    """
+                    SELECT payload FROM case_handoffs
+                    WHERE case_id = $1
+                      AND handoff_id != $2
+                      AND status NOT IN ('resolved', 'cancelled', 'expired')
+                    ORDER BY updated_at DESC, created_at DESC, handoff_id DESC
+                    LIMIT 1
+                    """,
+                    updated_handoff.case_id,
+                    updated_handoff.handoff_id,
+                )
+                surviving_handoff = (
+                    CaseHandoff.model_validate(_row_payload(surviving_row)) if surviving_row else None
+                )
+                if case.status not in TERMINAL_CASE_STATUSES:
+                    updated_case.status = (
+                        case_status_for_handoff(surviving_handoff.status)
+                        if surviving_handoff is not None
+                        else "investigating"
+                    )
+                updated_case.handoff_status = (
+                    surviving_handoff.status if surviving_handoff is not None else updated_handoff.status
+                )
+            else:
+                if case_status is not None:
+                    updated_case.status = case_status
+                updated_case.handoff_status = case_handoff_status or updated_handoff.status
             updated_case.last_handoff_at = stored_update.created_at
             updated_case.updated_at = stored_update.created_at
             await _update_case_projection(conn, updated_case)
@@ -1084,6 +1154,18 @@ class PostgresCaseStore:
 
     async def mark_handoff_verified(self, handoff_id: str, *, now: str, event: CaseEvent | None = None) -> CaseHandoff:
         async with self.pool.acquire() as conn, conn.transaction():
+            handoff_identity_row = await conn.fetchrow(
+                "SELECT payload FROM case_handoffs WHERE handoff_id = $1", handoff_id
+            )
+            if not handoff_identity_row:
+                raise KeyError(f"handoff not found: {handoff_id}")
+            handoff_identity = CaseHandoff.model_validate(_row_payload(handoff_identity_row))
+            case_row = await conn.fetchrow(
+                "SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", handoff_identity.case_id
+            )
+            case = _case_from_payload(_row_payload(case_row)) if case_row else None
+            if not isinstance(case, AtomicCaseProjection):
+                raise KeyError(f"atomic case not found: {handoff_identity.case_id}")
             handoff_row = await conn.fetchrow(
                 "SELECT payload FROM case_handoffs WHERE handoff_id = $1 FOR UPDATE", handoff_id
             )
@@ -1095,12 +1177,6 @@ class PostgresCaseStore:
             updated_handoff.status = "verified"
             updated_handoff.updated_at = now
             updated_handoff = await _update_case_handoff(conn, updated_handoff)
-            case_row = await conn.fetchrow(
-                "SELECT payload FROM cases WHERE case_id = $1 FOR UPDATE", updated_handoff.case_id
-            )
-            case = _case_from_payload(_row_payload(case_row)) if case_row else None
-            if not isinstance(case, AtomicCaseProjection):
-                raise KeyError(f"atomic case not found: {updated_handoff.case_id}")
             case.status = "verification_pending"
             case.handoff_status = updated_handoff.status
             case.last_handoff_at = now

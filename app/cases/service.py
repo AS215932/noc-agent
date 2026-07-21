@@ -16,17 +16,16 @@ from typing import Any, Literal, cast
 from app.cases.lhp import (
     CallbackInboxRecord,
     CaseHandoff,
-    HandoffStatus,
     HandoffTransportDelivery,
     HandoffUpdate,
     KnowledgeArtifact,
     OutcomeRecord,
     MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
-    TERMINAL_HANDOFF_STATUSES,
     VerificationObjective,
     sanitize_lhp_payload,
 )
 from app.cases.models import (
+    ActorType,
     AliasType,
     AtomicCaseProjection,
     CaseEvent,
@@ -40,7 +39,13 @@ from app.cases.models import (
     utc_now,
 )
 from app.cases.policy import CasePolicy
-from app.cases.store import CallbackClaimResult, CaseStore, HandoffCreateResult, HandoffUpdateResult
+from app.cases.store import (
+    CallbackClaimResult,
+    CaseStore,
+    HandoffCreateResult,
+    HandoffUpdateResult,
+    case_status_for_handoff,
+)
 from app.model_metrics import (
     record_lhp_case_resolved,
     record_lhp_handoff_request,
@@ -541,25 +546,32 @@ class CaseService:
         *,
         case_status: CaseStatus | None = None,
         case_handoff_status: str | None = None,
+        event_actor_type: ActorType | None = None,
+        event_actor_id: str = "",
+        event_reason: str = "",
     ) -> HandoffUpdateResult:
+        event_payload = {
+            "handoff_id": update.handoff_id,
+            "update_id": update.update_id,
+            "update_type": update.update_type,
+            "status": update.status,
+            "external_event_id": update.external_event_id,
+        }
+        if event_reason:
+            event_payload["reason"] = update.summary or event_reason
         event = CaseEvent(
             case_id=update.case_id,
             event_type="lhp_handoff_update_recorded",
-            actor_type="system" if update.source_loop == "noc" else "monitor",
+            actor_type=event_actor_type or ("system" if update.source_loop == "noc" else "monitor"),
+            actor_id=event_actor_id,
             source=update.source_loop,
             correlation_id=update.correlation_id,
             policy_version=self.policy.policy_version,
-            payload={
-                "handoff_id": update.handoff_id,
-                "update_id": update.update_id,
-                "update_type": update.update_type,
-                "status": update.status,
-                "external_event_id": update.external_event_id,
-            },
+            payload=event_payload,
         )
         result = await self.store.append_handoff_update(
             update,
-            case_status=case_status or _case_status_for_handoff(update.status),
+            case_status=case_status or case_status_for_handoff(update.status),
             case_handoff_status=case_handoff_status,
             event=event,
         )
@@ -585,21 +597,6 @@ class CaseService:
             handoff = await self.store.get_handoff(handoff_id)
             if handoff is None:
                 raise KeyError(f"handoff not found: {handoff_id}")
-            case = await self._require_atomic_case(handoff.case_id)
-            handoffs = await self.store.list_handoffs(case_id=handoff.case_id)
-            other_active_handoffs = [
-                item
-                for item in handoffs
-                if item.handoff_id != handoff.handoff_id and item.status not in TERMINAL_HANDOFF_STATUSES
-            ]
-            surviving_handoff = other_active_handoffs[0] if other_active_handoffs else None
-            if case.status in _TERMINAL_CASE_STATUSES:
-                cancellation_case_status = case.status
-            elif surviving_handoff is not None:
-                cancellation_case_status = _case_status_for_handoff(surviving_handoff.status)
-            else:
-                cancellation_case_status = "investigating"
-            sibling_handoff_status = surviving_handoff.status if surviving_handoff is not None else None
             result = await self.record_lhp_handoff_update(
                 HandoffUpdate(
                     handoff_id=handoff.handoff_id,
@@ -612,8 +609,9 @@ class CaseService:
                     correlation_id=handoff.correlation_id,
                     payload={"actor_id": actor_id, "reason": reason, "source": "loop_console"},
                 ),
-                case_status=cancellation_case_status,
-                case_handoff_status=sibling_handoff_status,
+                event_actor_type="operator",
+                event_actor_id=actor_id,
+                event_reason=reason,
             )
             await self._abandon_handoff_delivery_intents(handoff.handoff_id)
             await self._skip_cancelled_handoff_objectives(handoff)
@@ -631,7 +629,7 @@ class CaseService:
             abandoned.status = "abandoned"
             abandoned.completed_at = abandoned.completed_at or utc_now()
             abandoned.error = "handoff_cancelled"
-            await self.store.update_outbox(abandoned)
+            await self.store.update_outbox_if_status(abandoned, expected_status=intent.status)
 
     async def _skip_cancelled_handoff_objectives(self, handoff: CaseHandoff) -> None:
         objectives = await self.store.list_verification_objectives(case_id=handoff.case_id)
@@ -1041,27 +1039,6 @@ def _investigation_signature(case: AtomicCaseProjection) -> str:
 
 def _investigation_blocked_status(status: str) -> bool:
     return str(status or "") in {"resolved", "closed", "expired", "linked"}
-
-
-def _case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
-    if status in {"accepted", "in_progress", "change_planned"}:
-        return "handoff_in_progress"
-    if status == "implemented":
-        return "verification_pending"
-    if status == "blocked":
-        return "blocked"
-    if status == "failed":
-        return "failed"
-    if status == "needs_human":
-        return "needs_human"
-    if status in {"verified", "resolved"}:
-        return "verification_pending"
-    if status in {"cancelled", "expired"}:
-        return "investigating"
-    return "handoff_requested"
-
-
-_TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:

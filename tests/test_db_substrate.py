@@ -12,10 +12,12 @@ def test_database_settings_loads_env_and_fails_loud_when_required(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("NOC_DATABASE_URL", raising=False)
     monkeypatch.setenv("NOC_REQUIRE_POSTGRES", "true")
+    monkeypatch.setenv("NOC_HANDOFF_DELIVERY_LOCK_TIMEOUT_S", "75.5")
 
     settings = load_database_settings()
 
     assert settings.require_postgres is True
+    assert settings.handoff_delivery_lock_timeout_s == 75.5
     assert settings.enabled is False
     with pytest.raises(RuntimeError):
         settings.assert_ready_for_production()
@@ -142,11 +144,11 @@ async def test_postgres_handoff_delivery_guard_uses_cross_process_advisory_lock(
         def transaction(self):
             return _Transaction()
 
-        async def execute(self, query, *args):
-            self.queries.append((query, args))
+        async def execute(self, query, *args, **kwargs):
+            self.queries.append((query, args, kwargs))
 
         async def fetchrow(self, query, *args):
-            self.queries.append((query, args))
+            self.queries.append((query, args, {}))
             return None
 
     class _Acquire:
@@ -176,10 +178,12 @@ async def test_postgres_handoff_delivery_guard_uses_cross_process_advisory_lock(
         assert await store.get_handoff("handoff_1") is None
 
     assert pool.acquire_count == 1
-    queries = [query for query, _args in conn.queries]
+    queries = [query for query, _args, _kwargs in conn.queries]
     assert "SET LOCAL lock_timeout = '0'" in queries
     assert "SET LOCAL statement_timeout = '0'" in queries
     assert any("pg_advisory_xact_lock" in query for query in queries)
+    lock_call = next(call for call in conn.queries if "pg_advisory_xact_lock" in call[0])
+    assert lock_call[2]["timeout"] == 120.0
 
 
 def test_database_settings_defaults_do_not_require_postgres(monkeypatch):
