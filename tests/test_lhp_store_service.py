@@ -126,6 +126,38 @@ async def test_lhp_handoff_updates_are_deduped_and_drive_case_state():
 
 
 @pytest.mark.asyncio
+async def test_noc_can_cancel_handoff_idempotently_and_resume_case_monitoring():
+    service, case = await _service_with_case()
+    handoff = CaseHandoff(
+        handoff_id="handoff_cancel_1",
+        case_id=case.case_id,
+        target_loop="engineering",
+        objective="resolve low root filesystem condition",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        idempotency_key="case_lhp_1:engineering:resolve-low-root-filesystem-condition:v1",
+    )
+    await service.request_lhp_handoff(handoff)
+
+    first = await service.cancel_lhp_handoff(
+        handoff.handoff_id,
+        actor_id="operator",
+        reason="handoff was created for a monitor-only condition",
+        external_event_id="cancel_event_1",
+    )
+    duplicate = await service.cancel_lhp_handoff(
+        handoff.handoff_id,
+        actor_id="operator",
+        reason="handoff was created for a monitor-only condition",
+        external_event_id="cancel_event_1",
+    )
+
+    assert first.created is True
+    assert duplicate.created is False
+    assert first.handoff.status == "cancelled"
+    assert first.case.status == "investigating"
+
+
+@pytest.mark.asyncio
 async def test_lhp_callback_claims_are_idempotent_before_state_mutation():
     service, case = await _service_with_case()
     callback = CallbackInboxRecord(

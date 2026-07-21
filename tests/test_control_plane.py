@@ -24,6 +24,7 @@ from app.main import (
     LocalDecisionRequest,
     LoopConsoleAckRequest,
     LoopConsoleFeedbackRequest,
+    LoopConsoleHandoffCancelRequest,
     LoopConsoleKnowledgeArtifactProposalRequest,
     LoopConsoleKnowledgeArtifactReviewRequest,
     LoopConsoleKnowledgeContextRequest,
@@ -56,6 +57,7 @@ from app.main import (
     loop_console_cases,
     loop_console_health,
     loop_console_handoff_update,
+    loop_console_handoff_cancel,
     loop_console_knowledge_artifact_proposal,
     loop_console_knowledge_artifact_review,
     loop_console_knowledge_context_request,
@@ -229,8 +231,23 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
     assert fetched["handoff"]["handoff_id"] == handoff.handoff_id
     assert fetched["schema_version"] == "lhp.v1"
     assert fetched["payload_hash"]
+    assert fetched["approval_scope_hash"]
+    assert fetched["approval_scope"]["handoff"]["handoff_id"] == handoff.handoff_id
+    assert "status" not in fetched["approval_scope"]["handoff"]
     assert len(fetched["verification_objectives"]) == 20
     assert len(fetched["knowledge_artifacts"]) == 10
+
+    mutable_objective = (await service.list_lhp_verification_objectives(case_id=created.case.case_id))[0]
+    mutable_objective.status = "unknown"
+    mutable_objective.last_checked_at = "2026-07-21T19:30:00+00:00"
+    mutable_objective.next_check_at = "2026-07-21T19:32:00+00:00"
+    await service.record_lhp_verification_result(mutable_objective)
+    refreshed = await engineering_lhp_handoff_fetch(
+        handoff.handoff_id,
+        _LoopRequest(method="GET", path=f"/loop-handoff/v1/engineering/handoffs/{handoff.handoff_id}"),
+    )
+    assert refreshed["payload_hash"] != fetched["payload_hash"]
+    assert refreshed["approval_scope_hash"] == fetched["approval_scope_hash"]
 
     callback_body = HandoffUpdate(
         case_id=created.case.case_id,
@@ -269,6 +286,56 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
             _LoopRequest(method="POST", path="/webhook/engineering-loop/handoff-update", body=bad_body)
         )
     assert bad_exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_loop_console_can_cancel_handoff_with_idempotent_signed_action(monkeypatch):
+    monkeypatch.setenv("NOC_LOOP_CONSOLE_SECRET", "console-shared")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="rtr:/", status="firing")
+    )
+    assert created.case is not None
+    handoff = CaseHandoff(
+        handoff_id="handoff_cancel_console",
+        case_id=created.case.case_id,
+        target_loop="engineering",
+        objective="resolve disk condition",
+        objective_key="resolve-disk-v1",
+        idempotency_key="console:cancel:handoff",
+    )
+    await service.request_lhp_handoff(handoff)
+
+    class _Runtime:
+        pass
+
+    runtime = _Runtime()
+    runtime.service = service
+    runtime.store = store
+    monkeypatch.setattr(main_module, "case_service_runtime", runtime)
+    request_body = LoopConsoleHandoffCancelRequest(
+        actor_id="operator",
+        idempotency_key="cancel-1",
+        reason="monitor-only handoff",
+    )
+    body = request_body.model_dump(mode="json")
+    path = f"/loop-console/v1/handoffs/{handoff.handoff_id}/cancel"
+
+    first = await loop_console_handoff_cancel(
+        handoff.handoff_id,
+        request_body,
+        _console_request("POST", path, body),
+    )
+    duplicate = await loop_console_handoff_cancel(
+        handoff.handoff_id,
+        request_body,
+        _console_request("POST", path, body),
+    )
+
+    assert first["created"] is True
+    assert duplicate["created"] is False
+    assert first["handoff"]["status"] == "cancelled"
 
 
 @pytest.mark.asyncio

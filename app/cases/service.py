@@ -557,6 +557,33 @@ class CaseService:
         )
         return result
 
+    async def cancel_lhp_handoff(
+        self,
+        handoff_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        external_event_id: str,
+    ) -> HandoffUpdateResult:
+        """Cancel one handoff through the same atomic transition ledger."""
+
+        handoff = await self.store.get_handoff(handoff_id)
+        if handoff is None:
+            raise KeyError(f"handoff not found: {handoff_id}")
+        return await self.record_lhp_handoff_update(
+            HandoffUpdate(
+                handoff_id=handoff.handoff_id,
+                case_id=handoff.case_id,
+                source_loop="noc",
+                update_type="cancelled",
+                status="cancelled",
+                summary=reason,
+                external_event_id=external_event_id,
+                correlation_id=handoff.correlation_id,
+                payload={"actor_id": actor_id, "reason": reason, "source": "loop_console"},
+            )
+        )
+
     async def upsert_lhp_verification_objective(self, objective: VerificationObjective) -> VerificationObjective:
         event = CaseEvent(
             case_id=objective.case_id,
@@ -968,6 +995,8 @@ def _case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
         return "needs_human"
     if status in {"verified", "resolved"}:
         return "verification_pending"
+    if status in {"cancelled", "expired"}:
+        return "investigating"
     return "handoff_requested"
 
 

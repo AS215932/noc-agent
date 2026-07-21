@@ -37,6 +37,16 @@ def _runtime():
     )
 
 
+def _monitor_only_disk_runtime():
+    return FakeMCPRuntime(
+        {
+            'state!="Established"': {"ok": True, "result": []},
+            "node_filesystem_size_bytes": _vector(({"instance": "log:9100", "mountpoint": "/var"}, "0.197")),
+            "predict_linear": {"ok": True, "result": []},
+        }
+    )
+
+
 def _settings(tmp_path, **overrides) -> ProactiveLoopSettings:
     base = ProactiveLoopSettings(
         enabled=True,
@@ -164,6 +174,27 @@ async def test_lhp_disk_handoff_is_created_once_for_fresh_disk_hotspot(tmp_path)
         "disk_monitoring_alert_clear",
         "noc_health_remains_healthy",
     }
+    assert await service.store.list_outbox(status="pending") == []
+
+
+@pytest.mark.asyncio
+async def test_lhp_disk_handoff_is_not_created_for_monitor_only_disk_hotspot(tmp_path):
+    service = CaseService(InMemoryCaseStore())
+    lp = ProactiveLoop(
+        _monitor_only_disk_runtime(),
+        settings=_settings(tmp_path, shadow=True),
+        reporter=_Capture(),
+        model_chain=lambda: ["m"],
+        case_service=service,
+        loop_handoff_settings=LoopHandoffSettings(enabled=True, disk_alert_handoff_enabled=True),
+    )
+
+    report = await lp.run_once(deep=True)
+
+    disk_hotspots = [hotspot for hotspot in report.hotspots if hotspot.rule_id == "disk_fill"]
+    assert len(disk_hotspots) == 1
+    assert disk_hotspots[0].warrants_change is False
+    assert await service.list_lhp_handoffs() == []
     assert await service.store.list_outbox(status="pending") == []
 
 

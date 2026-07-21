@@ -280,8 +280,10 @@ async def rule_disk_fill(ctx: ScanContext) -> list[Hotspot]:
                     "identify largest growing path; check log rotation / retention",
                 ],
                 suggested_specialist="infrastructure",
-                warrants_change=soon,
-                change_rationale=("Retention/rotation or volume sizing may need a config change." if soon else ""),
+                warrants_change=soon or ratio < 0.10,
+                change_rationale=(
+                    "Retention/rotation or volume sizing may need a config change." if soon or ratio < 0.10 else ""
+                ),
             )
         )
     return hotspots

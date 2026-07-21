@@ -26,7 +26,7 @@ class DiskHandoffRequest:
 
 
 def is_disk_handoff_hotspot(hotspot: Hotspot) -> bool:
-    return hotspot.rule_id == "disk_fill" and hotspot.category == "disk"
+    return hotspot.rule_id == "disk_fill" and hotspot.category == "disk" and hotspot.warrants_change
 
 
 def build_disk_handoff_request(
@@ -42,6 +42,13 @@ def build_disk_handoff_request(
 
     host, filesystem = disk_resource_parts(hotspot)
     fingerprint = hotspot.fingerprint()
+    occurrence_id = lhp_payload_hash(
+        {
+            "case_id": case.case_id,
+            "opened_at": case.opened_at,
+            "previous_resolution_at": case.resolved_at or "",
+        }
+    )[:16]
     hotspot_payload = sanitize_lhp_payload(
         {
             "rule_id": hotspot.rule_id,
@@ -69,7 +76,7 @@ def build_disk_handoff_request(
         objective="resolve low root filesystem condition",
         objective_key=DISK_OBJECTIVE_KEY,
         knowledge_scope=f"disk:{host}:{filesystem}",
-        idempotency_key=f"{case.case_id}:engineering:{DISK_OBJECTIVE_KEY}:v1",
+        idempotency_key=f"{case.case_id}:engineering:{DISK_OBJECTIVE_KEY}:v2:{occurrence_id}",
         fingerprint=fingerprint,
         resource={
             "host": host,
@@ -95,6 +102,9 @@ def build_disk_handoff_request(
         payload={
             "schema": "proactive_disk_lhp_request.v1",
             "cycle_id": cycle_id,
+            "occurrence_id": occurrence_id,
+            "change_domain": "infrastructure_capacity_or_retention",
+            "expected_path_classes": ["ansible/", "configs/"],
             "hotspot": {
                 "rule_id": hotspot.rule_id,
                 "key": hotspot.key,

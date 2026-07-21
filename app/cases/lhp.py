@@ -21,6 +21,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 LHP_SCHEMA_VERSION = "lhp.v1"
+LHP_APPROVAL_SCOPE_SCHEMA_VERSION = "lhp.v1.approval-scope.v1"
 DEFAULT_LHP_CALLBACK_MAX_BYTES = 65_536
 DEFAULT_TEXT_LIMIT = 1_000
 MAX_COLLECTION_ITEMS = 50
@@ -51,6 +52,7 @@ HandoffUpdateType = Literal[
     "implemented",
     "failed",
     "needs_human",
+    "cancelled",
 ]
 VerificationStatus = Literal["pending", "pass", "fail", "unknown", "skipped"]
 KnowledgeArtifactStatus = Literal["proposed", "approved", "rejected", "superseded", "deprecated", "published"]
@@ -440,6 +442,80 @@ class VerificationObjective(BaseModel):
     def _payload(cls, value: Any) -> dict[str, Any]:
         sanitized = sanitize_lhp_payload(value or {})
         return sanitized if isinstance(sanitized, dict) else {"value": sanitized}
+
+
+def build_lhp_approval_scope(
+    handoff: CaseHandoff,
+    case: Any,
+    objectives: list[VerificationObjective],
+) -> dict[str, Any]:
+    """Return the immutable request projection used for Engineering approval.
+
+    The full handoff fetch response intentionally contains mutable execution and
+    verification state.  That state remains useful for audit and execution
+    gating, but it must not make an already-approved request look new every time
+    a verifier updates its timestamps.
+    """
+
+    handoff_fields = {
+        "handoff_id",
+        "case_id",
+        "source_loop",
+        "target_loop",
+        "objective",
+        "objective_key",
+        "knowledge_scope",
+        "idempotency_key",
+        "fingerprint",
+        "resource",
+        "case_type",
+        "constraints",
+        "acceptance_criteria",
+        "knowledge_context_refs",
+        "payload",
+        "correlation_id",
+        "trace_id",
+        "created_by",
+        "expires_at",
+        "schema_version",
+    }
+    objective_fields = {
+        "objective_id",
+        "case_id",
+        "handoff_id",
+        "objective_key",
+        "objective_type",
+        "name",
+        "description",
+        "required_status",
+        "required",
+        "required_consecutive_passes",
+        "payload",
+        "schema_version",
+    }
+    occurrence_seed = {
+        "case_id": str(getattr(case, "case_id", "")),
+        "opened_at": str(getattr(case, "opened_at", "")),
+        "previous_resolution_at": str(getattr(case, "resolved_at", "") or ""),
+    }
+    case_identity = {
+        "case_id": str(getattr(case, "case_id", "")),
+        "kind": str(getattr(case, "kind", "")),
+        "origin": str(getattr(case, "origin", "")),
+        "rule_id": str(getattr(case, "rule_id", "")),
+        "detector": str(getattr(case, "detector", "")),
+        "resource_id": str(getattr(case, "resource_id", "")),
+        "fingerprint": str(getattr(case, "fingerprint", "")),
+        "occurrence_id": lhp_payload_hash(occurrence_seed)[:16],
+    }
+    objective_definitions = [item.model_dump(mode="json", include=objective_fields) for item in objectives]
+    objective_definitions.sort(key=lambda item: (str(item.get("objective_key", "")), str(item.get("objective_id", ""))))
+    return {
+        "schema_version": LHP_APPROVAL_SCOPE_SCHEMA_VERSION,
+        "case": case_identity,
+        "handoff": handoff.model_dump(mode="json", include=handoff_fields),
+        "verification_objectives": objective_definitions,
+    }
 
 
 class KnowledgeArtifact(BaseModel):

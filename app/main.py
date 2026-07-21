@@ -45,6 +45,7 @@ from app.cases.lhp import (
     CallbackInboxRecord,
     HandoffUpdate,
     assert_lhp_payload_size,
+    build_lhp_approval_scope,
     lhp_payload_hash,
     verify_loop_signature,
 )
@@ -1960,6 +1961,10 @@ class LoopConsoleVerificationResultRequest(LoopConsoleBaseRequest):
     failure_reason: str = ""
 
 
+class LoopConsoleHandoffCancelRequest(LoopConsoleBaseRequest):
+    reason: str
+
+
 @app.post("/task", response_model=MailPollResponse)
 async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
     """Run an arbitrary task on the NOC Triage agent (e.g. 'Draft email to LocIX')."""
@@ -2532,6 +2537,35 @@ async def loop_console_handoff_update(handoff_id: str, request: Request):
     }
 
 
+@app.post("/loop-console/v1/handoffs/{handoff_id}/cancel")
+async def loop_console_handoff_cancel(
+    handoff_id: str,
+    request_body: LoopConsoleHandoffCancelRequest,
+    request: Request,
+):
+    body = _loop_console_signed_body(request_body)
+    _require_loop_console_request(request, body=body)
+    event_id = _loop_console_action_id("cancel_handoff", request_body.idempotency_key, handoff_id)
+    try:
+        result = await case_service_runtime.service.cancel_lhp_handoff(
+            handoff_id,
+            actor_id=_safe_monitor_token(request_body.actor_id, limit=120),
+            reason=_safe_monitor_text(request_body.reason, limit=800),
+            external_event_id=event_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="LHP handoff not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid LHP handoff transition") from exc
+    return {
+        "status": "ok",
+        "created": result.created,
+        "handoff": result.handoff.model_dump(mode="json"),
+        "case": result.case.model_dump(mode="json"),
+        "update": result.update.model_dump(mode="json"),
+    }
+
+
 @app.get("/control/cases/{case_id}/events")
 async def control_case_events(
     case_id: str,
@@ -2742,16 +2776,18 @@ async def engineering_lhp_handoff_fetch(handoff_id: str, request: Request):
         raise HTTPException(status_code=404, detail="LHP case not found")
     objectives = await runtime.service.list_lhp_verification_objectives(case_id=handoff.case_id)
     artifacts = await runtime.service.list_lhp_knowledge_artifacts(case_id=handoff.case_id)
+    handoff_objectives = [item for item in objectives if item.handoff_id == handoff.handoff_id][:20]
+    approval_scope = build_lhp_approval_scope(handoff, case, handoff_objectives)
     payload = {
         "schema_version": "lhp.v1",
         "handoff": handoff.model_dump(mode="json"),
         "case": _case_service_case_summary(case),
-        "verification_objectives": [
-            item.model_dump(mode="json") for item in objectives if item.handoff_id == handoff.handoff_id
-        ][:20],
+        "verification_objectives": [item.model_dump(mode="json") for item in handoff_objectives],
         "knowledge_artifacts": [
             item.model_dump(mode="json") for item in artifacts if item.handoff_id in {"", handoff.handoff_id}
         ][:10],
+        "approval_scope": approval_scope,
+        "approval_scope_hash": lhp_payload_hash(approval_scope),
     }
     assert_lhp_payload_size(payload, max_bytes=load_loop_handoff_settings().callback_max_bytes)
     return {**payload, "payload_hash": lhp_payload_hash(payload)}
