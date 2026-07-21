@@ -19,6 +19,7 @@ from app.cases.lhp import (
     HandoffTransportDelivery,
     HandoffUpdate,
     KnowledgeArtifact,
+    MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
     OutcomeRecord,
     TERMINAL_HANDOFF_STATUSES,
     VERIFIER_ONLY_HANDOFF_STATUSES,
@@ -599,6 +600,10 @@ class InMemoryCaseStore:
         event: CaseEvent | None = None,
         outbox_intent: OutboxIntent | None = None,
     ) -> HandoffCreateResult:
+        if len(objectives) > MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF:
+            raise ValueError(
+                f"handoff cannot define more than {MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF} verification objectives"
+            )
         async with self._lock:
             case = self._require_atomic_case_locked(handoff.case_id)
             existing_handoff = self._existing_handoff_locked(handoff)

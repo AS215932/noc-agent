@@ -2500,7 +2500,7 @@ async def loop_console_verification_result(
         else:
             objective.consecutive_pass_count = 0
             objective.status = request_body.status
-        objective.payload.update(
+        objective.result_payload.update(
             {"source": "loop_console", "actor_id": request_body.actor_id, **dict(request_body.payload)}
         )
         objective = await runtime.service.record_lhp_verification_result(objective, event_id=event_id)
@@ -2545,9 +2545,10 @@ async def loop_console_handoff_cancel(
 ):
     body = _loop_console_signed_body(request_body)
     _require_loop_console_request(request, body=body)
+    runtime = _require_case_service_runtime()
     event_id = _loop_console_action_id("cancel_handoff", request_body.idempotency_key, handoff_id)
     try:
-        result = await case_service_runtime.service.cancel_lhp_handoff(
+        result = await runtime.service.cancel_lhp_handoff(
             handoff_id,
             actor_id=_safe_monitor_token(request_body.actor_id, limit=120),
             reason=_safe_monitor_text(request_body.reason, limit=800),
@@ -2707,7 +2708,7 @@ def _proactive_hotspots_view() -> list[dict]:
 
 def _require_case_service_runtime():
     if case_service_runtime is None:
-        raise HTTPException(status_code=409, detail="Case service runtime is not enabled")
+        raise HTTPException(status_code=503, detail="Case service runtime is not enabled")
     return case_service_runtime
 
 

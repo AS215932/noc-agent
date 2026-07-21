@@ -21,6 +21,7 @@ from app.cases.lhp import (
     HandoffUpdate,
     KnowledgeArtifact,
     OutcomeRecord,
+    MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
     TERMINAL_HANDOFF_STATUSES,
     VerificationObjective,
     sanitize_lhp_payload,
@@ -399,6 +400,11 @@ class CaseService:
         event, and outbox intent atomically.
         """
 
+        requested_objectives = objectives or []
+        if len(requested_objectives) > MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF:
+            raise ValueError(
+                f"handoff cannot define more than {MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF} verification objectives"
+            )
         case = await self._require_atomic_case(handoff.case_id)
         event = CaseEvent(
             case_id=case.case_id,
@@ -424,7 +430,7 @@ class CaseService:
             )
         result = await self.store.create_handoff_with_objectives(
             handoff,
-            objectives=objectives or [],
+            objectives=requested_objectives,
             case_status="handoff_requested",
             event=event,
             outbox_intent=outbox_intent,
@@ -586,11 +592,14 @@ class CaseService:
                 for item in handoffs
                 if item.handoff_id != handoff.handoff_id and item.status not in TERMINAL_HANDOFF_STATUSES
             ]
-            if case.status in _TERMINAL_CASE_STATUSES or other_active_handoffs:
+            surviving_handoff = other_active_handoffs[0] if other_active_handoffs else None
+            if case.status in _TERMINAL_CASE_STATUSES:
                 cancellation_case_status = case.status
+            elif surviving_handoff is not None:
+                cancellation_case_status = _case_status_for_handoff(surviving_handoff.status)
             else:
                 cancellation_case_status = "investigating"
-            sibling_handoff_status = other_active_handoffs[0].status if other_active_handoffs else None
+            sibling_handoff_status = surviving_handoff.status if surviving_handoff is not None else None
             result = await self.record_lhp_handoff_update(
                 HandoffUpdate(
                     handoff_id=handoff.handoff_id,
@@ -627,7 +636,7 @@ class CaseService:
     async def _skip_cancelled_handoff_objectives(self, handoff: CaseHandoff) -> None:
         objectives = await self.store.list_verification_objectives(case_id=handoff.case_id)
         for objective in objectives:
-            if objective.handoff_id != handoff.handoff_id or objective.status == "skipped":
+            if objective.handoff_id != handoff.handoff_id or objective.status != "pending":
                 continue
             skipped = objective.model_copy(deep=True)
             skipped.status = "skipped"

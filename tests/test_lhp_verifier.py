@@ -117,6 +117,8 @@ async def test_verifier_marks_handoff_verified_after_required_consecutive_passes
     objectives = await service.list_lhp_verification_objectives(case_id=handoff.case_id)
     assert "Bearer nope" not in str([objective.payload for objective in objectives])
     assert "```" not in str([objective.payload for objective in objectives])
+    assert "Bearer nope" not in str([objective.result_payload for objective in objectives])
+    assert "```" not in str([objective.result_payload for objective in objectives])
 
 
 @pytest.mark.asyncio

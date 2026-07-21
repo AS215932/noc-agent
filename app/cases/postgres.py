@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, AsyncIterator, cast
 
 from app.cases.lhp import (
@@ -18,6 +19,7 @@ from app.cases.lhp import (
     HandoffTransportDelivery,
     HandoffUpdate,
     KnowledgeArtifact,
+    MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF,
     OutcomeRecord,
     VERIFIER_ONLY_HANDOFF_STATUSES,
     VerificationObjective,
@@ -46,9 +48,44 @@ from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
 
 
+class _GuardAwareAcquire:
+    def __init__(self, pool: Any, guarded_connection: ContextVar[Any | None]) -> None:
+        self._pool = pool
+        self._guarded_connection = guarded_connection
+        self._acquisition: Any | None = None
+
+    async def __aenter__(self) -> Any:
+        existing = self._guarded_connection.get()
+        if existing is not None:
+            return existing
+        self._acquisition = self._pool.acquire()
+        return await self._acquisition.__aenter__()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        if self._acquisition is None:
+            return False
+        return await self._acquisition.__aexit__(exc_type, exc, tb)
+
+
+class _GuardAwarePool:
+    def __init__(self, pool: Any, guarded_connection: ContextVar[Any | None]) -> None:
+        self._pool = pool
+        self._guarded_connection = guarded_connection
+
+    def acquire(self) -> _GuardAwareAcquire:
+        return _GuardAwareAcquire(self._pool, self._guarded_connection)
+
+    async def close(self) -> None:
+        await self._pool.close()
+
+
 class PostgresCaseStore:
     def __init__(self, pool: Any) -> None:
-        self.pool = pool
+        self._raw_pool = pool
+        self._guarded_connection: ContextVar[Any | None] = ContextVar(
+            "postgres_case_store_guarded_connection", default=None
+        )
+        self.pool = _GuardAwarePool(pool, self._guarded_connection)
 
     @classmethod
     async def connect(cls, settings: DatabaseSettings | None = None) -> "PostgresCaseStore":
@@ -652,6 +689,10 @@ class PostgresCaseStore:
         event: CaseEvent | None = None,
         outbox_intent: OutboxIntent | None = None,
     ) -> HandoffCreateResult:
+        if len(objectives) > MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF:
+            raise ValueError(
+                f"handoff cannot define more than {MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF} verification objectives"
+            )
         lock_key = _advisory_lock_key(
             "handoff",
             {
@@ -807,11 +848,15 @@ class PostgresCaseStore:
         """Serialize cancellation with external delivery across app processes."""
 
         lock_key = _advisory_lock_key("handoff-delivery", {"handoff_id": handoff_id})
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with self._raw_pool.acquire() as conn, conn.transaction():
             await conn.execute("SET LOCAL lock_timeout = '0'")
             await conn.execute("SET LOCAL statement_timeout = '0'")
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", lock_key)
-            yield
+            token = self._guarded_connection.set(conn)
+            try:
+                yield
+            finally:
+                self._guarded_connection.reset(token)
 
     async def append_handoff_update(
         self,

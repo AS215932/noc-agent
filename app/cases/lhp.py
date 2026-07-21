@@ -27,6 +27,7 @@ DEFAULT_TEXT_LIMIT = 1_000
 MAX_COLLECTION_ITEMS = 50
 MAX_MAPPING_ITEMS = 100
 MAX_PAYLOAD_DEPTH = 6
+MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF = 20
 
 LoopName = Literal["noc", "engineering", "knowledge", "soc"]
 HandoffStatus = Literal[
@@ -413,6 +414,7 @@ class VerificationObjective(BaseModel):
     evidence_ref: str = ""
     failure_reason: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
+    result_payload: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
     schema_version: str = LHP_SCHEMA_VERSION
@@ -437,7 +439,7 @@ class VerificationObjective(BaseModel):
     def _required_texts(cls, value: Any, info: ValidationInfo) -> str:
         return require_lhp_text(value, field_name=info.field_name or "field", limit=800)
 
-    @field_validator("payload", mode="before")
+    @field_validator("payload", "result_payload", mode="before")
     @classmethod
     def _payload(cls, value: Any) -> dict[str, Any]:
         sanitized = sanitize_lhp_payload(value or {})
@@ -517,7 +519,9 @@ def build_lhp_approval_scope(
         "schema_version": LHP_APPROVAL_SCOPE_SCHEMA_VERSION,
         "case": case_identity,
         "handoff": handoff_projection,
-        "verification_objectives": objective_definitions,
+        "verification_objectives": objective_definitions[:MAX_VERIFICATION_OBJECTIVES_PER_HANDOFF],
+        "verification_objective_count": len(objective_definitions),
+        "verification_objectives_hash": lhp_payload_hash(objective_definitions),
     }
 
 

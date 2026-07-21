@@ -145,6 +145,10 @@ async def test_postgres_handoff_delivery_guard_uses_cross_process_advisory_lock(
         async def execute(self, query, *args):
             self.queries.append((query, args))
 
+        async def fetchrow(self, query, *args):
+            self.queries.append((query, args))
+            return None
+
     class _Acquire:
         def __init__(self, conn):
             self.conn = conn
@@ -158,16 +162,20 @@ async def test_postgres_handoff_delivery_guard_uses_cross_process_advisory_lock(
     class _Pool:
         def __init__(self, conn):
             self.conn = conn
+            self.acquire_count = 0
 
         def acquire(self):
+            self.acquire_count += 1
             return _Acquire(self.conn)
 
     conn = _Conn()
-    store = PostgresCaseStore(_Pool(conn))
+    pool = _Pool(conn)
+    store = PostgresCaseStore(pool)
 
     async with store.handoff_delivery_guard("handoff_1"):
-        pass
+        assert await store.get_handoff("handoff_1") is None
 
+    assert pool.acquire_count == 1
     queries = [query for query, _args in conn.queries]
     assert "SET LOCAL lock_timeout = '0'" in queries
     assert "SET LOCAL statement_timeout = '0'" in queries

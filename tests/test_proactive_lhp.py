@@ -1,6 +1,6 @@
 import pytest
 
-from app.cases.lhp import CaseHandoff, build_lhp_approval_scope, lhp_payload_hash, lhp_payload_size
+from app.cases.lhp import CaseHandoff, VerificationObjective, build_lhp_approval_scope, lhp_payload_hash, lhp_payload_size
 from app.cases.models import AtomicCaseProjection
 from app.cases.service import CaseService
 from app.cases.store import InMemoryCaseStore
@@ -160,3 +160,33 @@ def test_approval_scope_hashes_large_payload_instead_of_copying_it():
     assert lhp_payload_size(scope) < 5_000
     assert scope["handoff"]["payload_hash"] == lhp_payload_hash(handoff.payload)
     assert "evidence" not in scope["handoff"]["payload"]
+
+
+def test_approval_scope_bounds_legacy_objectives_and_binds_the_complete_set():
+    handoff = CaseHandoff(
+        handoff_id="handoff_legacy_many",
+        case_id="case_legacy_many",
+        target_loop="engineering",
+        objective="resolve disk condition",
+        objective_key="resolve-disk-many-v1",
+        idempotency_key="case_legacy_many:engineering:resolve-disk-many:v1",
+    )
+    objectives = [
+        VerificationObjective(
+            case_id=handoff.case_id,
+            handoff_id=handoff.handoff_id,
+            objective_key=f"legacy_{index:02d}",
+            objective_type="health_endpoint",
+            name=f"legacy objective {index}",
+            payload={"endpoint": f"/health/{index}"},
+        )
+        for index in range(25)
+    ]
+
+    original = build_lhp_approval_scope(handoff, objectives)
+    objectives[-1].payload = {"endpoint": "/health/changed"}
+    changed = build_lhp_approval_scope(handoff, objectives)
+
+    assert len(original["verification_objectives"]) == 20
+    assert original["verification_objective_count"] == 25
+    assert original["verification_objectives_hash"] != changed["verification_objectives_hash"]

@@ -67,6 +67,34 @@ async def test_request_lhp_handoff_is_atomic_and_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_request_lhp_handoff_rejects_more_than_twenty_objectives():
+    service, case = await _service_with_case()
+    handoff = CaseHandoff(
+        handoff_id="handoff_too_many_objectives",
+        case_id=case.case_id,
+        target_loop="engineering",
+        objective="resolve disk condition",
+        objective_key="resolve-disk-many-v1",
+        idempotency_key="case_lhp_1:engineering:resolve-disk-many:v1",
+    )
+    objectives = [
+        VerificationObjective(
+            case_id=case.case_id,
+            handoff_id=handoff.handoff_id,
+            objective_key=f"objective_{index}",
+            objective_type="health_endpoint",
+            name=f"objective {index}",
+        )
+        for index in range(21)
+    ]
+
+    with pytest.raises(ValueError, match="more than 20 verification objectives"):
+        await service.request_lhp_handoff(handoff, objectives=objectives)
+
+    assert await service.get_lhp_handoff(handoff.handoff_id) is None
+
+
+@pytest.mark.asyncio
 async def test_lhp_handoff_updates_are_deduped_and_drive_case_state():
     service, case = await _service_with_case()
     handoff = CaseHandoff(
@@ -170,6 +198,48 @@ async def test_noc_can_cancel_handoff_idempotently_and_resume_case_monitoring():
 
 
 @pytest.mark.asyncio
+async def test_cancellation_preserves_completed_objective_results():
+    service, case = await _service_with_case()
+    handoff = CaseHandoff(
+        handoff_id="handoff_cancel_completed_checks",
+        case_id=case.case_id,
+        target_loop="engineering",
+        objective="resolve disk condition",
+        objective_key="resolve-disk-completed-checks-v1",
+        idempotency_key="case_lhp_1:engineering:resolve-disk-completed-checks:v1",
+    )
+    objectives = [
+        VerificationObjective(
+            case_id=case.case_id,
+            handoff_id=handoff.handoff_id,
+            objective_key=f"check_{status}",
+            objective_type="health_endpoint",
+            name=f"check {status}",
+            status=status,
+            failure_reason="observed_failure" if status == "fail" else "",
+        )
+        for status in ("pass", "fail", "pending")
+    ]
+    await service.request_lhp_handoff(handoff, objectives=objectives)
+
+    await service.cancel_lhp_handoff(
+        handoff.handoff_id,
+        actor_id="operator",
+        reason="cancel after partial verification",
+        external_event_id="cancel_completed_checks_1",
+    )
+    stored = {
+        item.objective_key: item
+        for item in await service.list_lhp_verification_objectives(case_id=case.case_id)
+    }
+
+    assert stored["check_pass"].status == "pass"
+    assert stored["check_fail"].status == "fail"
+    assert stored["check_fail"].failure_reason == "observed_failure"
+    assert stored["check_pending"].status == "skipped"
+
+
+@pytest.mark.asyncio
 async def test_cancelling_stale_handoff_preserves_resolved_case_state():
     service, case = await _service_with_case()
     handoff = CaseHandoff(
@@ -217,8 +287,19 @@ async def test_cancelling_one_handoff_preserves_active_sibling_projection():
         objective_key="resolve-disk-two-v1",
         idempotency_key="case_lhp_1:engineering:resolve-disk-two:v1",
     )
-    await service.request_lhp_handoff(cancelled)
     await service.request_lhp_handoff(sibling)
+    await service.request_lhp_handoff(cancelled)
+    await service.record_lhp_handoff_update(
+        HandoffUpdate(
+            case_id=case.case_id,
+            handoff_id=cancelled.handoff_id,
+            source_loop="engineering",
+            update_type="blocked",
+            status="blocked",
+            external_event_id="blocked_before_cancel_1",
+            correlation_id=cancelled.correlation_id,
+        )
+    )
 
     result = await service.cancel_lhp_handoff(
         cancelled.handoff_id,
