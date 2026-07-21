@@ -782,7 +782,13 @@ class InMemoryCaseStore:
             rows = [
                 row
                 for row in self._verification_objectives.values()
-                if row.status not in {"pass", "skipped"} and (not row.next_check_at or row.next_check_at <= now)
+                if row.status not in {"pass", "skipped"}
+                and (not row.next_check_at or row.next_check_at <= now)
+                and (
+                    not row.handoff_id
+                    or self._handoffs.get(row.handoff_id) is None
+                    or self._handoffs[row.handoff_id].status not in TERMINAL_HANDOFF_STATUSES
+                )
             ]
             rows.sort(key=lambda row: (row.next_check_at or "", row.created_at, row.objective_id))
             return [row.model_copy(deep=True) for row in rows[: _bounded_limit(limit)]]

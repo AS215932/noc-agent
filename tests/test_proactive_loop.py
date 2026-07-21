@@ -170,9 +170,10 @@ async def test_lhp_disk_handoff_is_created_once_for_fresh_disk_hotspot(tmp_path)
     assert handoff.resource["host"] == "log"
     assert handoff.resource["filesystem"] == "/var"
     objectives = await service.list_lhp_verification_objectives(case_id=handoff.case_id)
+    occurrence_id = handoff.payload["occurrence_id"]
     assert {objective.objective_key for objective in objectives} == {
-        "disk_monitoring_alert_clear",
-        "noc_health_remains_healthy",
+        f"disk_monitoring_alert_clear:{occurrence_id}",
+        f"noc_health_remains_healthy:{occurrence_id}",
     }
     assert await service.store.list_outbox(status="pending") == []
 

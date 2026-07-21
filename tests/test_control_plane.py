@@ -249,6 +249,17 @@ async def test_engineering_lhp_fetch_and_callback_use_hmac(monkeypatch):
     assert refreshed["payload_hash"] != fetched["payload_hash"]
     assert refreshed["approval_scope_hash"] == fetched["approval_scope_hash"]
 
+    current_case = await store.get_case(created.case.case_id)
+    assert current_case is not None
+    current_case.resolved_at = "2026-07-21T19:35:00+00:00"
+    current_case.status = "resolved"
+    await store.upsert_case(current_case)
+    resolved = await engineering_lhp_handoff_fetch(
+        handoff.handoff_id,
+        _LoopRequest(method="GET", path=f"/loop-handoff/v1/engineering/handoffs/{handoff.handoff_id}"),
+    )
+    assert resolved["approval_scope_hash"] == fetched["approval_scope_hash"]
+
     callback_body = HandoffUpdate(
         case_id=created.case.case_id,
         handoff_id=handoff.handoff_id,

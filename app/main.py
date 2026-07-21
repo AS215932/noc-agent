@@ -2777,7 +2777,7 @@ async def engineering_lhp_handoff_fetch(handoff_id: str, request: Request):
     objectives = await runtime.service.list_lhp_verification_objectives(case_id=handoff.case_id)
     artifacts = await runtime.service.list_lhp_knowledge_artifacts(case_id=handoff.case_id)
     handoff_objectives = [item for item in objectives if item.handoff_id == handoff.handoff_id][:20]
-    approval_scope = build_lhp_approval_scope(handoff, case, handoff_objectives)
+    approval_scope = build_lhp_approval_scope(handoff, handoff_objectives)
     payload = {
         "schema_version": "lhp.v1",
         "handoff": handoff.model_dump(mode="json"),
@@ -2789,8 +2789,12 @@ async def engineering_lhp_handoff_fetch(handoff_id: str, request: Request):
         "approval_scope": approval_scope,
         "approval_scope_hash": lhp_payload_hash(approval_scope),
     }
-    assert_lhp_payload_size(payload, max_bytes=load_loop_handoff_settings().callback_max_bytes)
-    return {**payload, "payload_hash": lhp_payload_hash(payload)}
+    response = {**payload, "payload_hash": lhp_payload_hash(payload)}
+    try:
+        assert_lhp_payload_size(response, max_bytes=load_loop_handoff_settings().callback_max_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail="LHP handoff response exceeds configured size") from exc
+    return response
 
 
 @app.post("/webhook/engineering-loop/handoff-update")

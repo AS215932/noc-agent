@@ -446,7 +446,6 @@ class VerificationObjective(BaseModel):
 
 def build_lhp_approval_scope(
     handoff: CaseHandoff,
-    case: Any,
     objectives: list[VerificationObjective],
 ) -> dict[str, Any]:
     """Return the immutable request projection used for Engineering approval.
@@ -490,32 +489,61 @@ def build_lhp_approval_scope(
         "required_status",
         "required",
         "required_consecutive_passes",
-        "payload",
         "schema_version",
     }
-    occurrence_seed = {
-        "case_id": str(getattr(case, "case_id", "")),
-        "opened_at": str(getattr(case, "opened_at", "")),
-        "previous_resolution_at": str(getattr(case, "resolved_at", "") or ""),
-    }
+    handoff_projection = handoff.model_dump(mode="json", include=handoff_fields)
+    handoff_projection["payload"] = _approval_payload_projection(handoff.payload)
+    handoff_projection["payload_hash"] = lhp_payload_hash(handoff.payload)
+    occurrence_id = str(handoff.payload.get("occurrence_id") or "")
+    if not occurrence_id:
+        occurrence_id = lhp_payload_hash(
+            {
+                "handoff_id": handoff.handoff_id,
+                "created_at": handoff.created_at,
+            }
+        )[:16]
     case_identity = {
-        "case_id": str(getattr(case, "case_id", "")),
-        "kind": str(getattr(case, "kind", "")),
-        "origin": str(getattr(case, "origin", "")),
-        "rule_id": str(getattr(case, "rule_id", "")),
-        "detector": str(getattr(case, "detector", "")),
-        "resource_id": str(getattr(case, "resource_id", "")),
-        "fingerprint": str(getattr(case, "fingerprint", "")),
-        "occurrence_id": lhp_payload_hash(occurrence_seed)[:16],
+        "case_id": handoff.case_id,
+        "fingerprint": handoff.fingerprint,
+        "occurrence_id": occurrence_id,
     }
-    objective_definitions = [item.model_dump(mode="json", include=objective_fields) for item in objectives]
+    objective_definitions = []
+    for item in objectives:
+        definition = item.model_dump(mode="json", include=objective_fields)
+        definition["payload_hash"] = lhp_payload_hash(item.payload)
+        objective_definitions.append(definition)
     objective_definitions.sort(key=lambda item: (str(item.get("objective_key", "")), str(item.get("objective_id", ""))))
     return {
         "schema_version": LHP_APPROVAL_SCOPE_SCHEMA_VERSION,
         "case": case_identity,
-        "handoff": handoff.model_dump(mode="json", include=handoff_fields),
+        "handoff": handoff_projection,
         "verification_objectives": objective_definitions,
     }
+
+
+def _approval_payload_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Expose bounded routing fields while binding the complete payload by hash."""
+
+    selected = {
+        key: payload[key]
+        for key in ("schema", "occurrence_id", "change_domain", "expected_path_classes")
+        if key in payload
+    }
+    hotspot = payload.get("hotspot")
+    if isinstance(hotspot, dict):
+        selected["hotspot"] = {
+            key: hotspot[key]
+            for key in (
+                "rule_id",
+                "key",
+                "severity",
+                "warrants_change",
+                "change_rationale",
+                "recommended_checks",
+            )
+            if key in hotspot
+        }
+    return selected
 
 
 class KnowledgeArtifact(BaseModel):

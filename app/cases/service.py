@@ -21,6 +21,7 @@ from app.cases.lhp import (
     HandoffUpdate,
     KnowledgeArtifact,
     OutcomeRecord,
+    TERMINAL_HANDOFF_STATUSES,
     VerificationObjective,
     sanitize_lhp_payload,
 )
@@ -528,7 +529,12 @@ class CaseService:
         record_lhp_knowledge_event(kind="artifact_proposed", outcome="enqueued")
         return intent
 
-    async def record_lhp_handoff_update(self, update: HandoffUpdate) -> HandoffUpdateResult:
+    async def record_lhp_handoff_update(
+        self,
+        update: HandoffUpdate,
+        *,
+        case_status: CaseStatus | None = None,
+    ) -> HandoffUpdateResult:
         event = CaseEvent(
             case_id=update.case_id,
             event_type="lhp_handoff_update_recorded",
@@ -546,7 +552,7 @@ class CaseService:
         )
         result = await self.store.append_handoff_update(
             update,
-            case_status=_case_status_for_handoff(update.status),
+            case_status=case_status or _case_status_for_handoff(update.status),
             event=event,
         )
         record_lhp_handoff_update(
@@ -570,7 +576,18 @@ class CaseService:
         handoff = await self.store.get_handoff(handoff_id)
         if handoff is None:
             raise KeyError(f"handoff not found: {handoff_id}")
-        return await self.record_lhp_handoff_update(
+        case = await self._require_atomic_case(handoff.case_id)
+        handoffs = await self.store.list_handoffs(case_id=handoff.case_id)
+        other_active_handoffs = [
+            item
+            for item in handoffs
+            if item.handoff_id != handoff.handoff_id and item.status not in TERMINAL_HANDOFF_STATUSES
+        ]
+        if case.status in _TERMINAL_CASE_STATUSES or other_active_handoffs:
+            cancellation_case_status = case.status
+        else:
+            cancellation_case_status = "investigating"
+        result = await self.record_lhp_handoff_update(
             HandoffUpdate(
                 handoff_id=handoff.handoff_id,
                 case_id=handoff.case_id,
@@ -581,8 +598,38 @@ class CaseService:
                 external_event_id=external_event_id,
                 correlation_id=handoff.correlation_id,
                 payload={"actor_id": actor_id, "reason": reason, "source": "loop_console"},
-            )
+            ),
+            case_status=cancellation_case_status,
         )
+        await self._abandon_handoff_delivery_intents(handoff.handoff_id)
+        await self._skip_cancelled_handoff_objectives(handoff)
+        return result
+
+    async def _abandon_handoff_delivery_intents(self, handoff_id: str) -> None:
+        for intent in await self.store.list_outbox():
+            if (
+                intent.intent_type != "engineering_handoff_requested"
+                or str(intent.payload.get("handoff_id") or "") != handoff_id
+                or intent.status in {"succeeded", "abandoned"}
+            ):
+                continue
+            abandoned = intent.model_copy(deep=True)
+            abandoned.status = "abandoned"
+            abandoned.completed_at = abandoned.completed_at or utc_now()
+            abandoned.error = "handoff_cancelled"
+            await self.store.update_outbox(abandoned)
+
+    async def _skip_cancelled_handoff_objectives(self, handoff: CaseHandoff) -> None:
+        objectives = await self.store.list_verification_objectives(case_id=handoff.case_id)
+        for objective in objectives:
+            if objective.handoff_id != handoff.handoff_id or objective.status == "skipped":
+                continue
+            skipped = objective.model_copy(deep=True)
+            skipped.status = "skipped"
+            skipped.failure_reason = "handoff_cancelled"
+            skipped.next_check_at = ""
+            skipped.updated_at = utc_now()
+            await self.record_lhp_verification_result(skipped)
 
     async def upsert_lhp_verification_objective(self, objective: VerificationObjective) -> VerificationObjective:
         event = CaseEvent(
@@ -998,6 +1045,9 @@ def _case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
     if status in {"cancelled", "expired"}:
         return "investigating"
     return "handoff_requested"
+
+
+_TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
 
 
 def _parse_iso_time(value: str | None) -> datetime | None:

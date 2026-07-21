@@ -958,10 +958,12 @@ class PostgresCaseStore:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT payload FROM verification_objectives
-                WHERE status NOT IN ('pass', 'skipped')
-                  AND (next_check_at = '' OR next_check_at <= $1)
-                ORDER BY next_check_at ASC, created_at ASC, objective_id ASC
+                SELECT objectives.payload FROM verification_objectives AS objectives
+                LEFT JOIN case_handoffs AS handoffs ON handoffs.handoff_id = objectives.handoff_id
+                WHERE objectives.status NOT IN ('pass', 'skipped')
+                  AND (objectives.next_check_at = '' OR objectives.next_check_at <= $1)
+                  AND (objectives.handoff_id IS NULL OR handoffs.status NOT IN ('resolved', 'cancelled', 'expired'))
+                ORDER BY objectives.next_check_at ASC, objectives.created_at ASC, objectives.objective_id ASC
                 LIMIT $2
                 """,
                 now,

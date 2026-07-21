@@ -1,3 +1,4 @@
+from app.cases.lhp import CaseHandoff, build_lhp_approval_scope, lhp_payload_hash, lhp_payload_size
 from app.cases.models import AtomicCaseProjection
 from app.proactive.lhp import build_disk_handoff_request, disk_resource_parts, is_disk_handoff_hotspot
 from app.proactive.models import Hotspot, HotspotEvidence
@@ -89,3 +90,28 @@ def test_disk_handoff_idempotency_is_stable_within_case_occurrence():
     assert first.handoff.idempotency_key == second.handoff.idempotency_key
     assert first.handoff.idempotency_key != reopened.handoff.idempotency_key
     assert ":v2:" in first.handoff.idempotency_key
+    assert {item.objective_key for item in first.objectives}.isdisjoint(
+        {item.objective_key for item in reopened.objectives}
+    )
+
+
+def test_approval_scope_hashes_large_payload_instead_of_copying_it():
+    large_payload = {
+        "occurrence_id": "occurrence_large",
+        "evidence": {f"sample_{index}": "x" * 900 for index in range(40)},
+    }
+    handoff = CaseHandoff(
+        case_id="case_large",
+        target_loop="engineering",
+        objective="resolve disk condition",
+        objective_key="resolve-disk-v1",
+        idempotency_key="case_large:engineering:resolve-disk-v1:occurrence_large",
+        payload=large_payload,
+    )
+
+    scope = build_lhp_approval_scope(handoff, [])
+
+    assert lhp_payload_size(handoff.model_dump(mode="json")) > 30_000
+    assert lhp_payload_size(scope) < 5_000
+    assert scope["handoff"]["payload_hash"] == lhp_payload_hash(handoff.payload)
+    assert "evidence" not in scope["handoff"]["payload"]

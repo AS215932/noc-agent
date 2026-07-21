@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from app.cases.lhp import HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
+from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.service import CaseService
@@ -114,6 +114,14 @@ def build_engineering_lhp_handoff_handler(
         handoff = await case_service.get_lhp_handoff(handoff_id)
         if handoff is None:
             raise KeyError(f"LHP handoff not found: {handoff_id}")
+        if handoff.status in TERMINAL_HANDOFF_STATUSES:
+            return OutboxHandlerResult(
+                payload_updates={
+                    "handoff_id": handoff.handoff_id,
+                    "delivery_skipped": True,
+                    "terminal_status": handoff.status,
+                }
+            )
         case = await case_service.store.get_case(handoff.case_id)
         if not isinstance(case, AtomicCaseProjection):
             raise KeyError(f"atomic case not found for LHP handoff: {handoff.case_id}")
@@ -132,6 +140,22 @@ def build_engineering_lhp_handoff_handler(
                 external_id=delivery.external_id,
                 external_url=delivery.external_url,
                 payload_updates={"handoff_id": handoff.handoff_id, "delivery_id": delivery.delivery_id},
+            )
+        current_handoff = await case_service.get_lhp_handoff(handoff_id)
+        if current_handoff is None:
+            raise KeyError(f"LHP handoff not found: {handoff_id}")
+        if current_handoff.status in TERMINAL_HANDOFF_STATUSES:
+            abandoned = delivery.model_copy(deep=True)
+            abandoned.status = "abandoned"
+            abandoned.last_error = f"handoff_{current_handoff.status}"
+            await case_service.update_lhp_handoff_delivery(abandoned)
+            return OutboxHandlerResult(
+                payload_updates={
+                    "handoff_id": current_handoff.handoff_id,
+                    "delivery_id": delivery.delivery_id,
+                    "delivery_skipped": True,
+                    "terminal_status": current_handoff.status,
+                }
             )
         marker = f"noc-lhp-handoff-id:{handoff.handoff_id}"
         case_marker = f"noc-case-id:{case.case_id}"

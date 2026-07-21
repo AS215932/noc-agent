@@ -136,7 +136,14 @@ async def test_noc_can_cancel_handoff_idempotently_and_resume_case_monitoring():
         objective_key="resolve-low-root-filesystem-condition-v1",
         idempotency_key="case_lhp_1:engineering:resolve-low-root-filesystem-condition:v1",
     )
-    await service.request_lhp_handoff(handoff)
+    objective = VerificationObjective(
+        case_id=case.case_id,
+        handoff_id=handoff.handoff_id,
+        objective_key="root_disk_clear:occurrence_1",
+        objective_type="monitoring_alert_clear",
+        name="root disk alert clears",
+    )
+    await service.request_lhp_handoff(handoff, objectives=[objective], enqueue_delivery=True)
 
     first = await service.cancel_lhp_handoff(
         handoff.handoff_id,
@@ -155,6 +162,40 @@ async def test_noc_can_cancel_handoff_idempotently_and_resume_case_monitoring():
     assert duplicate.created is False
     assert first.handoff.status == "cancelled"
     assert first.case.status == "investigating"
+    stored_objective = (await service.list_lhp_verification_objectives(case_id=case.case_id))[0]
+    assert stored_objective.status == "skipped"
+    assert stored_objective.failure_reason == "handoff_cancelled"
+    outbox = await service.store.list_outbox()
+    assert outbox[0].status == "abandoned"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_stale_handoff_preserves_resolved_case_state():
+    service, case = await _service_with_case()
+    handoff = CaseHandoff(
+        handoff_id="handoff_resolved_cancel",
+        case_id=case.case_id,
+        target_loop="engineering",
+        objective="resolve low root filesystem condition",
+        objective_key="resolve-low-root-filesystem-condition-v1",
+        idempotency_key="case_lhp_1:engineering:resolved-cancel:v1",
+    )
+    await service.request_lhp_handoff(handoff)
+    current = await service.store.get_case(case.case_id)
+    assert isinstance(current, AtomicCaseProjection)
+    current.status = "resolved"
+    current.resolved_at = "2026-07-21T20:00:00+00:00"
+    await service.store.upsert_case(current)
+
+    result = await service.cancel_lhp_handoff(
+        handoff.handoff_id,
+        actor_id="operator",
+        reason="stale handoff after positive recovery",
+        external_event_id="cancel_resolved_1",
+    )
+
+    assert result.case.status == "resolved"
+    assert result.case.resolved_at == "2026-07-21T20:00:00+00:00"
 
 
 @pytest.mark.asyncio

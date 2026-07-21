@@ -124,7 +124,7 @@ def build_disk_handoff_request(
         VerificationObjective(
             case_id=case.case_id,
             handoff_id=handoff.handoff_id,
-            objective_key="disk_monitoring_alert_clear",
+            objective_key=f"disk_monitoring_alert_clear:{occurrence_id}",
             objective_type="monitoring_alert_clear",
             name="disk monitoring alert clears",
             description=f"Verify {host}:{filesystem} no longer violates the disk_fill rule.",
@@ -134,7 +134,7 @@ def build_disk_handoff_request(
         VerificationObjective(
             case_id=case.case_id,
             handoff_id=handoff.handoff_id,
-            objective_key="noc_health_remains_healthy",
+            objective_key=f"noc_health_remains_healthy:{occurrence_id}",
             objective_type="health_endpoint",
             name="NOC health remains healthy",
             description="Verify /health, /health/cases, and CaseService outbox health remain OK.",
