@@ -291,6 +291,7 @@ async def test_health_model_is_degraded_for_missing_model_credentials(monkeypatc
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert health["status"] == "degraded"
+    assert health["readiness"]["status"] == "unavailable"
     assert health["quota_monitoring"] == "not_configured"
     assert "test-google-key" not in str(health)
 
@@ -313,12 +314,48 @@ async def test_health_model_is_degraded_for_recent_runtime_failure_when_config_i
     response = Response()
     health = await health_model(response)
 
-    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.status_code == status.HTTP_200_OK
     assert health["status"] == "degraded"
+    assert health["readiness"]["status"] == "ok"
+    assert health["runtime_reliability"]["status"] == "degraded"
     assert health["quota_monitoring"] == "not_configured"
     assert health["last_failure_category"] == "unknown_infrastructure"
     assert health["last_failure_at"] == 123.0
     assert health["last_failure_model"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_health_model_stays_ready_when_only_a_spare_provider_has_no_credit(monkeypatch):
+    # 2026-07-28: Venice — the THIRD fallback — ran its key to a negative
+    # balance. provider_monitoring went degraded, the whole endpoint 503'd, and
+    # mon paged CRITICAL on noc-agent-model-health, even though the primary
+    # (openrouter) was healthy and every investigation still ran. Readiness must
+    # track the model chain, not a spare provider's billing state; the degraded
+    # provider stays visible in the body so the operator still sees it.
+    monkeypatch.setenv("AGENT_MODEL", "google-gla:gemini-3.1-pro-preview")
+    monkeypatch.delenv("AGENT_FALLBACK_MODELS", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_QUOTA_PROJECT_ID", raising=False)
+
+    class _DegradedCredits:
+        status = "degraded"
+
+        def health_value(self):
+            return {"status": "degraded", "providers": {"venice": {"status": "degraded"}}}
+
+    monkeypatch.setattr("app.main.check_model_provider_credits", lambda config: _DegradedCredits())
+
+    response = Response()
+    health = await health_model(response)
+
+    assert response.status_code == status.HTTP_200_OK
+    assert health["readiness"]["status"] == "ok"
+    assert health["readiness"]["primary_viable"] is True
+    # Still reported as degraded overall, and the provider detail survives.
+    assert health["status"] == "degraded"
+    assert health["quota_monitoring"] == "degraded"
+    assert health["provider_monitoring"]["providers"]["venice"]["status"] == "degraded"
 
 
 @pytest.mark.asyncio
