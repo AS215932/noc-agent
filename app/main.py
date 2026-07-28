@@ -3097,13 +3097,44 @@ async def health_model(response: Response):
     config = load_model_config()
     provider_monitoring = check_model_provider_credits(config)
     health = MODEL_STATE.health()
-    if provider_monitoring.status == "degraded":
-        health["status"] = "degraded"
-    if health["status"] != "ok":
+    missing_models = {
+        item.rsplit(": ", 1)[0]
+        for item in config.missing_credentials
+        if isinstance(item, str) and item
+    }
+    unavailable_models = {*missing_models, *config.unsupported_models}
+    viable_models = [model for model in config.configured_models if model not in unavailable_models]
+    if not viable_models or config.config_errors:
+        readiness_status = "unavailable"
+    elif config.primary_model not in viable_models:
+        readiness_status = "degraded"
+    else:
+        readiness_status = "ok"
+    runtime_status = "degraded" if MODEL_STATE._has_recent_runtime_failure() else "ok"
+    overall_status = (
+        "degraded"
+        if readiness_status != "ok" or runtime_status != "ok" or provider_monitoring.status == "degraded"
+        else "ok"
+    )
+    # Runtime flaps and credit-probe warnings remain visible in the body and
+    # metrics, but only total model-chain unavailability makes readiness fail.
+    # This keeps Icinga from turning every transient provider error into a
+    # CRITICAL feedback loop that invokes the same degraded model again.
+    if readiness_status == "unavailable":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     provider_health = provider_monitoring.health_value()
     return {
         **health,
+        "status": overall_status,
+        "readiness": {
+            "status": readiness_status,
+            "viable_models": viable_models,
+            "primary_viable": config.primary_model in viable_models,
+        },
+        "runtime_reliability": {
+            "status": runtime_status,
+            "recent_failure": runtime_status == "degraded",
+        },
         "primary_model": config.primary_model,
         "fallback_models": config.fallback_models,
         "provider_monitoring": provider_health,
