@@ -15,7 +15,7 @@ def test_alertmanager_payload_normalizes_each_alert_with_citations_ready_fields(
         "receiver": "noc",
         "groupKey": "{}:{alertname=RouterDown}",
         "externalURL": "https://am.example.invalid",
-        "commonLabels": {"severity": "critical", "site": "ams"},
+        "commonLabels": {"severity": "critical", "site": "ams", "notification_route": "network"},
         "commonAnnotations": {"summary": "router down cascade"},
         "alerts": [
             {
@@ -47,6 +47,7 @@ def test_alertmanager_payload_normalizes_each_alert_with_citations_ready_fields(
     assert first.service == "bgp"
     assert first.site == "ams"
     assert first.severity == "HIGH"
+    assert first.notification_route == "network"
     assert first.status == "firing"
     assert first.payload_ref == "https://prom.example.invalid/graph"
     assert first.signal_snapshot["groupKey"] == "{}:{alertname=RouterDown}"
@@ -90,6 +91,32 @@ def test_icinga_alert_payload_normalizes_problem_and_recovery():
     assert recovery_obs.severity == "LOW"
     assert recovery_obs.source_fingerprint == problem_obs.source_fingerprint
     assert recovery_obs.is_positive_clean
+
+
+def test_notification_routes_ai_and_ci_without_model_classification():
+    ai = observation_from_icinga_alert_payload(
+        {
+            "source": "icinga2",
+            "status": "firing",
+            "commonLabels": {"host": "noc", "service": "noc-agent-model-health"},
+            "alerts": [{"labels": {"host": "noc", "service": "noc-agent-model-health", "state": "WARNING"}}],
+            "tags": {"notification_route": "ai"},
+        }
+    )
+    ci = observations_from_alertmanager(
+        {
+            "source": "alertmanager",
+            "status": "firing",
+            "receiver": "noc",
+            "groupKey": "ci",
+            "commonLabels": {"severity": "warning", "notification_route": "ci"},
+            "commonAnnotations": {},
+            "alerts": [{"status": "firing", "labels": {"alertname": "PipelineFailed"}}],
+        }
+    )[0]
+
+    assert ai.notification_route == "ai"
+    assert ci.notification_route == "ci"
 
 
 @pytest.mark.asyncio

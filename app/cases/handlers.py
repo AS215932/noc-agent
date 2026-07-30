@@ -37,6 +37,7 @@ def build_default_outbox_handlers(
 
     handlers: dict[str, OutboxHandler] = {
         "report": build_report_handler(case_service, control_public_url=control_public_url),
+        "discord_update": build_discord_reminder_handler(case_service, control_public_url=control_public_url),
     }
     if knowledge_candidate_dir:
         handlers["knowledge_candidate"] = build_knowledge_candidate_handler(case_service.store, knowledge_candidate_dir)
@@ -82,20 +83,72 @@ def build_report_handler(
             raise KeyError(f"atomic case not found for report intent: {intent.case_id}")
         state_signature = intent.state_signature or case_service.report_state_signature(case)
         title, description, fields = _render_case_report(case, intent)
-        await notifier(
+        delivery = await notifier(
             case_id=case.case_id,
             title=title,
             description=description,
             color=_severity_color(case.severity),
             fields=fields,
             level=Verbosity.WARNING if case.severity in {"HIGH", "MEDIUM"} else Verbosity.INFO,
+            route=case.notification_route,
+            message_id=case.discord_message_id,
         )
+        if delivery is not None and delivery.message_id:
+            await case_service.record_discord_delivery(
+                case.case_id,
+                message_id=str(delivery.message_id),
+                channel_id=str(delivery.channel_id or ""),
+                state_signature=state_signature,
+            )
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
         await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
         return OutboxHandlerResult(
-            external_id=case.case_number or case.case_id,
+            external_id=str(delivery.message_id if delivery is not None else case.case_number or case.case_id),
             external_url=_case_url(case, control_public_url),
-            payload_updates={"state_signature": state_signature, "case_number": case.case_number},
+            payload_updates={
+                "state_signature": state_signature,
+                "case_number": case.case_number,
+                "notification_route": case.notification_route,
+                "discord_action": str(delivery.action if delivery is not None else "bot"),
+            },
+        )
+
+    return handle
+
+
+def build_discord_reminder_handler(
+    case_service: CaseService,
+    *,
+    notifier=send_case_notification,
+    control_public_url: str = "",
+) -> OutboxHandler:
+    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+        if not intent.case_id or intent.payload.get("action") != "reminder":
+            raise ValueError("discord_update intent requires a reminder case")
+        case = await case_service.store.get_case(intent.case_id)
+        if not isinstance(case, AtomicCaseProjection):
+            raise KeyError(f"atomic case not found for reminder intent: {intent.case_id}")
+        if case.acknowledged_at or case.status in {"resolved", "closed", "expired", "linked"}:
+            return OutboxHandlerResult(payload_updates={"skipped": "no_longer_due"})
+        # A reminder is deliberately a new post: editing the case card does not
+        # create a new unread notification for the operator.
+        delivery = await notifier(
+            case_id=f"{case.case_id}:reminder",
+            title=f"🔁 Unacknowledged critical: {case.title or case.detector or case.rule_id}",
+            description=f"{case.case_number or case.case_id} remains critical and unacknowledged.",
+            color=_severity_color(case.severity),
+            fields=[
+                {"name": "Case", "value": _case_url(case, control_public_url) or case.case_number or case.case_id},
+                {"name": "Route", "value": case.notification_route, "inline": True},
+            ],
+            level=Verbosity.WARNING,
+            route=case.notification_route,
+            message_id="",
+        )
+        await case_service.mark_discord_reminder(case.case_id)
+        return OutboxHandlerResult(
+            external_id=str(delivery.message_id if delivery is not None else ""),
+            payload_updates={"notification_route": case.notification_route, "discord_action": "reminder"},
         )
 
     return handle
@@ -255,13 +308,22 @@ def build_handoff_handler(
 def _render_case_report(case: AtomicCaseProjection, intent: OutboxIntent) -> tuple[str, str, list[dict[str, Any]]]:
     override_title = str(intent.payload.get("title") or "").strip()
     override_description = str(intent.payload.get("description") or "").strip()
-    title = override_title or f"NOC case {case.case_number or case.case_id}: {case.title or case.detector or case.rule_id}"
+    route_label = {"network": "NOC", "ai": "AI", "ci": "CI"}.get(case.notification_route, "NOC")
+    title = override_title or f"{route_label} case {case.case_number or case.case_id}: {case.title or case.detector or case.rule_id}"
     description = override_description or case.summary or "Case state changed."
     fields = [
         {"name": "Status", "value": _clip(case.status), "inline": True},
         {"name": "Severity", "value": _clip(case.severity), "inline": True},
         {"name": "Resource", "value": _clip(case.resource_id or "unknown"), "inline": True},
     ]
+    if case.acknowledged_at:
+        fields.append(
+            {
+                "name": "Acknowledged",
+                "value": _clip(case.acknowledged_by or case.acknowledged_at),
+                "inline": True,
+            }
+        )
     if case.last_diagnosis:
         fields.append({"name": "Last diagnosis", "value": _clip(_diagnosis_summary(case.last_diagnosis)), "inline": False})
     if case.recommendations:

@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, suppress
 
 from app import log
 from app.agent import noc_triage_agent
-from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
+from app.discord import notify_start, notify_finish
 from app.icinga_ack import acknowledge_icinga
 from app.discord import install_bot_notifier, install_case_notifier
 from app.discord_bot import build_bot
@@ -66,9 +66,12 @@ case_outbox_task = None
 case_verifier_task = None
 MAIL_POLLER_LOCK_PATH = os.getenv("MAIL_POLLER_LOCK_PATH", "/var/lib/noc-agent/mail-poller.lock")
 PROACTIVE_LOCK_PATH = os.getenv("PROACTIVE_LOCK_PATH", "/var/lib/noc-agent/proactive-instance.lock")
+CASE_OUTBOX_LOCK_PATH = os.getenv("CASE_OUTBOX_LOCK_PATH", "/var/lib/noc-agent/case-outbox.lock")
 
 REQUIRED_CONFIG = [
     "DISCORD_WEBHOOK_URL",
+    "DISCORD_AI_WEBHOOK_URL",
+    "DISCORD_CI_WEBHOOK_URL",
     "HYRULE_MCP_CMD",
     "HYRULE_MCP_URL",
     "XO_MCP_CMD",
@@ -117,6 +120,28 @@ def _try_acquire_proactive_lock() -> int | None:
 
 
 def _release_proactive_lock(lock_fd: int | None):
+    if lock_fd is None:
+        return
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+
+
+def _try_acquire_case_outbox_lock() -> int | None:
+    """Elect one local API worker to execute external side effects."""
+
+    os.makedirs(os.path.dirname(CASE_OUTBOX_LOCK_PATH), exist_ok=True)
+    lock_fd = os.open(CASE_OUTBOX_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o640)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return None
+    os.ftruncate(lock_fd, 0)
+    os.write(lock_fd, str(os.getpid()).encode())
+    return lock_fd
+
+
+def _release_case_outbox_lock(lock_fd: int | None) -> None:
     if lock_fd is None:
         return
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -173,23 +198,31 @@ async def _case_outbox_loop(runtime):
 
     interval_s = _env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30)
     limit = _env_int("NOC_CASE_OUTBOX_LIMIT", 10)
-    log.info("case_outbox_loop_starting", interval_seconds=interval_s, limit=limit)
-    while True:
-        try:
-            report = await process_case_outbox_once(runtime, limit=limit)
-            if report.processed or report.failed or report.skipped:
-                log.info(
-                    "case_outbox_processed",
-                    processed=report.processed,
-                    succeeded=report.succeeded,
-                    failed=report.failed,
-                    skipped=report.skipped,
-                )
-        except Exception as e:
-            safe = classify_exception(e)
-            record_case_service_shadow_failure(path="outbox", category=safe.category)
-            log_exception("case_outbox_loop_failed", e, category=safe.category)
-        await asyncio.sleep(max(1, interval_s))
+    lock_fd = None
+    try:
+        while lock_fd is None:
+            lock_fd = _try_acquire_case_outbox_lock()
+            if lock_fd is None:
+                await asyncio.sleep(max(1, interval_s))
+        log.info("case_outbox_loop_starting", interval_seconds=interval_s, limit=limit)
+        while True:
+            try:
+                report = await process_case_outbox_once(runtime, limit=limit)
+                if report.processed or report.failed or report.skipped:
+                    log.info(
+                        "case_outbox_processed",
+                        processed=report.processed,
+                        succeeded=report.succeeded,
+                        failed=report.failed,
+                        skipped=report.skipped,
+                    )
+            except Exception as e:
+                safe = classify_exception(e)
+                record_case_service_shadow_failure(path="outbox", category=safe.category)
+                log_exception("case_outbox_loop_failed", e, category=safe.category)
+            await asyncio.sleep(max(1, interval_s))
+    finally:
+        _release_case_outbox_lock(lock_fd)
 
 
 @asynccontextmanager
@@ -672,14 +705,6 @@ async def investigate_alert(
         incident_id=(case or {}).get("incident_id"),
         case_number=(case or {}).get("case_number"),
     )
-    await send_case_notification(
-        case_id=(case or {}).get("incident_id", display_title),
-        title=f"⏳ {display_title}",
-        description="Starting investigation and collecting telemetry.",
-        color=0xF39C12,
-        level=Verbosity.INFO,
-    )
-
     await _take_ownership_ack(alert_payload, case, runtime)
 
     run_started = start_run("triage")
@@ -703,12 +728,7 @@ async def investigate_alert(
             provider=safe.provider,
             model=safe.model_name,
         )
-        await notify_finish(
-            f"NOC Triage: {display_title}",
-            safe.discord_description("NOC triage"),
-            is_error=True,
-            safe_category=safe.category,
-        )
+        await _record_reactive_case_investigation_failure(alert_payload, safe)
         # Return None so callers (e.g. the proactive investigator) can tell a
         # swallowed triage failure from a successful investigation.
         return None
@@ -726,19 +746,6 @@ async def investigate_alert(
     )
     await _record_reactive_case_investigation(alert_payload, plan, graph_state)
 
-    color = _severity_color(plan.severity, plan.requires_human)
-    fields = _triage_fields(plan, alert_payload)
-    await send_case_notification(
-        case_id=(case or {}).get("incident_id", display_title),
-        title=f"Detailed Report: {display_title}",
-        description=_truncate_discord(
-            f"{'Escalated to human review' if plan.requires_human else 'Triage completed'} "
-            f"with {plan.confidence_score * 100:.1f}% confidence.",
-            DISCORD_DESCRIPTION_LIMIT,
-        ),
-        color=color,
-        fields=fields,
-    )
     return plan
 
 
@@ -778,8 +785,6 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> list[object]:
 async def _maybe_request_reactive_case_report(observation, observe_result: object) -> None:
     """Optionally let CaseService own reactive report enqueue decisions."""
     if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
-        return
-    if getattr(observation, "status", "") != "firing":
         return
     case = getattr(observe_result, "case", None)
     if case is None:
@@ -870,11 +875,20 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
             }
             if graph_summary is not None:
                 diagnosis["graph_summary"] = _safe_case_service_output_value(graph_summary)
-            await service.record_investigation_result(
+            updated = await service.record_investigation_result(
                 case.case_id,
                 diagnosis=diagnosis,
                 recommendations=[_safe_monitor_text(item, limit=240) for item in recommendations[:20]],
                 status="complete",
+            )
+            state_signature = service.report_state_signature(updated)
+            await service.request_report(
+                updated,
+                state_signature=state_signature,
+                payload={
+                    "schema": "reactive_case_investigation_v1",
+                    "model_consumption_allowed": False,
+                },
             )
             recorded_case_ids.append(case.case_id)
         if recorded_case_ids:
@@ -887,6 +901,42 @@ async def _record_reactive_case_investigation(alert_payload: dict, plan, graph_s
         safe = classify_exception(e)
         record_case_service_shadow_failure(path="reactive_primary", category=safe.category)
         log_exception("case_service_reactive_investigation_record_failed", e, category=safe.category)
+
+
+async def _record_reactive_case_investigation_failure(alert_payload: dict, safe) -> None:
+    """Record one failed triage state and update the existing case card."""
+
+    if case_service_runtime is None:
+        return
+    try:
+        service = case_service_runtime.service
+        for observation in _reactive_observations_from_alert_payload(alert_payload):
+            if getattr(observation, "status", "") != "firing":
+                continue
+            case = await service.case_for_alias("source_fp", getattr(observation, "source_fingerprint", ""))
+            if case is None:
+                continue
+            updated = await service.record_investigation_result(
+                case.case_id,
+                diagnosis={
+                    "source": "reactive_graph",
+                    "summary": safe.discord_description("NOC triage"),
+                    "failure_category": safe.category,
+                },
+                recommendations=["Use the monitor output and linked runbook while AI enrichment is unavailable."],
+                status="failed",
+                error=safe.category,
+            )
+            state_signature = service.report_state_signature(updated)
+            await service.request_report(
+                updated,
+                state_signature=state_signature,
+                payload={"schema": "reactive_case_investigation_failure_v1", "model_consumption_allowed": False},
+            )
+    except Exception as exc:
+        classified = classify_exception(exc)
+        record_case_service_shadow_failure(path="reactive_failure_report", category=classified.category)
+        log_exception("case_service_reactive_failure_record_failed", exc, category=classified.category)
 
 
 async def _case_service_case_for_identifier(identifier: str):
@@ -1632,6 +1682,52 @@ async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[ob
     return results
 
 
+def _uses_deterministic_self_health_triage(alert_payload: dict) -> bool:
+    """Self-health checks must not invoke the dependency they are checking."""
+
+    labels = _labels(alert_payload)
+    identifiers = {
+        str(labels.get(key) or "").strip().lower()
+        for key in ("alertname", "service", "check_command")
+        if labels.get(key)
+    }
+    deterministic_detectors = {
+        "engineering-loop",
+        "engineering-loop-timer",
+        "noc-agent-health",
+        "noc-agent-config-health",
+        "noc-agent-mcp-health",
+        "noc-agent-model-health",
+        "nocagentmodelfallbackactive",
+        "nocagentallmodelsfailing",
+    }
+    return not identifiers.isdisjoint(deterministic_detectors)
+
+
+async def _record_deterministic_self_health_case(case, alert_payload: dict) -> None:
+    service = case_service_runtime.service
+    summary = str((_first_alert(alert_payload).get("annotations") or {}).get("summary") or "")
+    if not summary:
+        summary = str((alert_payload.get("commonAnnotations") or {}).get("summary") or "Self-health check failed.")
+    updated = await service.record_investigation_result(
+        case.case_id,
+        diagnosis={
+            "source": "deterministic_self_health",
+            "summary": _safe_monitor_text(summary, limit=700),
+            "model_invocation_skipped": True,
+        },
+        recommendations=["Use the check output and service health endpoint; AI triage is intentionally bypassed."],
+        status="deterministic",
+    )
+    state_signature = service.report_state_signature(updated)
+    await service.request_report(
+        updated,
+        state_signature=state_signature,
+        payload={"schema": "deterministic_self_health_v1", "model_consumption_allowed": False},
+    )
+    log.info("deterministic_self_health_triage", case_id=case.case_id, notification_route=case.notification_route)
+
+
 async def _case_service_reactive_primary_response(
     alert_payload: dict, background_tasks: BackgroundTasks, *, label: str
 ) -> dict:
@@ -1641,7 +1737,10 @@ async def _case_service_reactive_primary_response(
     investigation_result = _case_service_reactive_investigation_result(shadow_results)
     case = getattr(result, "case", None) if result is not None else None
     investigation_case = getattr(investigation_result, "case", None) if investigation_result is not None else None
-    if investigation_case is not None:
+    if investigation_case is not None and _uses_deterministic_self_health_triage(alert_payload):
+        await _record_deterministic_self_health_case(investigation_case, alert_payload)
+        investigation_case = None
+    elif investigation_case is not None:
         investigation_case = await case_service_runtime.service.claim_investigation(investigation_case)
     if investigation_case is not None:
         investigation_payload = _case_service_alert_payload_for_result(alert_payload, investigation_result)
@@ -1748,6 +1847,9 @@ def _reactive_observations_from_alert_payload(alert_payload: dict):
 def _reactive_report_payload(case, observation) -> dict[str, object]:
     """Bounded, known-safe schema for untrusted monitor text entering outbox."""
 
+    route_label = {"network": "NOC", "ai": "AI", "ci": "CI"}.get(
+        str(getattr(case, "notification_route", "network")), "NOC"
+    )
     return {
         "schema": "reactive_case_report_v1",
         "untrusted_monitor_text": True,
@@ -1757,7 +1859,7 @@ def _reactive_report_payload(case, observation) -> dict[str, object]:
         "detector": _safe_monitor_text(getattr(observation, "detector", ""), limit=120),
         "resource": _safe_monitor_text(getattr(observation, "resource", ""), limit=180),
         "title": _safe_monitor_text(
-            f"NOC case {getattr(case, 'case_number', '') or getattr(case, 'case_id', '')}: {getattr(case, 'title', '')}",
+            f"{route_label} case {getattr(case, 'case_number', '') or getattr(case, 'case_id', '')}: {getattr(case, 'title', '')}",
             limit=180,
         ),
         "description": _safe_monitor_text(

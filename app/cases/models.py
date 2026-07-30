@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 Severity = Literal["HIGH", "MEDIUM", "LOW", "UNKNOWN"]
+NotificationRoute = Literal["network", "ai", "ci"]
 CaseKind = Literal["atomic", "meta"]
 ObservationStatus = Literal["firing", "clean", "resolved", "unknown"]
 SourceHealth = Literal["healthy", "degraded", "unknown", "failed"]
@@ -166,6 +167,7 @@ class ObservationRecord(BaseModel):
     site: str = ""
     customer: str = ""
     severity: Severity = "UNKNOWN"
+    notification_route: NotificationRoute = "network"
     status: ObservationStatus = "unknown"
     observed_at: str = Field(default_factory=utc_now)
     received_at: str = Field(default_factory=utc_now)
@@ -251,6 +253,7 @@ class AtomicCaseProjection(BaseModel):
     customer: str = ""
     service: str = ""
     severity: Severity = "UNKNOWN"
+    notification_route: NotificationRoute = "network"
     status: CaseStatus = "investigating"
     opened_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -268,6 +271,10 @@ class AtomicCaseProjection(BaseModel):
     last_reported_at: str = ""
     last_reported_signature: str = ""
     last_reasserted_at: str = ""
+    discord_message_id: str = ""
+    discord_channel_id: str = ""
+    discord_last_state_signature: str = ""
+    discord_last_reminder_at: str = ""
     last_investigated_at: str = ""
     diagnosis_signature: str = ""
     last_diagnosis: dict[str, Any] = Field(default_factory=dict)

@@ -1,9 +1,11 @@
 import asyncio
 
 import pytest
+from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
 from app.cases import CaseHandoff, CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor, VerificationObjective
-from app.cases.handlers import build_default_outbox_handlers, build_engineering_lhp_handoff_handler, build_handoff_handler, build_report_handler
+from app.cases.handlers import build_default_outbox_handlers, build_discord_reminder_handler, build_engineering_lhp_handoff_handler, build_handoff_handler, build_report_handler
 from app.config import LoopHandoffSettings
 from app.proactive.handoff import GitHubHandoff
 
@@ -58,6 +60,7 @@ async def test_report_handler_sends_notification_and_marks_case_reported():
 
     async def notifier(**kwargs):
         sent.append(kwargs)
+        return SimpleNamespace(message_id="discord-123", channel_id="noc-channel", action="created")
 
     report = await OutboxProcessor(
         store,
@@ -68,14 +71,96 @@ async def test_report_handler_sends_notification_and_marks_case_reported():
     assert report.succeeded == 1
     assert sent
     assert sent[0]["case_id"] == created.case.case_id
+    assert sent[0]["route"] == "network"
+    assert sent[0]["message_id"] == ""
     assert "NOC case" in sent[0]["title"]
     stored_case = await store.get_case(created.case.case_id)
     assert stored_case is not None
     assert getattr(stored_case, "last_reported_signature") == state_signature
+    assert getattr(stored_case, "discord_message_id") == "discord-123"
+    assert getattr(stored_case, "discord_channel_id") == "noc-channel"
     stored_intent = (await store.list_outbox())[0]
     assert stored_intent.outbox_id == intent.outbox_id
     assert stored_intent.status == "succeeded"
     assert stored_intent.external_url.endswith(f"/control/cases/{created.case.case_number or created.case.case_id}")
+    assert stored_intent.external_id == "discord-123"
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_critical_gets_one_six_hour_reminder():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(
+            source="alertmanager",
+            rule_id="BGPSessionDown",
+            resource="cr1:peer",
+            status="firing",
+            severity="HIGH",
+            notification_route="network",
+            signal_snapshot={"state": "down"},
+        )
+    )
+    assert created.case is not None
+    case = created.case.model_copy(deep=True)
+    now = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    case.last_reported_at = (now - timedelta(hours=7)).isoformat()
+    case.discord_message_id = "card-1"
+    await store.upsert_case(case)
+
+    intents = await service.request_due_critical_reminders(now=now)
+    duplicate = await service.request_due_critical_reminders(now=now)
+    assert len(intents) == 1
+    assert duplicate[0].outbox_id == intents[0].outbox_id
+
+    sent = []
+
+    async def notifier(**kwargs):
+        sent.append(kwargs)
+        return SimpleNamespace(message_id="reminder-1", channel_id="noc", action="created")
+
+    report = await OutboxProcessor(
+        store,
+        {"discord_update": build_discord_reminder_handler(service, notifier=notifier)},
+    ).process_pending()
+
+    assert report.succeeded == 1
+    assert len(sent) == 1
+    assert sent[0]["route"] == "network"
+    stored = await store.get_case(case.case_id)
+    assert stored is not None and getattr(stored, "discord_last_reminder_at")
+
+
+@pytest.mark.asyncio
+async def test_acknowledgement_updates_existing_card_and_stops_reminders():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(
+        ObservationRecord(
+            source="alertmanager",
+            rule_id="BGPSessionDown",
+            resource="cr1:peer",
+            status="firing",
+            severity="HIGH",
+            notification_route="network",
+            signal_snapshot={"state": "down"},
+        )
+    )
+    assert created.case is not None
+    case = created.case.model_copy(deep=True)
+    case.discord_message_id = "card-1"
+    case.last_reported_at = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
+    await store.upsert_case(case)
+
+    acked = await service.ack(case.case_id, operator="alice")
+    reminders = await service.request_due_critical_reminders()
+
+    assert acked.acknowledged_by == "alice"
+    assert reminders == []
+    pending = await store.list_outbox(status="pending")
+    assert len(pending) == 1
+    assert pending[0].intent_type == "report"
+    assert pending[0].payload["schema"] == "case_acknowledgement_v1"
 
 
 @pytest.mark.asyncio
@@ -323,14 +408,15 @@ async def test_default_handlers_include_knowledge_candidate_and_handoff_only_whe
     store = InMemoryCaseStore()
     service = CaseService(store)
 
-    assert set(build_default_outbox_handlers(service)) == {"report"}
+    base_handlers = {"report", "discord_update"}
+    assert set(build_default_outbox_handlers(service)) == base_handlers
     assert set(build_default_outbox_handlers(service, knowledge_candidate_dir=tmp_path)) == {
-        "report",
+        *base_handlers,
         "knowledge_candidate",
     }
     handoff = GitHubHandoff(repo="o/r", token="t", requester=FakeGitHub().request)
     assert set(build_default_outbox_handlers(service, knowledge_candidate_dir=tmp_path, handoff_client=handoff)) == {
-        "report",
+        *base_handlers,
         "knowledge_candidate",
         "handoff",
     }
@@ -341,10 +427,10 @@ async def test_default_handlers_include_knowledge_candidate_and_handoff_only_whe
             handoff_client=handoff,
             engineering_handoff_client=handoff,
         )
-    ) == {"report", "knowledge_candidate", "handoff", "engineering_handoff_requested"}
+    ) == {*base_handlers, "knowledge_candidate", "handoff", "engineering_handoff_requested"}
     assert set(
         build_default_outbox_handlers(
             service,
             loop_handoff_settings=LoopHandoffSettings(enabled=True, knowledge_context_enabled=True, knowledge_candidate_dir=str(tmp_path)),
         )
-    ) == {"report", "knowledge_context_requested", "knowledge_artifact_proposed"}
+    ) == {*base_handlers, "knowledge_context_requested", "knowledge_artifact_proposed"}

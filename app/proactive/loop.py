@@ -123,8 +123,8 @@ class ProactiveLoop:
         # Digest de-dup: remember the last reported hotspot set + when, so an
         # unchanged set doesn't re-post every scan cycle (it re-asserts at most
         # every report_reassert_s).
-        self._last_report_signature: frozenset[tuple[str, str]] | None = None
-        self._last_report_ts = 0.0
+        self._report_state_path = self._state_dir / "discord-report-state.json"
+        self._last_report_signature, self._last_report_ts = self._load_report_state()
         # Deep rules (disk, TLS) only run on deep cycles. Remember their last
         # *clean* result so cheap-only / degraded cycles don't read "not scanned"
         # as "resolved" and post a false all-clear. _last_effective is the last
@@ -133,6 +133,28 @@ class ProactiveLoop:
         self._last_effective: list[Hotspot] = []
         # Lazy OKF citation lookup for insight records (built on first use).
         self._insight_knowledge_lookup: Any | None = None
+
+    def _load_report_state(self) -> tuple[frozenset[tuple[str, str]] | None, float]:
+        try:
+            payload = json.loads(self._report_state_path.read_text(encoding="utf-8"))
+            signature = frozenset(
+                (str(item[0]), str(item[1]))
+                for item in payload.get("signature", [])
+                if isinstance(item, list | tuple) and len(item) == 2
+            )
+            return signature, float(payload.get("reported_at", 0.0) or 0.0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None, 0.0
+
+    def _save_report_state(self) -> None:
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "signature": sorted([list(item) for item in (self._last_report_signature or frozenset())]),
+            "reported_at": self._last_report_ts,
+        }
+        temporary = self._report_state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(self._report_state_path)
 
     # --- lifecycle --------------------------------------------------------
 
@@ -524,6 +546,7 @@ class ProactiveLoop:
             description="\n".join(lines) or "non-urgent findings muted",
             color=0x95A5A6,
             level=Verbosity.INFO,
+            route="network",
         )
 
     async def _shadow_observe_hotspots(
@@ -715,7 +738,7 @@ class ProactiveLoop:
         Returns ``(should_post, signature, now)``."""
         signature = frozenset((h.fingerprint(), h.severity) for h in report.hotspots)
         now = time.time()
-        if report.investigated or report.handoffs:
+        if report.handoffs:
             return True, signature, now
         if not report.hotspots:
             # All-clear: post once iff we previously reported an active set, so
@@ -744,6 +767,7 @@ class ProactiveLoop:
                 # Commit de-dup state only after a successful send, so a transient
                 # webhook failure doesn't suppress the next retry.
                 self._last_report_signature, self._last_report_ts = signature, now
+                self._save_report_state()
                 posted = True
                 await self._case_service_mark_reported_hotspots(report)
         try:
@@ -778,6 +802,7 @@ class ProactiveLoop:
                 description="All previously flagged hotspots have resolved.",
                 color=0x2ECC71,
                 level=Verbosity.INFO,
+                route="network",
             )
             return
         top = report.top(6)
@@ -809,6 +834,7 @@ class ProactiveLoop:
             color=color,
             fields=fields,
             level=Verbosity.INFO,
+            route="network",
         )
 
     async def _case_for_hotspot(self, hotspot: Hotspot) -> dict[str, Any] | None:

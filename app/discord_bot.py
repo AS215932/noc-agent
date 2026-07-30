@@ -6,7 +6,7 @@ import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
 
 from app import log
@@ -60,6 +60,20 @@ class OperatorResponse:
     content: str
     thread_required: bool = False
     incident_id: str | None = None
+
+
+def _is_discord_not_found(exc: Exception) -> bool:
+    return discord is not None and isinstance(exc, discord.NotFound)
+
+
+def _case_delivery_result(message, channel, *, action: Literal["created", "updated", "replaced"]):
+    from app.discord import DiscordDeliveryResult
+
+    return DiscordDeliveryResult(
+        message_id=str(getattr(message, "id", "")),
+        channel_id=str(getattr(channel, "id", "")),
+        action=action,
+    )
 
 
 def _current_case_service_runtime():
@@ -162,12 +176,13 @@ class NOCDiscordBot:
         description: str,
         color: int,
         fields: list[dict[str, Any]] | None = None,
+        message_id: str = "",
     ):
         if self.channel_id is None:
-            return
+            raise RuntimeError("DISCORD_BOT_CHANNEL_ID is not configured")
         channel = self.client.get_channel(self.channel_id)
         if channel is None:
-            return
+            channel = await self.client.fetch_channel(self.channel_id)
         embed = discord.Embed(title=title, description=description, color=color)
         for embed_field in fields or []:
             embed.add_field(
@@ -176,16 +191,28 @@ class NOCDiscordBot:
                 inline=bool(embed_field.get("inline", False)),
             )
         message = self._case_messages.get(case_id)
+        if message_id and str(getattr(message, "id", "")) != str(message_id):
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except Exception as exc:
+                if not _is_discord_not_found(exc):
+                    safe = classify_exception(exc)
+                    log_exception("discord_case_embed_fetch_failed", exc, category=safe.category, case_id=case_id)
+                    raise
+                message = None
         if message is not None and callable(getattr(message, "edit", None)):
             try:
                 await message.edit(embed=embed)
                 self._remember_case_message(case_id, message)
-                return
+                return _case_delivery_result(message, channel, action="updated")
             except Exception as exc:
                 safe = classify_exception(exc)
                 log_exception("discord_case_embed_edit_failed", exc, category=safe.category, case_id=case_id)
+                if not _is_discord_not_found(exc):
+                    raise
         sent = await channel.send(embed=embed)
         self._remember_case_message(case_id, sent)
+        return _case_delivery_result(sent, channel, action="replaced" if message_id else "created")
 
     def _remember_case_message(self, case_id: str, message) -> None:
         if self._max_case_messages <= 0:

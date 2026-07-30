@@ -44,6 +44,9 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
         handlers,
         retry_backoff_s=_env_int("NOC_CASE_OUTBOX_RETRY_BACKOFF_S", 60),
     )
+    await runtime.service.request_due_critical_reminders(
+        interval_s=_env_int("NOC_DISCORD_CRITICAL_REMINDER_S", 21600)
+    )
     return await processor.process_pending(limit=limit or _env_int("NOC_CASE_OUTBOX_LIMIT", 10))
 
 

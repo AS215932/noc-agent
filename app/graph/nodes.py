@@ -534,6 +534,7 @@ class NodeRunner:
                 ),
                 color=0x3498DB if executed else 0xE67E22,
                 level=Verbosity.INFO,
+                route="network",
             )
         except Exception:  # audit post is advisory; execution trace still records it
             return

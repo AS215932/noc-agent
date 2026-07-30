@@ -74,6 +74,31 @@ class FakeThread:
         self.messages.append((content, kwargs))
 
 
+class FakeCardMessage:
+    def __init__(self, message_id: int):
+        self.id = message_id
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+
+
+class FakeCardChannel:
+    def __init__(self):
+        self.id = 99
+        self.messages = {}
+        self.fetches = []
+
+    async def send(self, **kwargs):
+        message = FakeCardMessage(len(self.messages) + 1)
+        self.messages[message.id] = message
+        return message
+
+    async def fetch_message(self, message_id):
+        self.fetches.append(message_id)
+        return self.messages[message_id]
+
+
 class FakeMCPSession:
     def __init__(self):
         self.calls = []
@@ -208,6 +233,29 @@ async def test_bot_start_uses_shared_mcp_runtime(monkeypatch):
     await bot.start()
 
     assert calls == ["connect", ("start", "token"), "disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_case_card_id_survives_process_local_cache_loss(monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_CHANNEL_ID", "99")
+    channel = FakeCardChannel()
+    bot = NOCDiscordBot()
+    monkeypatch.setattr(bot.client, "get_channel", lambda _channel_id: channel)
+
+    created = await bot.send_case_embed("case-1", "Router down", "BGP failed", 0xE74C3C)
+    bot._case_messages.clear()
+    updated = await bot.send_case_embed(
+        "case-1",
+        "Router recovered",
+        "BGP established",
+        0x2ECC71,
+        message_id=created.message_id,
+    )
+
+    assert created.action == "created"
+    assert updated.action == "updated"
+    assert channel.fetches == [1]
+    assert channel.messages[1].edits
 
 
 @pytest.mark.asyncio

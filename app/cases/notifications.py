@@ -5,7 +5,51 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from app.cases.models import ObservationRecord, ObservationStatus, Severity, stable_json
+from app.cases.models import NotificationRoute, ObservationRecord, ObservationStatus, Severity, stable_json
+
+
+AI_ROUTE_TERMS = (
+    "engineering-loop",
+    "engineering_loop",
+    "noc-agent-model",
+    "noc_agent_model",
+    "noc-agent-mcp",
+    "noc_agent_mcp",
+    "knowledge-mcp",
+    "agentic-observatory",
+    "model-fallback",
+    "allmodels",
+    "gemini",
+    "openrouter",
+    "venice",
+)
+CI_ROUTE_TERMS = ("ci-runner", "pipeline", "workflow", "deploy", "promotion", "drift-detection")
+
+
+def notification_route_for(
+    *,
+    labels: dict[str, Any] | None = None,
+    tags: dict[str, Any] | None = None,
+    detector: str = "",
+    service: str = "",
+) -> NotificationRoute:
+    """Resolve an explicit route, with a deterministic compatibility fallback.
+
+    Routing never invokes a model. Unknown production alerts deliberately land
+    in the network/NOC channel so a missing label cannot hide an incident.
+    """
+
+    labels = labels or {}
+    tags = tags or {}
+    explicit = str(labels.get("notification_route") or tags.get("notification_route") or "").strip().lower()
+    if explicit in {"network", "ai", "ci"}:
+        return explicit  # type: ignore[return-value]
+    subject = " ".join((detector, service)).lower()
+    if any(term in subject for term in AI_ROUTE_TERMS):
+        return "ai"
+    if any(term in subject for term in CI_ROUTE_TERMS):
+        return "ci"
+    return "network"
 
 
 def observations_from_alertmanager(payload: dict[str, Any]) -> list[ObservationRecord]:
@@ -31,6 +75,7 @@ def observations_from_alertmanager(payload: dict[str, Any]) -> list[ObservationR
         detector = str(labels.get("alertname") or payload.get("receiver") or "alertmanager")
         resource = _first_label(labels, "host", "instance", "device", "router", "node", "target")
         service = _first_label(labels, "service", "job", "check", "alertname")
+        notification_route = notification_route_for(labels=labels, detector=detector, service=service)
         starts_at = str(alert.get("startsAt") or alert.get("starts_at") or "")
         signal_snapshot = {
             "labels": labels,
@@ -54,6 +99,7 @@ def observations_from_alertmanager(payload: dict[str, Any]) -> list[ObservationR
                 site=_first_label(labels, "site", "pop", "region"),
                 customer=_first_label(labels, "customer", "tenant"),
                 severity=_severity(labels.get("severity") or labels.get("priority") or "UNKNOWN"),
+                notification_route=notification_route,
                 status=status,
                 observed_at=starts_at,
                 labels=labels,
@@ -76,9 +122,13 @@ def observation_from_icinga_alert_payload(payload: dict[str, Any]) -> Observatio
     first_alert = alerts[0] if alerts and isinstance(alerts[0], dict) else {}
     labels = {**labels, **_dict(first_alert.get("labels"))}
     annotations = {**annotations, **_dict(first_alert.get("annotations"))}
+    tags = _dict(payload.get("tags"))
+    if tags.get("notification_route") and not labels.get("notification_route"):
+        labels["notification_route"] = tags["notification_route"]
     detector = str(labels.get("alertname") or labels.get("service") or labels.get("check_command") or "icinga-check")
     resource = str(labels.get("host") or labels.get("instance") or "")
     service = str(labels.get("service") or labels.get("check_command") or detector)
+    notification_route = notification_route_for(labels=labels, tags=tags, detector=detector, service=service)
     state = str(labels.get("state") or first_alert.get("status") or payload.get("status") or "")
     status = _status_from_icinga(state, str(payload.get("status") or ""))
     source_event_id = _fingerprint({"source": source, "detector": detector, "resource": resource, "service": service})
@@ -86,7 +136,7 @@ def observation_from_icinga_alert_payload(payload: dict[str, Any]) -> Observatio
         "labels": labels,
         "annotations": annotations,
         "state": state,
-        "tags": _dict(payload.get("tags")),
+        "tags": tags,
     }
     return ObservationRecord(
         source=source,
@@ -99,6 +149,7 @@ def observation_from_icinga_alert_payload(payload: dict[str, Any]) -> Observatio
         resource=resource,
         service=service,
         severity=_severity(state),
+        notification_route=notification_route,
         status=status,
         labels=labels,
         annotations=annotations,
