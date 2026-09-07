@@ -825,7 +825,17 @@ async def _maybe_request_reactive_case_report(
         processor = OutboxProcessor(case_service_runtime.store, {
             "report": build_report_handler(service, notifier=send_case_notification),
         })
-        background_tasks.add_task(processor.process_intent, intent)
+        async def attempt_initial_delivery():
+            try:
+                await processor.process_intent(intent)
+            except Exception:
+                # BackgroundTasks stops at an escaping exception. Store/claim
+                # failures must not strand the investigation queued after us;
+                # the durable outbox retains retry/lease recovery ownership.
+                log.warning("case_initial_delivery_deferred", case_id=case.case_id,
+                            outbox_id=intent.outbox_id)
+
+        background_tasks.add_task(attempt_initial_delivery)
 
 
 def _case_service_reactive_primary_enabled() -> bool:

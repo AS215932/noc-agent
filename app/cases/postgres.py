@@ -722,6 +722,13 @@ class PostgresCaseStore:
             )
         return OutboxIntent.model_validate(_row_payload(row)) if row else None
 
+    async def get_outbox_by_key(self, idempotency_key: str) -> OutboxIntent | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payload FROM side_effect_outbox WHERE idempotency_key = $1", idempotency_key
+            )
+        return OutboxIntent.model_validate(_row_payload(row)) if row else None
+
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
         async with self.pool.acquire() as conn:
             if status:

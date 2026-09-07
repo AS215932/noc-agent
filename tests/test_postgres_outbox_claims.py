@@ -109,6 +109,9 @@ async def test_postgres_claim_fencing_and_legacy_payload():
             + ",".join(map(sql_literal, [intent.outbox_id, "report", intent.idempotency_key, intent.status, json.dumps(payload)]))
             + ");")
         try:
+            found = await store.get_outbox_by_key(intent.idempotency_key)
+            assert found is not None and found.outbox_id == intent.outbox_id
+            assert await store.get_outbox_by_key(intent.idempotency_key + ":missing") is None
             recovered = intent.model_copy(update={"claim_token": "new-claim"})
             assert await store.update_outbox_if_status(
                 recovered, expected_status="in_progress", expected_claim_token="incorrect-token",

@@ -94,15 +94,19 @@ def build_report_handler(
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
         update = intent.payload.get("card_update")
         if isinstance(update, dict):
+            current_signature = case_service.report_state_signature(case)
             if (reactive_reporting_owns_cards() and case.identity.get("source") in {"alertmanager", "icinga2"}
-                    and not case.last_reported_at):
+                    and (not case.last_reported_at or case.last_reported_signature != current_signature)):
                 initial_level = _case_report_level(case)
                 if initial_level < get_verbosity():
                     return OutboxHandlerResult(payload_updates={"notification_suppressed": "initial_report_verbosity"})
-                # A model result may finish while the initial Discord send is
-                # retrying. Keep its update queued instead of creating the first
-                # card with only investigation/dependency-failure information.
-                raise RuntimeError("Initial case card has not been delivered")
+                initial = await case_service.store.get_outbox_by_key(f"report:{case.case_id}:{current_signature}")
+                # A legacy card may already have a newer revision. Its completed
+                # superseded report establishes card existence without pretending
+                # these facts were delivered or advancing the reminder clock.
+                if not (initial and initial.status == "succeeded"
+                        and initial.payload.get("notification_superseded") is True):
+                    raise RuntimeError("Current case facts have not been delivered")
             title = str(update["title"])
             description = str(update["description"])
             fields = update.get("fields") or []
