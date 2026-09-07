@@ -653,8 +653,10 @@ async def investigate_alert(
     *,
     mcp_runtime=None,
     graph_memory=None,
+    case_runtime=None,
 ):
     runtime = mcp_runtime if mcp_runtime is not None else globals()["mcp_runtime"]
+    notification_runtime = case_runtime if case_runtime is not None else case_service_runtime
     event = (case or {}).get("latest_event") or case_event_from_alert(alert_payload)
     display_title = case_display_title(case, event)
     if _is_recovery_alert(alert_payload):
@@ -705,7 +707,7 @@ async def investigate_alert(
             model=safe.model_name,
         )
         await send_investigation_card(
-            runtime=case_service_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
+            runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
             notifier=send_case_notification,
             case_id=(case or {}).get("incident_id", display_title),
             safe_category=safe.category,
@@ -734,7 +736,7 @@ async def investigate_alert(
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
     await send_investigation_card(
-        runtime=case_service_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
+        runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
         notifier=send_case_notification,
         case_id=(case or {}).get("incident_id", display_title),
         title=f"Detailed Report: {display_title}",
