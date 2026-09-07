@@ -76,12 +76,14 @@ async def send_case_notification(
     color: int = 0x3498db,
     fields: list[dict[str, Any]] | None = None,
     level: Verbosity = Verbosity.INFO,
+    revision: float | None = None,
 ) -> bool:
     if level < get_verbosity():
         return False
     if CASE_BOT_NOTIFIER is not None:
         return bool(await CASE_BOT_NOTIFIER(
             case_id=case_id,
+            revision=revision,
             title=title,
             description=description,
             color=color,
@@ -112,6 +114,7 @@ async def send_case_notification(
             destination=f"webhook:{url}",
             case_id=case_id,
             payload=payload,
+            revision=revision,
             create=create,
             edit=edit,
         )

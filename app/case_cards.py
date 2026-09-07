@@ -32,9 +32,11 @@ async def deliver_case_card(
     destination: str,
     case_id: str,
     payload: dict[str, Any],
+    revision: float | None = None,
     create: Callable[[], Awaitable[int | None]],
     edit: Callable[[int], Awaitable[bool]],
 ) -> bool:
+    revision = time.time() if revision is None else revision
     directory = os.getenv("DISCORD_CASE_STATE_DIR") or str(
         Path(os.getenv("MAIL_DRAFT_DIR", "data/mail-drafts")) / ".notifications" / "case-cards"
     )
@@ -59,31 +61,42 @@ async def deliver_case_card(
                     state = json.loads(path.read_text())
                     message_id = state["message_id"]
                     previous = state["digest"]
+                    previous_revision = state.get("revision", 0)
+                    if not isinstance(previous_revision, (int, float)):
+                        previous_revision = 0
                     verified_at = state.get("verified_at", 0)
                     if not isinstance(verified_at, (int, float)):
                         verified_at = 0
                     if type(message_id) is not int or message_id <= 0 or not isinstance(previous, str):
                         raise ValueError("invalid card state")
                 except FileNotFoundError:
-                    message_id, previous, verified_at = None, None, 0
+                    message_id, previous, verified_at, previous_revision = None, None, 0, 0
                 except (ValueError, KeyError, TypeError):
                     log.warn("discord_case_state_invalid", case_id=case_id)
-                    message_id, previous, verified_at = None, None, 0
+                    message_id, previous, verified_at, previous_revision = None, None, 0, 0
+                verified_now = time.time()
                 if message_id is not None:
-                    if previous == digest and 0 <= time.time() - verified_at < CARD_REFRESH_S:
+                    if revision < previous_revision:
                         return True
-                    try:
-                        if not await asyncio.wait_for(edit(message_id), timeout=DELIVERY_TIMEOUT_S):
-                            return False
-                    except CardNotFound:
-                        message_id = None
+                    if previous == digest and 0 <= verified_now - verified_at < CARD_REFRESH_S:
+                        if revision == previous_revision:
+                            return True
+                        # Advance ordering without a network request or falsely
+                        # refreshing the last time Discord confirmed the card.
+                        verified_now = verified_at
+                    else:
+                        try:
+                            if not await asyncio.wait_for(edit(message_id), timeout=DELIVERY_TIMEOUT_S):
+                                return False
+                        except CardNotFound:
+                            message_id = None
                 if message_id is None:
                     message_id = await asyncio.wait_for(create(), timeout=DELIVERY_TIMEOUT_S)
                     if type(message_id) is not int or message_id <= 0:
                         return False
                 temporary = path.with_suffix(".tmp")
                 with temporary.open("w") as output:
-                    json.dump({"message_id": message_id, "digest": digest, "verified_at": time.time()}, output)
+                    json.dump({"message_id": message_id, "digest": digest, "verified_at": verified_now, "revision": revision}, output)
                     output.write("\n")
                     output.flush()
                     os.fsync(output.fileno())

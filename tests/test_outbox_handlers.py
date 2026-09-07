@@ -386,3 +386,96 @@ async def test_report_outbox_retries_failed_delivery_before_marking_reported(tmp
     assert case.last_reported_signature == signature
     assert (await store.list_outbox())[0].status == "succeeded"
     assert create.await_count == 2
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("severity,verbosity", [("LOW", "WARNING"), ("HIGH", "ERROR")])
+async def test_verbosity_filtered_reports_complete_without_retry_or_report_stamp(monkeypatch, severity, verbosity):
+    from unittest.mock import AsyncMock
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", verbosity)
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity=severity,
+    ))
+    await service.request_report(created.case)
+    notifier = AsyncMock(return_value=False)
+    result = await OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}).process_pending()
+    assert result.succeeded == 1 and result.failed == 0
+    notifier.assert_not_called()
+    intent = (await store.list_outbox())[0]
+    assert intent.payload["notification_suppressed"] == "verbosity"
+    assert not (await store.get_case(created.case.case_id)).last_reported_signature
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_card_edit_retries_from_outbox(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from app.case_cards import deliver_case_card
+    from app.cases.reporting import send_investigation_card
+    from app.discord import Verbosity
+
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+    ))
+    create = AsyncMock(return_value=123)
+    edit = AsyncMock(side_effect=[TimeoutError("temporary"), True])
+    async def notifier(**kwargs):
+        return await deliver_case_card(
+            destination="bot:999:42", case_id=kwargs["case_id"],
+            payload={"title": kwargs["title"]}, revision=kwargs.get("revision"),
+            create=create, edit=edit,
+        )
+    assert await notifier(case_id=created.case.case_id, title="Starting investigation")
+    assert not await send_investigation_card(
+        runtime=SimpleNamespace(store=store), case_id=created.case.case_id, notifier=notifier,
+        title="Investigation unavailable", description="Dependency failed", color=0, level=Verbosity.ERROR,
+    )
+    pending = await store.list_outbox(status="pending")
+    assert len(pending) == 1
+    result = await OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}).process_pending()
+    assert result.succeeded == 1
+    assert edit.await_count == 2
+    create.assert_awaited_once()
+    assert (await store.list_outbox())[0].payload["card_update_delivered"] is True
+
+
+@pytest.mark.asyncio
+async def test_old_intake_report_cannot_overwrite_newer_terminal_card(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from app.case_cards import deliver_case_card
+    from app.cases.reporting import send_investigation_card
+    from app.discord import Verbosity
+
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+    ))
+    intake = await service.request_report(created.case)
+    intake.created_at = "2000-01-01T00:00:00+00:00"
+    await store.update_outbox_if_status(intake, expected_status="pending")
+    sent = []
+    async def notifier(**kwargs):
+        async def create():
+            sent.append(kwargs["title"])
+            return 123
+        async def edit(message_id):
+            sent.append(kwargs["title"])
+            return True
+        return await deliver_case_card(
+            destination="bot:999:42", case_id=kwargs["case_id"],
+            payload={"title": kwargs["title"]}, revision=kwargs.get("revision"),
+            create=create, edit=edit,
+        )
+    assert await send_investigation_card(
+        runtime=SimpleNamespace(store=store), case_id=created.case.case_id, notifier=notifier,
+        title="Investigation unavailable", description="Dependency failed", color=0, level=Verbosity.ERROR,
+    )
+    result = await OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}).process_pending()
+    assert result.succeeded == 2
+    assert sent == ["Investigation unavailable"]

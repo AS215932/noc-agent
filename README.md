@@ -325,9 +325,16 @@ Set `DISCORD_CASE_STATE_DIR` to override the state directory. The default is
 `${MAIL_DRAFT_DIR}/.notifications/case-cards` when `MAIL_DRAFT_DIR` is configured,
 otherwise `data/mail-drafts/.notifications/case-cards`. All workers serving the same
 destination must share this writable persistent directory. It contains only
-hashed destination/case keys, message IDs, content hashes, and last-verified times; retain it during
+hashed destination/case keys, message IDs, content hashes, event revisions, and last-verified times; retain it during
 deployments. Changing the bot account, channel, or webhook creates a separate destination
 identity. Bot permissions must allow sending and editing its own messages.
+
+Event revisions prevent delayed outbox reports from replacing newer triage
+results. With `NOC_CASE_OUTBOX_ENABLED=1` (the production setting), terminal
+investigation updates are queued durably before their immediate delivery attempt;
+failed sends are retried by the existing outbox worker. Intentionally filtered
+reports complete as suppressed, without being stamped as delivered. Standalone
+use without the case outbox has three bounded attempts but no durable retry.
 
 The state file is atomically replaced after successful delivery. A process crash
 between Discord accepting a new message and recording its ID can still produce

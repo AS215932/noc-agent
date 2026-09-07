@@ -161,6 +161,7 @@ class NOCDiscordBot:
         description: str,
         color: int,
         fields: list[dict[str, Any]] | None = None,
+        revision: float | None = None,
     ) -> bool:
         if self.channel_id is None or self.client.user is None:
             return False
@@ -192,6 +193,7 @@ class NOCDiscordBot:
             destination=f"bot:{self.client.user.id}:{self.channel_id}",
             case_id=case_id,
             payload=embed.to_dict(),
+            revision=revision,
             create=create,
             edit=edit,
         )

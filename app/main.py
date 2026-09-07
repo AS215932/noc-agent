@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, suppress
 
 from app import log
 from app.agent import noc_triage_agent
+from app.cases.reporting import send_investigation_card
 from app.model_metrics import record_sanitized_discord_failure
 from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
 from app.icinga_ack import acknowledge_icinga
@@ -704,7 +705,9 @@ async def investigate_alert(
             provider=safe.provider,
             model=safe.model_name,
         )
-        delivered = await send_case_notification(
+        delivered = await send_investigation_card(
+            runtime=case_service_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
+            notifier=send_case_notification,
             case_id=(case or {}).get("incident_id", display_title),
             title=f"❌ Investigation unavailable: {display_title}",
             description=safe.discord_description("NOC triage"),
@@ -732,7 +735,9 @@ async def investigate_alert(
 
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
-    await send_case_notification(
+    await send_investigation_card(
+        runtime=case_service_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
+        notifier=send_case_notification,
         case_id=(case or {}).get("incident_id", display_title),
         title=f"Detailed Report: {display_title}",
         description=_truncate_discord(

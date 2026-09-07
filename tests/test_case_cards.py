@@ -81,7 +81,7 @@ async def test_destinations_and_cases_have_independent_identities(tmp_path):
     files = list(tmp_path.glob("*.json"))
     assert len(files) == 3
     for path in files:
-        assert set(json.loads(path.read_text())) == {"message_id", "digest", "verified_at"}
+        assert set(json.loads(path.read_text())) == {"message_id", "digest", "verified_at", "revision"}
         assert "private-token" not in path.name + path.read_text()
 
 
@@ -265,3 +265,14 @@ async def test_hung_transport_is_bounded_and_releases_case_lock(monkeypatch):
         await asyncio.Event().wait()
     assert not await deliver(hung, AsyncMock())
     assert await deliver(AsyncMock(return_value=123), AsyncMock())
+
+@pytest.mark.asyncio
+async def test_identical_newer_revision_also_blocks_intermediate_stale_content():
+    create, edit = AsyncMock(return_value=123), AsyncMock(return_value=True)
+    for revision, title in [(1, "latest"), (3, "latest"), (2, "stale")]:
+        assert await deliver_case_card(
+            destination="bot:42", case_id="case-1", payload={"title": title},
+            revision=revision, create=create, edit=edit,
+        )
+    create.assert_awaited_once()
+    edit.assert_not_called()
