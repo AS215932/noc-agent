@@ -16,7 +16,6 @@ from contextlib import asynccontextmanager, suppress
 from app import log
 from app.agent import noc_triage_agent
 from app.cases.reporting import send_investigation_card
-from app.model_metrics import record_sanitized_discord_failure
 from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
 from app.icinga_ack import acknowledge_icinga
 from app.discord import install_bot_notifier, install_case_notifier
@@ -705,17 +704,16 @@ async def investigate_alert(
             provider=safe.provider,
             model=safe.model_name,
         )
-        delivered = await send_investigation_card(
+        await send_investigation_card(
             runtime=case_service_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
             notifier=send_case_notification,
             case_id=(case or {}).get("incident_id", display_title),
+            safe_category=safe.category,
             title=f"❌ Investigation unavailable: {display_title}",
             description=safe.discord_description("NOC triage"),
             color=0xE74C3C,
             level=Verbosity.ERROR,
         )
-        if delivered:
-            record_sanitized_discord_failure(safe.category)
         # Return None so callers (e.g. the proactive investigator) can tell a
         # swallowed triage failure from a successful investigation.
         return None

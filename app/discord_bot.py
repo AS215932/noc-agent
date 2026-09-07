@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from app import log
-from app.case_cards import CardNotFound, deliver_case_card
+from app.case_cards import CardDeliveryOutcome, CardNotFound, deliver_case_card
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.cases.models import ObservationRecord
 from app.cases.runtime import build_case_service_runtime_from_env
@@ -162,7 +162,7 @@ class NOCDiscordBot:
         color: int,
         fields: list[dict[str, Any]] | None = None,
         revision: float | None = None,
-    ) -> bool:
+    ) -> bool | CardDeliveryOutcome:
         if self.channel_id is None or self.client.user is None:
             return False
         channel = self.client.get_channel(self.channel_id)

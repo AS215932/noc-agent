@@ -479,3 +479,103 @@ async def test_old_intake_report_cannot_overwrite_newer_terminal_card(monkeypatc
     result = await OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}).process_pending()
     assert result.succeeded == 2
     assert sent == ["Investigation unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_lowering_verbosity_requeues_same_report_identity(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "ERROR")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+    ))
+    original = await service.request_report(created.case)
+    notifier = AsyncMock(return_value=True)
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)})
+    assert (await processor.process_pending()).succeeded == 1
+    same_policy = await service.request_report(created.case)
+    assert same_policy.status == "succeeded"
+    assert (await processor.process_pending()).processed == 0
+    notifier.assert_not_called()
+
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "WARNING")
+    reopened = await service.request_report(created.case)
+    assert reopened.outbox_id == original.outbox_id
+    assert reopened.status == "pending"
+    assert reopened.completed_at is None
+    assert "notification_suppressed" not in reopened.payload
+    assert (await processor.process_pending()).succeeded == 1
+    notifier.assert_awaited_once()
+    assert len(await store.list_outbox()) == 1
+    assert (await store.get_case(created.case.case_id)).last_reported_signature
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("immediate_delivery", [False, True])
+async def test_failure_metric_recorded_once_by_delivery_outbox(monkeypatch, immediate_delivery):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from app.cases.reporting import send_investigation_card
+    from app.discord import Verbosity
+
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
+    metric = Mock()
+    monkeypatch.setattr("app.cases.reporting.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+    ))
+    notifier = AsyncMock(side_effect=[immediate_delivery, True])
+    assert await send_investigation_card(
+        runtime=SimpleNamespace(store=store), case_id=created.case.case_id, notifier=notifier,
+        safe_category="infrastructure", title="Unavailable", description="Dependency failed", level=Verbosity.ERROR,
+    ) is immediate_delivery
+    metric.assert_not_called()
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)})
+    assert (await processor.process_pending()).succeeded == 1
+    metric.assert_called_once_with("infrastructure")
+    assert (await processor.process_pending()).processed == 0
+    metric.assert_called_once_with("infrastructure")
+
+
+@pytest.mark.asyncio
+async def test_superseded_failure_is_not_counted_as_delivered(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from app.case_cards import deliver_case_card
+    from app.cases.reporting import send_investigation_card
+    from app.discord import Verbosity
+
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    metric = Mock()
+    monkeypatch.setattr("app.cases.reporting.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+    ))
+    await send_investigation_card(
+        runtime=SimpleNamespace(store=store), case_id=created.case.case_id, notifier=AsyncMock(return_value=False),
+        safe_category="infrastructure", title="Unavailable", description="Dependency failed", level=Verbosity.ERROR,
+    )
+    intent = (await store.list_outbox())[0]
+    create, edit = AsyncMock(return_value=123), AsyncMock(return_value=True)
+
+    async def notifier(**kwargs):
+        return await deliver_case_card(
+            destination="bot:999:42", case_id=kwargs["case_id"],
+            payload={"title": kwargs["title"]}, revision=kwargs["revision"], create=create, edit=edit,
+        )
+
+    await notifier(case_id=created.case.case_id, title="Recovered", revision=intent.payload["card_revision"] + 1)
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)})
+    assert (await processor.process_pending()).succeeded == 1
+    metric.assert_not_called()
+    edit.assert_not_called()
+    assert (await store.list_outbox())[0].payload["notification_superseded"] is True

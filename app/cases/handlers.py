@@ -6,12 +6,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.case_cards import CardDeliveryOutcome
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.service import CaseService
 from app.config import LoopHandoffSettings
 from app.discord import Verbosity, get_verbosity, send_case_notification
+from app.model_metrics import record_sanitized_discord_failure
 from app.knowledge.lhp import build_lhp_knowledge_artifact_handler, build_lhp_knowledge_context_handler
 from app.knowledge.outbox import build_knowledge_candidate_handler
 from app.proactive.handoff import GitHubHandoff, handoff_from_env
@@ -94,7 +96,7 @@ def build_report_handler(
             color = _severity_color(case.severity)
             level = Verbosity.WARNING if case.severity in {"HIGH", "MEDIUM"} else Verbosity.INFO
         if level < get_verbosity():
-            return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity"})
+            return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
         revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
         delivered = await notifier(
             case_id=case.case_id,
@@ -107,9 +109,13 @@ def build_report_handler(
         )
         # Legacy custom notifiers return None; built-in transports explicitly
         # return False when the card has not been delivered.
+        if delivered is CardDeliveryOutcome.SUPERSEDED:
+            return OutboxHandlerResult(payload_updates={"notification_superseded": True})
         if delivered is False:
             raise RuntimeError("Discord case notification was not delivered")
         if isinstance(update, dict):
+            if intent.payload.get("safe_category"):
+                record_sanitized_discord_failure(str(intent.payload["safe_category"]))
             # An investigation update is not a new case-state report signature.
             return OutboxHandlerResult(payload_updates={"card_update_delivered": True})
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)

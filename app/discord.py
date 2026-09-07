@@ -3,7 +3,7 @@ import httpx
 from typing import Any
 import enum
 
-from app.case_cards import CardNotFound, deliver_case_card
+from app.case_cards import CardDeliveryOutcome, CardNotFound, deliver_case_card
 from app.model_metrics import record_sanitized_discord_failure
 from app.safe_errors import classify_exception, log_exception
 
@@ -77,18 +77,18 @@ async def send_case_notification(
     fields: list[dict[str, Any]] | None = None,
     level: Verbosity = Verbosity.INFO,
     revision: float | None = None,
-) -> bool:
+) -> bool | CardDeliveryOutcome:
     if level < get_verbosity():
         return False
     if CASE_BOT_NOTIFIER is not None:
-        return bool(await CASE_BOT_NOTIFIER(
+        return await CASE_BOT_NOTIFIER(
             case_id=case_id,
             revision=revision,
             title=title,
             description=description,
             color=color,
             fields=fields or [],
-        ))
+        )
     if not DISCORD_WEBHOOK_URL:
         return False
     payload = {"embeds": [{

@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+from enum import Enum
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,10 @@ from app.safe_errors import classify_exception
 LOCK_TIMEOUT_S = 30
 DELIVERY_TIMEOUT_S = 60
 CARD_REFRESH_S = 6 * 3600
+
+
+class CardDeliveryOutcome(Enum):
+    SUPERSEDED = "superseded"
 
 
 class CardNotFound(Exception):
@@ -35,7 +40,7 @@ async def deliver_case_card(
     revision: float | None = None,
     create: Callable[[], Awaitable[int | None]],
     edit: Callable[[int], Awaitable[bool]],
-) -> bool:
+) -> bool | CardDeliveryOutcome:
     revision = time.time() if revision is None else revision
     directory = os.getenv("DISCORD_CASE_STATE_DIR") or str(
         Path(os.getenv("MAIL_DRAFT_DIR", "data/mail-drafts")) / ".notifications" / "case-cards"
@@ -77,7 +82,7 @@ async def deliver_case_card(
                 verified_now = time.time()
                 if message_id is not None:
                     if revision < previous_revision:
-                        return True
+                        return CardDeliveryOutcome.SUPERSEDED
                     if previous == digest and 0 <= verified_now - verified_at < CARD_REFRESH_S:
                         if revision == previous_revision:
                             return True
