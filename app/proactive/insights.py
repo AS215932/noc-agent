@@ -178,7 +178,7 @@ def build_cycle_insights(
         )
         handoff_url = report.handoffs_by_key.get(hotspot.key)
         downstream: dict[str, Any] | None = None
-        if hotspot.key in investigated:
+        if hotspot.key in investigated and (handoff_url or posted):
             action = "draft" if handoff_url else "notify"
             sampling = "surfaced"
             why_now = f"{gate.reason} · investigated"

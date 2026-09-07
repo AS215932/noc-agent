@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -95,8 +96,24 @@ async def test_bot_without_channel_does_not_commit_notification_state(tmp_path, 
 
     monkeypatch.setattr("app.discord.BOT_NOTIFIER", notifier)
     await report_mailbox_state(str(tmp_path), failed=True, description="Unavailable")
-    assert not (tmp_path / ".notifications/mailbox-notification.json").exists()
+    state = json.loads((tmp_path / ".notifications/mailbox-notification.json").read_text())
+    assert state == {"failed": True, "delivered": False}
     bot.client.get_channel = lambda _: channel
     await report_mailbox_state(str(tmp_path), failed=True, description="Unavailable")
     await report_mailbox_state(str(tmp_path), failed=True, description="Unavailable")
     channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", ["WARNING", "ERROR"])
+async def test_filtered_recovery_does_not_hide_next_outage(tmp_path, monkeypatch, level):
+    send = AsyncMock(return_value=True)
+    categories = []
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", level)
+    monkeypatch.setattr("app.discord.BOT_NOTIFIER", send)
+    monkeypatch.setattr("app.mail_notifications.record_sanitized_discord_failure", categories.append)
+    for failed in [True, True, False, False, True, True]:
+        await report_mailbox_state(str(tmp_path), failed=failed, description="Current state",
+                                   safe_category="unknown_infrastructure")
+    assert send.await_count == 2
+    assert categories == ["unknown_infrastructure", "unknown_infrastructure"]

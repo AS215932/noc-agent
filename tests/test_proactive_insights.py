@@ -106,6 +106,23 @@ def test_digest_member_posted_is_notify_surfaced(tmp_path):
     assert record["budget_context"]["shadow"] is True
 
 
+def test_investigated_but_deduplicated_hotspot_is_withheld(tmp_path):
+    hs = _hotspot()
+    report = ProactiveCycleReport(hotspots=[hs], investigated=[hs.key])
+    record = _build(report, _gate(), _settings(tmp_path), digest_due=False, posted=False)[0]
+    assert record["action_selected"] == "stay_silent"
+    assert record["sampling_class"] == "withheld_logged"
+    assert "surfaced" not in record["why_now"]
+
+
+def test_investigated_digest_delivery_failure_is_recorded(tmp_path):
+    hs = _hotspot()
+    report = ProactiveCycleReport(hotspots=[hs], investigated=[hs.key])
+    record = _build(report, _gate(), _settings(tmp_path), digest_due=True, posted=False)[0]
+    assert record["action_selected"] == "notify"
+    assert "delivery failed" in record["why_now"]
+
+
 def test_digest_withheld_by_dedup_is_deliberate_silence(tmp_path):
     hs = _hotspot()
     report = ProactiveCycleReport(hotspots=[hs])

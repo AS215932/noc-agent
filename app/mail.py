@@ -241,6 +241,7 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
             await report_mailbox_state(
                 settings.draft_dir, failed=True,
                 description=safe.discord_description("Mailbox polling"),
+                safe_category=safe.category,
             )
         except Exception as notification_error:
             log_exception("mailbox_notification_failed", notification_error,
