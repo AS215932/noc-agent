@@ -347,8 +347,9 @@ use without the case outbox has three bounded attempts but no durable retry.
 The state file is atomically replaced after successful delivery. A process crash
 between Discord accepting a new message and recording its ID can still produce
 one duplicate on retry; Discord does not provide a transactional create with the
-local state store. This does not yet implement incident escalation/recovery
-paging or the six-hour critical reminder policy.
+local state store. Incident escalation/recovery paging and production monitoring
+route integration remain separate from persistent card delivery. The case-service
+reminder eligibility and retry policy is described with the runtime settings below.
 
 
 When `DISCORD_BOT_TOKEN` is present, the service starts a `discord.py` bot that
@@ -401,6 +402,16 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
 - `NOC_CASESERVICE_CONTROL` (deprecated for app runtime; forces proactive case-owned cooldown/report state in custom embeddings)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
+- `NOC_CASE_REPORT_REASSERT_S` (default `21600`; unchanged-case reminders have a six-hour minimum,
+  even if a legacy override is shorter). Only unacknowledged `HIGH` cases remain eligible;
+  resolved, closed, expired, linked, recovering, snoozed, suppressed and covered child cases do not repeat.
+  Acknowledgement is checked again at delivery. Recurrence and escalation to `HIGH` clear the old
+  acknowledgement and advance the report generation. Changed case reports still update the persistent card.
+  Reminders create a new notification, with a durable outbox identity anchored to the previous successful
+  delivery. Retries do not advance that timestamp. Discord delivery and database completion are not atomic:
+  a process failure after Discord accepts a reminder but before the database commit can duplicate it.
+  This policy requires reactive report enqueueing and the outbox worker; it does not change the separate
+  Alertmanager or Icinga direct Discord routes. Those must be coordinated in the infrastructure repository.
 - `NOC_CASESERVICE_REACTIVE_PRIMARY` (default `0`; make reactive webhooks use CaseService)
 - `NOC_CASESERVICE_CONTROL_PRIMARY` (default `0`; make `/control/cases` use CaseService)
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
