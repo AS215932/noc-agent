@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
-from app.cases.attention import AttentionDelivery
+from app.cases.attention import AttentionDelivery, attention_due
 
 
 from app.cases.lhp import (
@@ -151,7 +151,8 @@ class CaseStore(Protocol):
 
     async def list_reminder_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]: ...
 
-    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]: ...
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100,
+                                        now: datetime | None = None, reminder_seconds: int = 21600) -> list[AtomicCaseProjection]: ...
 
     async def append_event(self, event: CaseEvent) -> CaseEvent: ...
 
@@ -508,16 +509,15 @@ class InMemoryCaseStore:
             )
             return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
 
-    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100,
+                                        now: datetime | None = None, reminder_seconds: int = 21600) -> list[AtomicCaseProjection]:
+        now = now or datetime.now(timezone.utc)
         async with self._lock:
             cases = sorted((case for case in self._cases.values()
                             if isinstance(case, AtomicCaseProjection) and case.case_id > after_case_id
                             and case.identity.get("source") in {"alertmanager", "icinga2"}
-                            and case.status not in {"closed", "expired", "linked", "recovered_pending"}
-                            and (case.status != "resolved" or (
-                                case.resolution_reason == "positive_clean_observation"
-                                and case.case_id in self._attention
-                                and self._attention[case.case_id].phase == "firing"))),
+                            and attention_due(case, self._attention.get(case.case_id), now=now,
+                                              reminder_seconds=reminder_seconds) is not None),
                            key=lambda case: case.case_id)
             return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
 

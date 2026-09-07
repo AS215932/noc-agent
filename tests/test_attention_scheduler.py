@@ -58,5 +58,29 @@ async def test_completed_recoveries_do_not_consume_candidate_pages():
     await store.upsert_case(pending)
     assert await store.list_attention_candidates() == []
     pending.status = "investigating"
+    pending.report_generation += 1
     await store.upsert_case(pending)
     assert [case.case_id for case in await store.list_attention_candidates()] == [pending.case_id]
+
+
+@pytest.mark.asyncio
+async def test_covered_firing_history_does_not_delay_due_page():
+    from datetime import timedelta
+    from app.cases.attention import AttentionDelivery
+
+    now = datetime.now(timezone.utc)
+    store = InMemoryCaseStore()
+    for number in range(105):
+        case = AtomicCaseProjection(case_id=f"quiet-{number:03}", severity="MEDIUM", identity={"source": "icinga2"})
+        await store.upsert_case(case)
+        store._attention[case.case_id] = AttentionDelivery(case_id=case.case_id, generation=0,
+            severity="MEDIUM", phase="firing", sequence=1, delivered_at=now - timedelta(days=1))
+    due = AtomicCaseProjection(case_id="z-critical", severity="HIGH", identity={"source": "icinga2"})
+    await store.upsert_case(due)
+    store._attention[due.case_id] = AttentionDelivery(case_id=due.case_id, generation=0,
+        severity="HIGH", phase="firing", sequence=1, delivered_at=now - timedelta(hours=7))
+    assert [c.case_id for c in await store.list_attention_candidates(limit=1, now=now)] == [due.case_id]
+    assert await store.list_attention_candidates(limit=1, now=now, reminder_seconds=86400) == []
+    due.acknowledged_by = "oncall"
+    await store.upsert_case(due)
+    assert await store.list_attention_candidates(limit=1, now=now) == []

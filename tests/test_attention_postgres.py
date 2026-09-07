@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import asyncpg
 import pytest
 
-from app.cases.attention import AttentionDelivery
+from app.cases.attention import AttentionDelivery, attention_due
 from app.cases.attention_scheduler import enqueue_attention, enqueue_attention_batch
 from app.cases.handlers import build_report_handler
 from app.cases.outbox import OutboxProcessor
@@ -201,6 +201,43 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         legacy_case.status = "investigating"
         await restarted.upsert_case(legacy_case)
         assert legacy_case.case_id in {c.case_id for c in await restarted.list_attention_candidates()}
+        now = datetime.now(timezone.utc)
+        samples = []
+        variants = [
+            {}, {"acknowledged_by": "oncall"}, {"acknowledged_at": now.isoformat()},
+            {"severity": "HIGH"}, {"report_generation": 1},
+            {"severity": "HIGH", "summary": "escalated"},
+            {"status": "resolved", "resolution_reason": "positive_clean_observation"},
+            {"status": "resolved", "resolution_reason": "operator_rejected"},
+            {"covered_by_meta_case": True},
+            {"covered_by_meta_case": True, "independent_action_required": True, "severity": "HIGH"},
+            {"severity": "HIGH", "suppressed_until": (now + timedelta(hours=1)).isoformat()},
+            {"severity": "HIGH", "snoozed_until": (now + timedelta(hours=1)).replace(tzinfo=None).isoformat()},
+            {"severity": "HIGH", "suppressed_until": (now + timedelta(days=1)).date().isoformat()},
+            {"severity": "HIGH", "suppressed_until": "not-a-date"},
+            {"severity": "HIGH", "suppressed_until": "2026-99-99T00:00:00Z"},
+        ]
+        for number in range(105 + len(variants)):
+            changes = {} if number < 105 else variants[number - 105]
+            candidate = AtomicCaseProjection(case_id=f"due-{number:03}", severity="MEDIUM",
+                identity={"source": "icinga2"}).model_copy(update=changes)
+            prior = AttentionDelivery(case_id=candidate.case_id, generation=0,
+                severity="MEDIUM" if candidate.summary == "escalated" else candidate.severity,
+                phase="firing", sequence=1, delivered_at=now - timedelta(hours=7))
+            await restarted.upsert_case(candidate)
+            async with pool.acquire() as conn:
+                await conn.execute("INSERT INTO case_attention_delivery(case_id,sequence,delivered_at,payload) VALUES($1,$2,$3,$4::jsonb)",
+                    candidate.case_id, prior.sequence, prior.delivered_at, prior.model_dump_json())
+            samples.append((candidate, prior))
+        for interval in (21600, 86400):
+            expected = [c.case_id for c, prior in samples
+                        if attention_due(c, prior, now=now, reminder_seconds=interval) is not None]
+            candidates = await restarted.list_attention_candidates(after_case_id="due-", now=now,
+                reminder_seconds=interval, limit=1000)
+            assert [c.case_id for c in candidates if c.case_id.startswith("due-")] == expected
+            first = await restarted.list_attention_candidates(after_case_id="due-", now=now,
+                reminder_seconds=interval, limit=1)
+            assert [c.case_id for c in first] == expected[:1]
     finally:
         if pool is not None:
             await pool.close()

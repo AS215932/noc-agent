@@ -8,6 +8,7 @@ the schema in :mod:`app.db.schema`.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, AsyncIterator, cast
@@ -421,18 +422,43 @@ class PostgresCaseStore:
             )
         return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
 
-    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100,
+                                        now: datetime | None = None, reminder_seconds: int = 21600) -> list[AtomicCaseProjection]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT c.payload FROM cases c WHERE c.kind='atomic' AND c.case_id > $1
+                """SELECT c.payload FROM cases c
+                   LEFT JOIN case_attention_delivery a ON a.case_id=c.case_id
+                   WHERE c.kind='atomic' AND c.case_id > $1
                    AND c.payload#>>'{identity,source}' IN ('alertmanager', 'icinga2')
                    AND c.status NOT IN ('closed','expired','linked','recovered_pending')
-                   AND (c.status <> 'resolved' OR (
-                       c.payload->>'resolution_reason' = 'positive_clean_observation'
-                       AND EXISTS (SELECT 1 FROM case_attention_delivery a
-                                   WHERE a.case_id=c.case_id AND a.payload->>'phase'='firing')))
+                   AND (c.payload->>'covered_by_meta_case' IS DISTINCT FROM 'true'
+                        OR c.payload->>'independent_action_required'='true')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM (VALUES(c.payload->>'suppressed_until'),
+                                            (c.payload->>'snoozed_until')) AS deadlines(value)
+                       WHERE CASE WHEN value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ]|$)'
+                                       AND pg_input_is_valid(value, 'timestamp with time zone')
+                                  THEN CASE WHEN value ~ '[T ].*(Z|[+-][0-9]{2}(:?[0-9]{2})?)$'
+                                            THEN value::timestamptz
+                                            ELSE value::timestamp AT TIME ZONE 'UTC' END
+                             END > $3)
+                   AND ((c.status='resolved'
+                         AND c.payload->>'resolution_reason'='positive_clean_observation'
+                         AND a.payload->>'phase'='firing')
+                        OR (c.status<>'resolved'
+                            AND coalesce(c.payload->>'acknowledged_at','')=''
+                            AND coalesce(c.payload->>'acknowledged_by','')=''
+                            AND (a.case_id IS NULL OR a.payload->>'phase'='recovered'
+                                 OR CASE c.payload->>'severity' WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2
+                                                               WHEN 'LOW' THEN 1 ELSE 0 END
+                                    > CASE a.payload->>'severity' WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2
+                                                                 WHEN 'LOW' THEN 1 ELSE 0 END
+                                 OR coalesce(c.payload->>'report_generation','0') <> a.payload->>'generation'
+                                 OR (c.payload->>'severity'='HIGH'
+                                     AND a.delivered_at <= $3 - make_interval(secs => $4)))))
                    ORDER BY c.case_id LIMIT $2""",
-                after_case_id, max(0, min(limit, 1000)),
+                after_case_id, max(0, min(limit, 1000)), now or datetime.now(timezone.utc),
+                max(21600, reminder_seconds),
             )
         return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
 

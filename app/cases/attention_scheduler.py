@@ -41,7 +41,9 @@ async def enqueue_attention(store: CaseStore, case: AtomicCaseProjection, *, now
 async def enqueue_attention_batch(store: CaseStore, *, after_case_id: str = "", limit: int = 100,
                                   now: datetime | None = None, reminder_seconds: int = 21600) -> tuple[str, int]:
     limit = max(1, min(limit, 1000))
-    cases = await store.list_attention_candidates(after_case_id=after_case_id, limit=limit)
+    now = now or datetime.now(timezone.utc)
+    cases = await store.list_attention_candidates(after_case_id=after_case_id, limit=limit, now=now,
+                                                   reminder_seconds=reminder_seconds)
     count = 0
     for case in cases:
         if await enqueue_attention(store, case, now=now, reminder_seconds=reminder_seconds) is not None:
