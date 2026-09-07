@@ -43,8 +43,17 @@ class OutboxProcessor:
 
     async def process_pending(self, *, limit: int = 10) -> OutboxProcessReport:
         candidates = await self._due_intents()
+        return await self._process_candidates(candidates[: max(0, limit)])
+
+    async def process_intent(self, intent: OutboxIntent) -> OutboxProcessReport:
+        """Attempt a newly queued intent using the same atomic worker claim."""
+        if intent.status != "pending":
+            raise ValueError("immediate processing requires a pending intent")
+        return await self._process_candidates([intent])
+
+    async def _process_candidates(self, candidates: list[OutboxIntent]) -> OutboxProcessReport:
         processed = succeeded = failed = skipped = 0
-        for intent in candidates[: max(0, limit)]:
+        for intent in candidates:
             handler = self.handlers.get(intent.intent_type)
             if handler is None:
                 skipped += 1

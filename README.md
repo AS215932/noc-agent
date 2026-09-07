@@ -331,8 +331,9 @@ identity. Bot permissions must allow sending and editing its own messages.
 
 Event revisions prevent delayed outbox reports from replacing newer triage
 results. With `NOC_CASE_OUTBOX_ENABLED=1` (the production setting), terminal
-investigation updates are queued durably before their immediate delivery attempt;
-failed sends are retried by the existing outbox worker. Intentionally filtered
+investigation updates are queued durably before their immediate delivery attempt.
+Immediate delivery and retries share the same atomic outbox claim, completion
+record, and delivery metrics; failed sends are retried by the existing worker. Intentionally filtered
 reports complete as suppressed, without being stamped as delivered. Standalone
 use without the case outbox has three bounded attempts but no durable retry.
 

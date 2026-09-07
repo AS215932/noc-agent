@@ -188,8 +188,7 @@ class CaseService:
                 retry = intent.model_copy(deep=True)
                 retry.status = "pending"
                 retry.completed_at = None
-                retry.created_at = utc_now()
-                retry.next_attempt_at = retry.created_at
+                retry.next_attempt_at = utc_now()
                 retry.payload.pop("notification_suppressed", None)
                 retry.payload.pop("notification_level", None)
                 updated = await self.store.update_outbox_if_status(retry, expected_status="succeeded")
