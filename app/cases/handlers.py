@@ -141,7 +141,7 @@ def build_report_handler(
             color = int(update["color"])
             if bundled_facts is not None:
                 _, facts_description, facts_fields = bundled_facts
-                description = _clip(facts_description, limit=2000) + "\n\n" + _clip(description, limit=2000)
+                description = _clip(facts_description, limit=1000) + "\n\n" + _clip(description, limit=1000)
                 # Investigation actions take priority; facts are also retained
                 # in the description when contextual fields exceed the limit.
                 fields = (list(fields) + facts_fields)[:10]
@@ -149,6 +149,7 @@ def build_report_handler(
             title, description, fields = _render_case_report(case, intent)
             color = _severity_color(case.severity)
             level = _case_report_level(case)
+        title, description, fields = _budget_report_embed(title, description, fields)
         if level < get_verbosity():
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
         if reminder_since:
@@ -187,6 +188,22 @@ def build_report_handler(
         )
 
     return handle
+
+
+def _budget_report_embed(title: str, description: str, fields: list[dict]) -> tuple[str, str, list[dict]]:
+    """Reserve room for every selected field within Discord's total limit."""
+    title = _clip(title, limit=256)
+    description = _clip(description, limit=2002)
+    selected = fields[:10]
+    remaining = 5900 - len(title) - len(description)
+    budgeted = []
+    for index, field in enumerate(selected):
+        allowance = remaining // (len(selected) - index)
+        name = _clip(str(field.get("name") or "Details"), limit=min(256, allowance // 2))
+        value = _clip(str(field.get("value") or "—"), limit=min(1024, allowance - len(name)))
+        budgeted.append({**field, "name": name, "value": value})
+        remaining -= len(name) + len(value)
+    return title, description, budgeted
 
 
 def _case_report_level(case: AtomicCaseProjection) -> Verbosity:

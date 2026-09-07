@@ -77,6 +77,14 @@ async def spool_stats() -> dict:
     return await asyncio.to_thread(_stats)
 
 
+def _quarantine(path: Path) -> None:
+    try:
+        path.rename(path.with_suffix(".invalid"))
+        _sync_directory(path.parent)
+    except FileNotFoundError:
+        pass
+
+
 def _read(path: Path) -> OutboxIntent:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as source:
@@ -106,21 +114,23 @@ async def replay_reports(store: CaseStore, *, limit: int = 100) -> int:
         except Exception as exc:
             log.warn("report_spool_invalid", error_type=type(exc).__name__)
             # Retain invalid records for inspection, outside the replay set.
-            try:
-                await asyncio.to_thread(path.rename, path.with_suffix(".invalid"))
-                await asyncio.to_thread(_sync_directory, path.parent)
-            except FileNotFoundError:
-                pass  # Another replay already quarantined this record.
+            await asyncio.to_thread(_quarantine, path)
             continue
         # The durable unique key also handles a database commit whose reply was
         # lost, or two workers replaying the same file concurrently.
         try:
             await store.enqueue_outbox(intent)
         except Exception as exc:
-            # A rejected case reference must not block unrelated reports in
-            # this bounded batch. Keep the original record for another retry.
             log.warn("report_spool_enqueue_failed", error_type=type(exc).__name__)
-            continue
+            if str(getattr(exc, "sqlstate", "")).startswith("23"):
+                # PostgreSQL integrity violations are specific to this record.
+                # Preserve them outside the bounded prefix so later records
+                # are reachable even after a restore loses many case rows.
+                await asyncio.to_thread(_quarantine, path)
+                continue
+            # Connection/pool/timeouts (and unclassified failures) stop this
+            # tick instead of repeating a store-wide failure up to 100 times.
+            raise
         await asyncio.to_thread(path.unlink, missing_ok=True)
         await asyncio.to_thread(_sync_directory, path.parent)
         accepted += 1

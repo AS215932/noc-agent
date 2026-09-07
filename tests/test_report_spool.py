@@ -10,6 +10,10 @@ from app.cases.report_spool import replay_reports, retain_report, spool_director
 from app.cases.store import InMemoryCaseStore
 
 
+class RejectedReference(Exception):
+    sqlstate = "23503"
+
+
 @pytest.fixture(autouse=True)
 def private_spool(monkeypatch, tmp_path):
     monkeypatch.setenv("NOC_REPORT_SPOOL_DIR", str(tmp_path / "spool"))
@@ -28,7 +32,8 @@ async def test_private_retention_survives_store_failure_and_replays():
     assert path.stat().st_mode & 0o777 == 0o600
     assert spool_directory().stat().st_mode & 0o777 == 0o700
     failed = SimpleNamespace(enqueue_outbox=AsyncMock(side_effect=ConnectionError("offline")))
-    assert await replay_reports(failed) == 0
+    with pytest.raises(ConnectionError):
+        await replay_reports(failed)
     assert path.exists()
     # Replay discovers the durable file without any retained process state.
     store = InMemoryCaseStore()
@@ -48,7 +53,8 @@ async def test_lost_database_ack_and_concurrent_replay_remain_idempotent():
         await store.enqueue_outbox(item)
         raise ConnectionError("ack lost")
 
-    assert await replay_reports(SimpleNamespace(enqueue_outbox=commit_then_disconnect)) == 0
+    with pytest.raises(ConnectionError):
+        await replay_reports(SimpleNamespace(enqueue_outbox=commit_then_disconnect))
     assert (await spool_stats())["pending"] == 1
     await asyncio.gather(replay_reports(store), replay_reports(store))
     assert (await store.outbox_health()).pending == 1
@@ -164,13 +170,45 @@ async def test_rejected_record_does_not_block_later_records():
 
     async def enqueue(item):
         if item.idempotency_key == rejected:
-            raise ValueError("case reference unavailable")
+            raise RejectedReference("case reference unavailable")
         return await store.enqueue_outbox(item)
 
     assert await replay_reports(SimpleNamespace(enqueue_outbox=enqueue)) == 2
-    assert first.exists()
-    assert (await spool_stats())["pending"] == 1
+    assert first.with_suffix(".invalid").exists()
+    assert (await spool_stats())["invalid"] == 1
     assert (await store.outbox_health()).pending == 2
+
+
+@pytest.mark.asyncio
+async def test_full_rejected_prefix_cannot_starve_later_report():
+    for number in range(101):
+        await retain_report(report(f"prefix-{number}"))
+    paths = sorted(spool_directory().glob("*.json"))
+    allowed = OutboxIntent.model_validate_json(paths[-1].read_text()).idempotency_key
+    store = InMemoryCaseStore()
+
+    async def enqueue(item):
+        if item.idempotency_key != allowed:
+            raise RejectedReference("missing restored case")
+        return await store.enqueue_outbox(item)
+
+    replay_store = SimpleNamespace(enqueue_outbox=enqueue)
+    assert await replay_reports(replay_store) == 0
+    assert (await spool_stats())["invalid"] == 100
+    assert await replay_reports(replay_store) == 1
+    assert await store.get_outbox_by_key(allowed) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ConnectionError, TimeoutError])
+async def test_store_wide_failure_stops_after_first_attempt(error):
+    for number in range(3):
+        await retain_report(report(f"offline-{number}"))
+    enqueue = AsyncMock(side_effect=error("offline"))
+    with pytest.raises(error):
+        await replay_reports(SimpleNamespace(enqueue_outbox=enqueue))
+    assert enqueue.await_count == 1
+    assert (await spool_stats())["pending"] == 3
 
 
 @pytest.mark.asyncio

@@ -361,13 +361,19 @@ is retained in a private, atomically written and fsynced local report spool.
 (`data/mail-drafts/.notifications/report-spool` when the mail directory is unset).
 Keep this directory on persistent storage. The outbox worker replays at most 100
 records per tick with their original idempotency keys and removes each file only
-after the database acknowledges it. Invalid records are retained as `.invalid`
-files for inspection. `/health/cases` reports spool counts and degrades for
+after the database acknowledges it. Invalid records and records rejected by
+database integrity constraints are retained as `.invalid` files for inspection,
+outside the replay queue. Connection-level failures stop the batch and retain
+pending files. `/health/cases` reports local spool counts even during database
+outages and degrades for
 invalid records or reports retained beyond the delivery health threshold.
 If both database and local storage fail, the retention error propagates; there
 is no claim that the result was saved. Owned terminal cards include monitoring
 facts as well as the investigation result, so recreating a remotely deleted card
 preserves the incident context.
+Combined report embeds share one total character budget so contextual facts
+cannot make the terminal result exceed Discord's limits; all selected terminal
+fields retain space, including the next checks or proposal.
 
 The state file is atomically replaced after successful delivery. A process crash
 between Discord accepting a new message and recording its ID can still produce

@@ -407,7 +407,8 @@ async def test_eligible_terminal_error_includes_lower_severity_facts(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_normally_reported_card_deleted_during_investigation_retains_facts(monkeypatch, tmp_path, owned_cards):
+@pytest.mark.parametrize("detailed", [False, True])
+async def test_normally_reported_card_deleted_during_investigation_retains_facts(monkeypatch, tmp_path, owned_cards, detailed):
     monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
     store = InMemoryCaseStore()
     service = CaseService(store)
@@ -415,7 +416,7 @@ async def test_normally_reported_card_deleted_during_investigation_retains_facts
         source="alertmanager", detector="Disk", resource="rtr", status="firing", severity="HIGH",
     ))
     case = observed.case
-    case.summary = "Router has 4% free"
+    case.summary = "Router has 4% free" + (" monitor evidence" * 200 if detailed else "")
     await store.upsert_case(case)
     created = []
     exists = False
@@ -443,8 +444,9 @@ async def test_normally_reported_card_deleted_during_investigation_retains_facts
     terminal = await store.enqueue_outbox(OutboxIntent(
         case_id=case.case_id, intent_type="report", idempotency_key="normal-deletion-terminal",
         payload={"card_revision": 20, "card_update": {"title": "Investigation failed",
-            "description": "Model unavailable", "color": 0, "level": int(Verbosity.ERROR),
-            "fields": [{"name": name, "value": "actionable result"} for name in
+            "description": "Model unavailable" + (" investigation evidence" * 200 if detailed else ""),
+            "color": 0, "level": int(Verbosity.ERROR),
+            "fields": [{"name": name, "value": "actionable result" * (64 if detailed else 1)} for name in
                        ["Diagnosis", "Evidence", "Impact", "Actions", "Confidence", "Severity", "Outcome", "Next Checks / Proposal"]]}},
     ))
     assert (await processor.process_intent(terminal)).succeeded == 1
@@ -452,3 +454,8 @@ async def test_normally_reported_card_deleted_during_investigation_retains_facts
     assert "Router has 4% free" in created[-1]["description"]
     assert "Model unavailable" in created[-1]["description"]
     assert any(field["name"] == "Next Checks / Proposal" for field in created[-1]["fields"])
+    embed = created[-1]
+    assert len(embed["title"]) + len(embed["description"]) + sum(
+        len(field["name"]) + len(field["value"]) for field in embed["fields"]
+    ) <= 6000
+    assert all(len(field["value"]) <= 1024 for field in embed["fields"])
