@@ -142,7 +142,9 @@ def build_report_handler(
             if bundled_facts is not None:
                 _, facts_description, facts_fields = bundled_facts
                 description = _clip(facts_description, limit=2000) + "\n\n" + _clip(description, limit=2000)
-                fields = (facts_fields + list(fields))[:10]
+                # Investigation actions take priority; facts are also retained
+                # in the description when contextual fields exceed the limit.
+                fields = (list(fields) + facts_fields)[:10]
         else:
             title, description, fields = _render_case_report(case, intent)
             color = _severity_color(case.severity)

@@ -28,8 +28,7 @@ async def test_private_retention_survives_store_failure_and_replays():
     assert path.stat().st_mode & 0o777 == 0o600
     assert spool_directory().stat().st_mode & 0o777 == 0o700
     failed = SimpleNamespace(enqueue_outbox=AsyncMock(side_effect=ConnectionError("offline")))
-    with pytest.raises(ConnectionError):
-        await replay_reports(failed)
+    assert await replay_reports(failed) == 0
     assert path.exists()
     # Replay discovers the durable file without any retained process state.
     store = InMemoryCaseStore()
@@ -49,8 +48,7 @@ async def test_lost_database_ack_and_concurrent_replay_remain_idempotent():
         await store.enqueue_outbox(item)
         raise ConnectionError("ack lost")
 
-    with pytest.raises(ConnectionError):
-        await replay_reports(SimpleNamespace(enqueue_outbox=commit_then_disconnect))
+    assert await replay_reports(SimpleNamespace(enqueue_outbox=commit_then_disconnect)) == 0
     assert (await spool_stats())["pending"] == 1
     await asyncio.gather(replay_reports(store), replay_reports(store))
     assert (await store.outbox_health()).pending == 1
@@ -154,3 +152,59 @@ async def test_worker_replays_retained_intent_before_processing(monkeypatch):
     monkeypatch.setattr("app.cases.runtime.OutboxProcessor.process_pending", process)
     await process_case_outbox_once(state)
     assert (await spool_stats())["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_record_does_not_block_later_records():
+    for number in range(3):
+        await retain_report(report(f"report-{number}"))
+    first = sorted(spool_directory().glob("*.json"))[0]
+    rejected = OutboxIntent.model_validate_json(first.read_text()).idempotency_key
+    store = InMemoryCaseStore()
+
+    async def enqueue(item):
+        if item.idempotency_key == rejected:
+            raise ValueError("case reference unavailable")
+        return await store.enqueue_outbox(item)
+
+    assert await replay_reports(SimpleNamespace(enqueue_outbox=enqueue)) == 2
+    assert first.exists()
+    assert (await spool_stats())["pending"] == 1
+    assert (await store.outbox_health()).pending == 2
+
+
+@pytest.mark.asyncio
+async def test_database_outage_still_exposes_local_retention(monkeypatch):
+    from fastapi import Response
+    import app.main as main
+    from app.cases import CaseService
+    from app.cases.runtime import CaseServiceRuntime
+
+    store = InMemoryCaseStore()
+    monkeypatch.setattr(main, "case_service_runtime", CaseServiceRuntime(store=store, service=CaseService(store)))
+    monkeypatch.setattr(store, "outbox_health", AsyncMock(side_effect=ConnectionError("private database detail")))
+    await retain_report(report())
+    response = Response()
+    result = await main.health_cases(response)
+    assert response.status_code == 503
+    assert result["report_spool"]["pending"] == 1
+    assert result["report_spool"]["oldest_retained_at"] is not None
+    assert "private database detail" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_spool_read_failure_is_visible_without_hiding_database_health(monkeypatch):
+    from fastapi import Response
+    import app.main as main
+    from app.cases import CaseService
+    from app.cases.runtime import CaseServiceRuntime
+
+    store = InMemoryCaseStore()
+    monkeypatch.setattr(main, "case_service_runtime", CaseServiceRuntime(store=store, service=CaseService(store)))
+    monkeypatch.setattr("app.cases.report_spool.spool_stats", AsyncMock(side_effect=OSError("private path")))
+    response = Response()
+    result = await main.health_cases(response)
+    assert response.status_code == 503
+    assert result["outbox"] == {"pending": 0, "failed": 0}
+    assert "report_spool_unavailable" in result["delivery"]["reasons"]
+    assert "private path" not in str(result)

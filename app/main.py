@@ -3106,17 +3106,24 @@ def _provider_from_model_name(model_name: str) -> str:
 @app.get("/health/cases")
 async def health_cases(response: Response):
     from app.cases.report_spool import spool_stats
+    spool_error = False
+    try:
+        async with asyncio.timeout(2):
+            retained = await spool_stats()
+    except Exception as e:
+        spool_error = True
+        retained = {"status": "unavailable", "error": safe_health_error(e)}
     if case_service_runtime is None:
         if _env_bool("NOC_CASE_OUTBOX_ENABLED", False):
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {"status": "degraded", "enabled": True,
-                    "delivery": {"status": "degraded", "reasons": ["worker_runtime_unavailable"]}}
-        return {"status": "disabled", "enabled": False}
+                    "delivery": {"status": "degraded", "reasons": ["worker_runtime_unavailable"]},
+                    "report_spool": retained}
+        return {"status": "disabled", "enabled": False, "report_spool": retained}
     store = case_service_runtime.store
     try:
         async with asyncio.timeout(5):
             queue_health = await store.outbox_health()
-            retained = await spool_stats()
             recent_cases = await store.list_cases(limit=1)
     except Exception as e:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -3128,6 +3135,7 @@ async def health_cases(response: Response):
             "enabled": True,
             "backend": type(store).__name__,
             "error": safe_health_error(e),
+            "report_spool": retained,
         }
     lhp_settings = load_loop_handoff_settings()
     from app.cases.health import delivery_health
@@ -3139,9 +3147,11 @@ async def health_cases(response: Response):
         stale_after_s=_env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300),
         worker_interval_s=_env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30),
     )
-    if retained["invalid"]:
+    if spool_error:
+        delivery["reasons"].append("report_spool_unavailable")
+    elif retained["invalid"]:
         delivery["reasons"].append("retained_reports_invalid")
-    if retained["oldest_retained_at"] is not None:
+    if not spool_error and retained["oldest_retained_at"] is not None:
         retained_age = max(0, datetime.now(timezone.utc).timestamp() - retained["oldest_retained_at"])
         if retained_age > delivery["stale_after_seconds"]:
             delivery["reasons"].append("retained_reports_overdue")

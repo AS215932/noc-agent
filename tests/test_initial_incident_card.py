@@ -443,9 +443,12 @@ async def test_normally_reported_card_deleted_during_investigation_retains_facts
     terminal = await store.enqueue_outbox(OutboxIntent(
         case_id=case.case_id, intent_type="report", idempotency_key="normal-deletion-terminal",
         payload={"card_revision": 20, "card_update": {"title": "Investigation failed",
-            "description": "Model unavailable", "color": 0, "level": int(Verbosity.ERROR)}},
+            "description": "Model unavailable", "color": 0, "level": int(Verbosity.ERROR),
+            "fields": [{"name": name, "value": "actionable result"} for name in
+                       ["Diagnosis", "Evidence", "Impact", "Actions", "Confidence", "Severity", "Outcome", "Next Checks / Proposal"]]}},
     ))
     assert (await processor.process_intent(terminal)).succeeded == 1
     assert len(created) == 2
     assert "Router has 4% free" in created[-1]["description"]
     assert "Model unavailable" in created[-1]["description"]
+    assert any(field["name"] == "Next Checks / Proposal" for field in created[-1]["fields"])

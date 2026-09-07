@@ -114,7 +114,13 @@ async def replay_reports(store: CaseStore, *, limit: int = 100) -> int:
             continue
         # The durable unique key also handles a database commit whose reply was
         # lost, or two workers replaying the same file concurrently.
-        await store.enqueue_outbox(intent)
+        try:
+            await store.enqueue_outbox(intent)
+        except Exception as exc:
+            # A rejected case reference must not block unrelated reports in
+            # this bounded batch. Keep the original record for another retry.
+            log.warn("report_spool_enqueue_failed", error_type=type(exc).__name__)
+            continue
         await asyncio.to_thread(path.unlink, missing_ok=True)
         await asyncio.to_thread(_sync_directory, path.parent)
         accepted += 1
