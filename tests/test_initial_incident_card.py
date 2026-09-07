@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import BackgroundTasks
 
-from app.case_cards import CardNotFound, deliver_case_card
+from app.case_cards import CardDeliveryOutcome, CardNotFound, deliver_case_card
 from app.cases import CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor
 from app.cases.handlers import build_report_handler
 from app.cases.runtime import CaseServiceRuntime
@@ -227,6 +227,49 @@ async def test_superseded_legacy_initial_card_allows_newer_terminal_edit(monkeyp
     assert edited == (["New terminal"] if deleted else ["Old initial facts", "New terminal"])
     assert (await store.get_case(observed.case.case_id)).last_reported_at
     assert await store.get_outbox_by_key("missing") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_current_completed_facts_recover_lost_stamp_with_bounded_refresh(owned_cards, superseded):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    observed = await service.observe(ObservationRecord(
+        source="icinga2", detector="Disk", resource="rtr", severity="HIGH", status="firing",
+    ))
+    case = observed.case
+    case.summary = "Router disk low " * 500
+    case.resource_id = "router " * 300
+    case.recommendations = ["Check retention " * 100]
+    await store.upsert_case(case)
+    sent = []
+
+    async def notify(**payload):
+        sent.append(payload)
+        if payload.get("force_refresh"):
+            assert len(payload["title"]) + len(payload["description"]) + sum(
+                len(item["name"]) + len(item["value"]) for item in payload["fields"]
+            ) <= 6000
+        if len(sent) == 1 and superseded:
+            return CardDeliveryOutcome.SUPERSEDED
+        return True
+
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notify)})
+    initial = await service.request_report(case)
+    assert (await processor.process_intent(initial)).succeeded == 1
+    # An observation that read this projection before delivery can write its
+    # old stamp back after the report completed. The outbox remains authoritative.
+    await store.upsert_case(case)
+    assert not (await store.get_case(case.case_id)).last_reported_at
+    terminal = await store.enqueue_outbox(OutboxIntent(
+        case_id=case.case_id, intent_type="report", idempotency_key="lost-stamp-terminal",
+        payload={"card_update": {"title": "Terminal result", "description": "Diagnosis",
+                                 "color": 0, "level": int(Verbosity.ERROR)}},
+    ))
+    assert (await processor.process_intent(terminal)).succeeded == 1
+    assert len(sent) == 3 and sent[1]["force_refresh"] is True
+    assert sent[-1]["title"] == "Terminal result"
+    assert (await store.get_case(case.case_id)).last_reported_at
 
 
 @pytest.mark.asyncio

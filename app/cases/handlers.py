@@ -122,12 +122,13 @@ def build_report_handler(
                         # the signature. Ensure the prerequisite actually exists.
                         await case_service.request_report(case, state_signature=current_signature,
                                                           payload={"card_revision": revision})
-                    if not (initial and initial.status == "succeeded" and initial.payload.get("notification_superseded") is True):
+                    if not (initial and initial.status == "succeeded" and not initial.payload.get("notification_suppressed")):
                         raise RuntimeError("Current case facts have not been delivered")
                     # A local revision cannot prove the remote card still exists.
                     # Refresh facts at this update's revision before any terminal
                     # content, so replacement of a deleted legacy card starts with facts.
                     facts_title, facts_description, facts_fields = _render_case_report(case, initial)
+                    facts_title, facts_description, facts_fields = _budget_report_embed(facts_title, facts_description, facts_fields)
                     facts_delivered = await notifier(
                         case_id=case.case_id, title=facts_title, description=facts_description,
                         fields=facts_fields, color=_severity_color(case.severity), level=initial_level,
