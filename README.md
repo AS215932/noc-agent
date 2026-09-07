@@ -527,3 +527,10 @@ See [TESTING.md](TESTING.md).
 ---
 
 *Part of [Hyrule Networks (AS215932)](https://github.com/AS215932).*
+
+
+### Case delivery health
+
+`GET /health/cases` reports delivery independently of model and intake health. With `NOC_CASE_OUTBOX_ENABLED=1`, it returns HTTP503 if the worker is not running, no outbox tick has completed within `NOC_CASE_OUTBOX_HEALTH_STALE_S` (default300 seconds, minimum30), or an outstanding report is older than that threshold. Pending, failed and in-progress reports all count; unrelated handoffs do not. Runtime startup gets one threshold interval of heartbeat grace. An empty successful tick refreshes the heartbeat; a store exception does not. Queue reads have a five-second deadline and failures return sanitized degraded health. Long batches can legitimately exceed the threshold: this is delivery latency degradation, not proof of process death.
+
+The additive `delivery` object exposes heartbeat timestamps/age, oldest report age, count and reason codes without case content. Heartbeat is process-local and resets on restart; outstanding report age comes from durable outbox creation timestamps and survives restart. Configure an independent monitor against this endpoint before transferring notification ownership. This change does not add monitor routing, disable direct alerts, or activate case-owned reporting.

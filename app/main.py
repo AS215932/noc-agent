@@ -3072,9 +3072,11 @@ async def health_cases(response: Response):
         return {"status": "disabled", "enabled": False}
     store = case_service_runtime.store
     try:
-        pending = await store.list_outbox(status="pending")
-        failed = await store.list_outbox(status="failed")
-        recent_cases = await store.list_cases(limit=1)
+        async with asyncio.timeout(5):
+            pending = await store.list_outbox(status="pending")
+            failed = await store.list_outbox(status="failed")
+            in_progress = await store.list_outbox(status="in_progress")
+            recent_cases = await store.list_cases(limit=1)
     except Exception as e:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         safe = classify_exception(e)
@@ -3087,8 +3089,18 @@ async def health_cases(response: Response):
             "error": safe_health_error(e),
         }
     lhp_settings = load_loop_handoff_settings()
+    from app.cases.health import delivery_health
+
+    delivery = delivery_health(
+        case_service_runtime, [*pending, *failed, *in_progress],
+        enabled=_env_bool("NOC_CASE_OUTBOX_ENABLED", False),
+        running=case_outbox_task is not None and not case_outbox_task.done(),
+        stale_after_s=_env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300),
+    )
+    if delivery["status"] == "degraded":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
-        "status": "ok",
+        "status": delivery["status"],
         "enabled": True,
         "backend": type(store).__name__,
         "sample_case_count": len(recent_cases),
@@ -3097,6 +3109,7 @@ async def health_cases(response: Response):
             "running": case_outbox_task is not None and not case_outbox_task.done(),
         },
         "outbox": {"pending": len(pending), "failed": len(failed)},
+        "delivery": delivery,
         "verifier": {
             "enabled": lhp_settings.enabled and lhp_settings.case_verification_enabled,
             "running": case_verifier_task is not None and not case_verifier_task.done(),

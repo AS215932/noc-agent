@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from app.cases.outbox import OutboxProcessReport, OutboxProcessor
 from app.cases.policy import CasePolicy
@@ -19,6 +20,9 @@ class CaseServiceRuntime:
     service: CaseService
     store: CaseStore
     reminder_cursor: str = ""
+    started_at: float = field(default_factory=time.time)
+    outbox_last_started_at: float = 0.0
+    outbox_last_completed_at: float = 0.0
 
     async def close(self) -> None:
         close = getattr(self.store, "close", None)
@@ -51,6 +55,7 @@ async def enqueue_due_case_reminders(runtime: CaseServiceRuntime, *, batch_size:
 async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | None = None) -> OutboxProcessReport:
     from app.cases.handlers import build_default_outbox_handlers
 
+    runtime.outbox_last_started_at = time.time()
     try:
         await enqueue_due_case_reminders(runtime)
     except Exception as exc:
@@ -71,7 +76,9 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
         handlers,
         retry_backoff_s=_env_int("NOC_CASE_OUTBOX_RETRY_BACKOFF_S", 60),
     )
-    return await processor.process_pending(limit=limit or _env_int("NOC_CASE_OUTBOX_LIMIT", 10))
+    report = await processor.process_pending(limit=limit or _env_int("NOC_CASE_OUTBOX_LIMIT", 10))
+    runtime.outbox_last_completed_at = time.time()
+    return report
 
 
 async def build_case_service_runtime_from_env(*, force: bool = False) -> CaseServiceRuntime | None:
