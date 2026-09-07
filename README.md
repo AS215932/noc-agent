@@ -552,7 +552,12 @@ shares the persistent facts card; escalation, recurrence, recovery and six-hour
 unacknowledged critical reminders have separate durable message identities in the
 same destination. Quiet case-card updates never advance the attention clock.
 Human acknowledgement suppresses firing attention until a recurrence or severity
-increase; the automatic Icinga investigation acknowledgement is separate.
+increase beyond the severity covered by that acknowledgement; downgrades and
+rebounds within its coverage remain acknowledged. Coverage is stored separately
+from case JSON and matched to the acknowledgement timestamp. Older acknowledgements
+without coverage are adopted at their last known severity before the next
+observation; audit any such active acknowledgements before rollout if historical
+severity may already have changed. The automatic Icinga investigation acknowledgement is separate.
 Positive recovery can notify even if the firing incident was acknowledged.
 The new scheduler inhibits the legacy reactive reminder path while ownership is
 enabled. Already queued attention intents retain their handler after flags change.

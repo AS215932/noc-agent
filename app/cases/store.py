@@ -35,6 +35,7 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    Severity,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
@@ -116,6 +117,10 @@ class CaseStore(Protocol):
     async def upsert_case(self, case: CaseProjection) -> CaseProjection: ...
 
     def case_write_guard(self, case_id: str) -> AsyncContextManager[None]: ...
+
+    async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None: ...
+
+    async def acknowledgement_scope(self, case_id: str, acknowledged_at: str) -> Severity | None: ...
 
     async def create_atomic_case(
         self,
@@ -346,6 +351,7 @@ class InMemoryCaseStore:
         self._outbox: dict[str, OutboxIntent] = {}
         self._outbox_index: dict[str, str] = {}
         self._attention: dict[str, AttentionDelivery] = {}
+        self._acknowledgement_scopes: dict[str, tuple[str, Severity]] = {}
         self._attention_leases: dict[str, tuple[str, str, str, datetime]] = {}
         self._handoffs: dict[str, CaseHandoff] = {}
         self._handoff_idempotency_index: dict[str, str] = {}
@@ -390,6 +396,16 @@ class InMemoryCaseStore:
         async with self._lock:
             self._require_atomic_case_locked(case_id)
             yield
+
+    async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None:
+        async with self._lock:
+            self._require_atomic_case_locked(case_id)
+            self._acknowledgement_scopes[case_id] = (acknowledged_at, severity)
+
+    async def acknowledgement_scope(self, case_id: str, acknowledged_at: str) -> Severity | None:
+        async with self._lock:
+            scope = self._acknowledgement_scopes.get(case_id)
+            return scope[1] if scope is not None and scope[0] == acknowledged_at else None
 
     async def create_atomic_case(
         self,

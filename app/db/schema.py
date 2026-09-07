@@ -425,6 +425,13 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         expires_at TIMESTAMPTZ NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS case_acknowledgement_scope (
+        case_id TEXT PRIMARY KEY REFERENCES cases(case_id),
+        acknowledged_at TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ('UNKNOWN','LOW','MEDIUM','HIGH'))
+    )
+    """,
 )
 
 

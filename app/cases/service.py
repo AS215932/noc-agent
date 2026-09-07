@@ -382,6 +382,7 @@ class CaseService:
         now = utc_now()
         case.acknowledged_by = operator
         case.acknowledged_at = now
+        await self.store.record_acknowledgement_scope(case.case_id, now, case.severity)
         case.updated_at = now
         case.policy_version = self.policy.policy_version
         case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
@@ -1055,9 +1056,20 @@ class CaseService:
     @_serialize_case_write
     async def _update_unhealthy(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
         now = utc_now()
+        covered_severity = case.severity
+        if case.acknowledged_at or case.acknowledged_by:
+            scope = await self.store.acknowledgement_scope(case.case_id, case.acknowledged_at)
+            if scope is None:
+                # Adopt an older acknowledgement at the last known severity
+                # before applying this observation. Subsequent downgrades must
+                # not lower that coverage. Rollout audits must identify older
+                # acknowledgements whose historical severity is unavailable.
+                await self.store.record_acknowledgement_scope(case.case_id, case.acknowledged_at, case.severity)
+            else:
+                covered_severity = scope
         # Acknowledgement covers this incident at its acknowledged severity,
         # not a later recurrence or an increase beyond that severity.
-        if case.status in {"resolved", "recovered_pending"} or SEVERITY_RANK[observation.severity] > SEVERITY_RANK[case.severity]:
+        if case.status in {"resolved", "recovered_pending"} or SEVERITY_RANK[observation.severity] > SEVERITY_RANK[covered_severity]:
             case.acknowledged_at = ""
             case.acknowledged_by = ""
             case.report_generation += 1

@@ -88,6 +88,8 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         with pytest.raises(RuntimeError, match="event write failed"):
             await asyncio.wait_for(service.ack(case_id=case.case_id, operator="not-committed"), timeout=2)
         assert not (await restarted.get_case(case.case_id)).acknowledged_by
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM case_acknowledgement_scope") == 0
         monkeypatch.setattr(restarted, "append_event", append_event)
         await asyncio.wait_for(asyncio.gather(
             service.ack(case_id=case.case_id, operator="oncall"),
@@ -96,6 +98,8 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         current = await restarted.get_case(case.case_id)
         assert current.acknowledged_by == "oncall"
         assert current.last_reported_signature == "current-facts"
+        assert await restarted.acknowledgement_scope(case.case_id, current.acknowledged_at) == "HIGH"
+        assert await restarted.acknowledgement_scope(case.case_id, "stale-ack") is None
         # Stable keyset pagination must survive changes to recent telemetry and
         # skip retired/manual cases without excluding a pending recovery.
         for number, status, source in [
@@ -119,6 +123,10 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         assert await enqueue_attention_batch(restarted, after_case_id=cursor, limit=2) == ("", 0)
         await enqueue_attention_batch(restarted)
         assert len(await restarted.list_outbox(status="pending")) == 2
+        await pool.close()
+        pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=1,
+                                        server_settings={"search_path": schema})
+        assert await PostgresCaseStore(pool).acknowledgement_scope(case.case_id, current.acknowledged_at) == "HIGH"
     finally:
         if pool is not None:
             await pool.close()

@@ -33,6 +33,7 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    Severity,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
@@ -223,6 +224,21 @@ class PostgresCaseStore:
                 yield
             finally:
                 self._guarded_connection.reset(token)
+
+    async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO case_acknowledgement_scope(case_id, acknowledged_at, severity) VALUES($1,$2,$3)
+                   ON CONFLICT(case_id) DO UPDATE SET acknowledged_at=EXCLUDED.acknowledged_at, severity=EXCLUDED.severity""",
+                case_id, acknowledged_at, severity,
+            )
+
+    async def acknowledgement_scope(self, case_id: str, acknowledged_at: str) -> Severity | None:
+        async with self.pool.acquire() as conn:
+            return cast(Severity | None, await conn.fetchval(
+                "SELECT severity FROM case_acknowledgement_scope WHERE case_id=$1 AND acknowledged_at=$2",
+                case_id, acknowledged_at,
+            ))
 
     async def create_atomic_case(
         self,

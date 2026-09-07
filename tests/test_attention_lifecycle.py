@@ -73,3 +73,33 @@ async def test_automatic_icinga_ownership_does_not_acknowledge_case_attention(mo
     assert not current.acknowledged_at and not current.acknowledged_by
     reminder = await enqueue_attention(store, current)
     assert reminder.payload["attention_request"]["kind"] == "reminder"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("covered", ["MEDIUM", "HIGH"])
+async def test_acknowledgement_covers_lower_severity_rebounds(covered):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+
+    async def observe(severity):
+        return (await service.observe(ObservationRecord(source="icinga2", detector="Disk", resource="rtr",
+            severity=severity, status="firing"))).case
+
+    case = await observe(covered)
+    acknowledged = await service.ack(case.case_id, operator="oncall")
+    for severity in ("LOW", "MEDIUM", covered):
+        rebound = await observe(severity)
+        assert rebound.acknowledged_at == acknowledged.acknowledged_at
+        assert rebound.acknowledged_by == "oncall"
+        assert rebound.report_generation == acknowledged.report_generation
+    assert await store.acknowledgement_scope(case.case_id, acknowledged.acknowledged_at) == covered
+    assert await store.acknowledgement_scope(case.case_id, "another-ack") is None
+    if covered == "MEDIUM":
+        escalated = await observe("HIGH")
+        assert not escalated.acknowledged_by
+        assert escalated.report_generation == acknowledged.report_generation + 1
+    # A later explicit acknowledgement at LOW changes the coverage intentionally.
+    await observe("LOW")
+    acknowledged_again = await service.ack(case.case_id, operator="oncall")
+    assert await store.acknowledgement_scope(case.case_id, acknowledged_again.acknowledged_at) == "LOW"
+    assert not (await observe("MEDIUM")).acknowledged_by
