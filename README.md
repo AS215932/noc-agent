@@ -417,6 +417,17 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASE_POLICY_VERSION` (default `case_policy_v1`)
 - `NOC_CASE_OUTBOX_ENABLED` (default `0`; process case side-effect outbox intents)
 - `NOC_CASE_OUTBOX_INTERVAL_S` / `NOC_CASE_OUTBOX_LIMIT` / `NOC_CASE_OUTBOX_RETRY_BACKOFF_S`
+
+When reactive reporting and the outbox worker are enabled, each worker tick also
+scans up to 100 previously reported critical cases for due reminders. It walks
+stable case IDs and wraps after the last page, so frequently updated cases cannot
+starve older incidents. Delivery timing includes the scan cycle and outbox queue
+latency. A restart begins a new scan; durable reminder identities prevent the
+scan from creating duplicate pending work. Eligibility and acknowledgement are
+checked again at delivery. A scan failure is logged without blocking existing
+outbox retries. This scheduler does not activate reporting or change the separate
+infrastructure notification routes.
+
 - `NOC_KNOWLEDGE_CANDIDATE_DIR` (optional output dir for review-gated learning events)
 - `NOC_CASE_HANDOFF_REPO` (optional handoff repo; falls back to `NOC_PROACTIVE_HANDOFF_REPO`)
 - LHP-v1 dormant cross-loop flags (all behavior-changing flags default off):

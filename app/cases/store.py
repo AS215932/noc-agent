@@ -128,6 +128,8 @@ class CaseStore(Protocol):
         self, *, kind: str | None = None, status: str | None = None, limit: int = 100
     ) -> list[CaseProjection]: ...
 
+    async def list_reminder_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]: ...
+
     async def append_event(self, event: CaseEvent) -> CaseEvent: ...
 
     async def case_events(
@@ -417,6 +419,15 @@ class InMemoryCaseStore:
                 cases = [case for case in cases if str(getattr(case, "status", "")) == status]
             cases.sort(key=lambda case: getattr(case, "updated_at", getattr(case, "opened_at", "")), reverse=True)
             return [case.model_copy(deep=True) for case in cases[: max(0, limit)]]
+
+    async def list_reminder_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
+        async with self._lock:
+            cases = sorted(
+                (case for case in self._cases.values() if isinstance(case, AtomicCaseProjection)
+                 and case.case_id > after_case_id and case.severity == "HIGH" and case.last_reported_at),
+                key=lambda case: case.case_id,
+            )
+            return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
 
     async def append_event(self, event: CaseEvent) -> CaseEvent:
         async with self._lock:

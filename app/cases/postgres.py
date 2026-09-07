@@ -377,6 +377,18 @@ class PostgresCaseStore:
                 rows = await conn.fetch("SELECT payload FROM cases ORDER BY updated_at DESC LIMIT $1", limit)
         return [_case_from_payload(_row_payload(row)) for row in rows]
 
+    async def list_reminder_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT payload FROM cases
+                   WHERE kind = 'atomic' AND case_id > $1
+                     AND payload->>'severity' = 'HIGH'
+                     AND COALESCE(payload->>'last_reported_at', '') <> ''
+                   ORDER BY case_id ASC LIMIT $2""",
+                after_case_id, max(0, min(limit, 1000)),
+            )
+        return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
+
     async def append_event(self, event: CaseEvent) -> CaseEvent:
         async with self.pool.acquire() as conn:
             return await _insert_case_event(conn, event)

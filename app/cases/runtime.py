@@ -11,12 +11,14 @@ from app.cases.service import CaseService
 from app.cases.store import CaseStore, InMemoryCaseStore
 from app.config import load_loop_handoff_settings
 from app.db.config import load_database_settings
+from app.safe_errors import log_exception
 
 
 @dataclass(slots=True)
 class CaseServiceRuntime:
     service: CaseService
     store: CaseStore
+    reminder_cursor: str = ""
 
     async def close(self) -> None:
         close = getattr(self.store, "close", None)
@@ -26,9 +28,34 @@ class CaseServiceRuntime:
                 await result
 
 
+async def enqueue_due_case_reminders(runtime: CaseServiceRuntime, *, batch_size: int = 100) -> int:
+    """Walk durable cases without relying on monitor re-notification.
+
+    Stable case-ID pagination avoids starvation by frequently updated cases.
+    A restart starts another scan; durable report keys make replay harmless.
+    Eligibility is checked here and again by the delivery handler.
+    """
+    if not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
+        return 0
+    batch_size = max(1, min(batch_size, 1000))
+    cases = await runtime.store.list_reminder_candidates(after_case_id=runtime.reminder_cursor, limit=batch_size)
+    enqueued = 0
+    for case in cases:
+        if runtime.service.should_remind(case):
+            await runtime.service.request_report(case, payload={"source": "reminder_scheduler"})
+            enqueued += 1
+    runtime.reminder_cursor = cases[-1].case_id if len(cases) == batch_size else ""
+    return enqueued
+
+
 async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | None = None) -> OutboxProcessReport:
     from app.cases.handlers import build_default_outbox_handlers
 
+    try:
+        await enqueue_due_case_reminders(runtime)
+    except Exception as exc:
+        # A failed candidate scan must not block already queued delivery retries.
+        log_exception("case_reminder_enqueue_failed", exc)
     lhp = load_loop_handoff_settings()
     engineering_repo = lhp.engineering_handoff_repo if lhp.enabled and lhp.engineering_handoff_delivery_enabled else ""
     handlers = build_default_outbox_handlers(
