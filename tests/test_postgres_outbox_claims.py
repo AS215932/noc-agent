@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from app.cases.models import OutboxIntent
+from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.postgres import PostgresCaseStore
 from app.db.schema import SCHEMA_STATEMENTS
 
@@ -32,6 +32,11 @@ def sql(query):
 
 
 class Connection:
+    async def fetch(self, query, *args):
+        bound = re.sub(r"\$(\d+)", lambda match: sql_literal(args[int(match[1]) - 1]), query)
+        output = await asyncio.to_thread(sql, bound)
+        return [{"payload": json.loads(line)} for line in output.splitlines() if line]
+
     async def fetchrow(self, query, *args):
         bound = re.sub(r"\$(\d+)", lambda match: sql_literal(args[int(match[1]) - 1]), query)
         output = await asyncio.to_thread(sql, bound)
@@ -47,6 +52,38 @@ class Connection:
 class Pool:
     def acquire(self):
         return Connection()
+
+
+@pytest.mark.asyncio
+async def test_postgres_reminder_candidate_pagination():
+    assert CONTAINER.startswith("as215932-noc-outbox-test")
+    network = subprocess.check_output(["docker", "inspect", "-f", "{{.HostConfig.NetworkMode}}", CONTAINER], text=True).strip()
+    assert network == "none"
+    sql("CREATE TABLE IF NOT EXISTS cases (case_id text PRIMARY KEY);")
+    sql("ALTER TABLE cases ADD COLUMN IF NOT EXISTS kind text; ALTER TABLE cases ADD COLUMN IF NOT EXISTS payload jsonb;")
+    cases = [AtomicCaseProjection(case_id="scheduler-" + suffix, severity=severity, last_reported_at=reported)
+             for suffix, severity, reported in [
+                 ("a", "HIGH", "2026-09-07T00:00:00+00:00"),
+                 ("b", "MEDIUM", "2026-09-07T00:00:00+00:00"),
+                 ("c", "HIGH", "2026-09-07T00:00:00+00:00"),
+                 ("d", "HIGH", ""),
+                 ("e", "HIGH", "2026-09-07T00:00:00+00:00"),
+             ]]
+    try:
+        for case in cases:
+            sql("INSERT INTO cases(case_id,kind,payload) VALUES (" + ",".join(map(sql_literal, [
+                case.case_id, case.kind, case.model_dump_json(),
+            ])) + ");")
+        store = PostgresCaseStore(Pool())
+        first = await store.list_reminder_candidates(after_case_id="scheduler-", limit=2)
+        assert [case.case_id for case in first] == ["scheduler-a", "scheduler-c"]
+        second = await store.list_reminder_candidates(after_case_id=first[-1].case_id, limit=2)
+        assert [case.case_id for case in second] == ["scheduler-e"]
+        assert await store.list_reminder_candidates(after_case_id=second[-1].case_id) == []
+        assert await store.list_reminder_candidates(limit=0) == []
+    finally:
+        for case in cases:
+            sql("DELETE FROM cases WHERE case_id=" + sql_literal(case.case_id) + ";")
 
 
 @pytest.mark.asyncio
