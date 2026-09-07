@@ -34,8 +34,7 @@ async def send_discord_notification(
         return False
 
     if BOT_NOTIFIER is not None:
-        await BOT_NOTIFIER(title=title, description=description, color=color, fields=fields or [])
-        return True
+        return bool(await BOT_NOTIFIER(title=title, description=description, color=color, fields=fields or []))
 
     if not DISCORD_WEBHOOK_URL:
         from app import log

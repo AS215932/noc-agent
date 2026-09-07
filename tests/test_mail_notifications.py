@@ -66,3 +66,37 @@ async def test_poll_failure_stays_visible_without_repeated_posts(tmp_path, mocke
     fetch.return_value = []
     await process_mailbox_once(settings=settings)
     assert send.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contents", ['{', '{}', 'null', '{"failed":"true"}'])
+@pytest.mark.parametrize("failed", [True, False])
+async def test_damaged_state_does_not_disable_notifications(tmp_path, monkeypatch, contents, failed):
+    root = tmp_path / ".notifications"
+    root.mkdir()
+    (root / "mailbox-notification.json").write_text(contents)
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.mail_notifications.send_discord_notification", send)
+    for _ in range(3):
+        await report_mailbox_state(str(tmp_path), failed=failed, description="Current state")
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_bot_without_channel_does_not_commit_notification_state(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from app.discord_bot import NOCDiscordBot
+
+    channel = SimpleNamespace(send=AsyncMock())
+    bot = SimpleNamespace(channel_id=123, client=SimpleNamespace(get_channel=lambda _: None))
+
+    async def notifier(**kwargs):
+        return await NOCDiscordBot.send_embed(bot, **kwargs)
+
+    monkeypatch.setattr("app.discord.BOT_NOTIFIER", notifier)
+    await report_mailbox_state(str(tmp_path), failed=True, description="Unavailable")
+    assert not (tmp_path / ".notifications/mailbox-notification.json").exists()
+    bot.client.get_channel = lambda _: channel
+    await report_mailbox_state(str(tmp_path), failed=True, description="Unavailable")
+    await report_mailbox_state(str(tmp_path), failed=True, description="Unavailable")
+    channel.send.assert_awaited_once()

@@ -23,7 +23,17 @@ async def report_mailbox_state(directory: str, *, failed: bool, description: str
         except BlockingIOError:
             return  # The next poll retries if the other sender fails.
         try:
-            previous = json.loads(path.read_text())["failed"] if path.exists() else False
+            try:
+                previous = json.loads(path.read_text())["failed"]
+                if not isinstance(previous, bool):
+                    previous = None
+            except FileNotFoundError:
+                previous = False
+            except (ValueError, KeyError, TypeError, OSError):
+                # Dedup state must not become an alert-delivery dependency.
+                # Unknown state re-announces the current condition and replaces
+                # the damaged file only after a successful send.
+                previous = None
             if previous == failed:
                 return
             delivered = await send_discord_notification(
