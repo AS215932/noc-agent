@@ -710,13 +710,11 @@ class ProactiveLoop:
     ) -> tuple[bool, frozenset[tuple[str, str]], float]:
         """Decide whether to post a digest WITHOUT mutating de-dup state (state is
         committed only after a successful send). Posts when the hotspot set
-        changes (new/resolved/severity), something was investigated/handed off,
+        changes (new/resolved/severity),
         the set goes all-clear, or the persistent set is due a re-assert.
         Returns ``(should_post, signature, now)``."""
         signature = frozenset((h.fingerprint(), h.severity) for h in report.hotspots)
         now = time.time()
-        if report.investigated or report.handoffs:
-            return True, signature, now
         if not report.hotspots:
             # All-clear: post once iff we previously reported an active set, so
             # operators get confirmation the issue resolved.

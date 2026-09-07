@@ -286,6 +286,19 @@ async def test_unchanged_hotspots_reported_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_investigation_does_not_repost_unchanged_hotspots(tmp_path):
+    cap = _Capture()
+    lp = ProactiveLoop(
+        _runtime(), settings=_settings(tmp_path, report_reassert_s=99999),
+        reporter=cap, model_chain=lambda: ["m"],
+    )
+    report = await lp.run_once(deep=True)
+    report.investigated.append("new-investigation-of-existing-hotspot")
+    should_post, _, _ = lp._report_decision(report)
+    assert not should_post
+
+
+@pytest.mark.asyncio
 async def test_changed_hotspots_repost(tmp_path):
     cap = _Capture()
     runtime = _runtime()
