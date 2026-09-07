@@ -1,6 +1,6 @@
 """Real transaction checks through an explicitly configured local test socket."""
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -10,7 +10,9 @@ import asyncpg
 import pytest
 
 from app.cases.attention import AttentionDelivery
-from app.cases.attention_scheduler import enqueue_attention_batch
+from app.cases.attention_scheduler import enqueue_attention, enqueue_attention_batch
+from app.cases.handlers import build_report_handler
+from app.cases.outbox import OutboxProcessor
 from app.cases.models import AtomicCaseProjection, MetaCaseProjection, OutboxIntent
 from app.cases.correlation import CorrelationService
 from app.cases.postgres import PostgresCaseStore
@@ -142,6 +144,51 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         ), timeout=3)
         assert set((await restarted.get_case(meta.case_id)).child_case_ids) == {"page-0", "page-3"}
         assert (await restarted.get_case("page-0")).acknowledged_by == "oncall"
+        # Exercise the mixed-configuration send race through real PostgreSQL
+        # claims and atomic completion, with independent pooled connections.
+        monkeypatch.setenv("NOC_CASE_ATTENTION_ENABLED", "0")
+        monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
+        service = CaseService(restarted)
+        legacy_case = AtomicCaseProjection(severity="HIGH", identity={"source": "icinga2"})
+        legacy_case.last_reported_at = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+        legacy_case.last_reported_signature = service.report_state_signature(legacy_case)
+        await restarted.upsert_case(legacy_case)
+        legacy = await service.request_report(legacy_case)
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def legacy_send(**kwargs):
+            sending.set()
+            await release.wait()
+            return True
+
+        attention_send = AsyncMock(return_value=True)
+        processor = OutboxProcessor(restarted, {"report": build_report_handler(service,
+            notifier=attention_send, reminder_notifier=legacy_send)}, retry_backoff_s=0)
+        task = asyncio.create_task(processor.process_intent(legacy))
+        try:
+            await asyncio.wait_for(sending.wait(), timeout=3)
+            competing = await enqueue_attention(restarted, legacy_case)
+            assert competing is not None
+            assert (await processor.process_intent(competing)).failed == 1
+            attention_send.assert_not_awaited()
+        finally:
+            release.set()
+            outcome = await asyncio.wait_for(task, timeout=3)
+        assert outcome.succeeded == 1
+        assert (await restarted.get_attention(legacy_case.case_id)).sequence == 1
+        assert (await processor.process_pending()).failed == 0
+        competing = await restarted.get_outbox_by_key(competing.idempotency_key)
+        assert competing.status == "succeeded"
+        assert competing.payload["notification_suppressed"] == "attention_no_longer_due"
+        attention_send.assert_not_awaited()
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM case_attention_lease WHERE case_id=$1", legacy_case.case_id) == 0
+        await pool.close()
+        pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=1,
+                                        server_settings={"search_path": schema})
+        restarted = PostgresCaseStore(pool)
+        assert (await restarted.get_attention(legacy_case.case_id)).sequence == 1
+        assert await enqueue_attention(restarted, await restarted.get_case(legacy_case.case_id)) is None
     finally:
         if pool is not None:
             await pool.close()
