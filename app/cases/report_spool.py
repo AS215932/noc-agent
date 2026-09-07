@@ -6,6 +6,7 @@ import heapq
 import os
 from pathlib import Path
 import tempfile
+from uuid import uuid4
 
 from app import log
 from app.cases.models import OutboxIntent
@@ -60,25 +61,30 @@ def _stats() -> dict:
     count = invalid = 0
     oldest = None
     limited = False
-    try:
-        entries = os.scandir(directory)
-    except FileNotFoundError:
-        return {"pending": 0, "invalid": 0, "oldest_retained_at": None, "scan_limited": False}
-    with entries:
-        for index, entry in enumerate(entries):
-            if index >= MAX_HEALTH_SCAN_ENTRIES:
-                limited = True
-                break
-            if entry.name.endswith(".invalid"):
-                invalid += 1
-            if not entry.name.endswith(".json"):
-                continue
-            try:
-                stamp = entry.stat(follow_symlinks=False).st_mtime
-            except FileNotFoundError:
-                continue
-            count += 1
-            oldest = stamp if oldest is None else min(oldest, stamp)
+    scanned = 0
+    for scan_directory in (directory, directory / "quarantine"):
+        try:
+            entries = os.scandir(scan_directory)
+        except FileNotFoundError:
+            continue
+        with entries:
+            for entry in entries:
+                if scanned >= MAX_HEALTH_SCAN_ENTRIES:
+                    limited = True
+                    break
+                scanned += 1
+                if entry.name.endswith(".invalid"):
+                    invalid += 1
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    stamp = entry.stat(follow_symlinks=False).st_mtime
+                except FileNotFoundError:
+                    continue
+                count += 1
+                oldest = stamp if oldest is None else min(oldest, stamp)
+        if limited:
+            break
     return {"pending": count, "invalid": invalid, "oldest_retained_at": oldest, "scan_limited": limited}
 
 
@@ -88,7 +94,13 @@ async def spool_stats() -> dict:
 
 def _quarantine(path: Path) -> None:
     try:
-        path.rename(path.with_suffix(".invalid"))
+        directory = path.parent / "quarantine"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        destination = directory / path.with_suffix(".invalid").name
+        if destination.exists():
+            destination = directory / f"{path.stem}-{uuid4().hex}.invalid"
+        path.rename(destination)
+        _sync_directory(directory)
         _sync_directory(path.parent)
     except FileNotFoundError:
         pass
@@ -107,10 +119,28 @@ def _read(path: Path) -> OutboxIntent:
 
 
 def _pending(limit: int) -> list[Path]:
+    if limit <= 0:
+        return []
     directory = spool_directory()
     if not directory.exists():
         return []
-    return heapq.nsmallest(limit, (path for path in directory.iterdir() if path.suffix == ".json"))
+    candidates = []
+    migrated = 0
+    with os.scandir(directory) as entries:
+        for index, entry in enumerate(entries):
+            if index >= MAX_HEALTH_SCAN_ENTRIES:
+                break
+            path = Path(entry.path)
+            if entry.name.endswith(".invalid"):
+                # Migrate old quarantine files in bounded batches; never make
+                # their historical count part of ordinary replay discovery.
+                _quarantine(path)
+                migrated += 1
+                if migrated >= limit:
+                    break
+            elif entry.name.endswith(".json"):
+                candidates.append(path)
+    return heapq.nsmallest(limit, candidates)
 
 
 async def replay_reports(store: CaseStore, *, limit: int = 100) -> int:

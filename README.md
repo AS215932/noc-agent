@@ -362,8 +362,10 @@ is retained in a private, atomically written and fsynced local report spool.
 Keep this directory on persistent storage. The outbox worker replays at most 100
 records per tick with their original idempotency keys and removes each file only
 after the database acknowledges it. Invalid records and records rejected by
-database integrity constraints are retained as `.invalid` files for inspection,
-outside the replay queue. Connection-level failures stop the batch and retain
+database integrity constraints are retained as `.invalid` files in the private
+`quarantine/` subdirectory for inspection, outside replay discovery. Discovery
+examines at most 1,000 top-level entries and migrates legacy top-level invalid
+files in batches no larger than the replay limit. Connection-level failures stop the batch and retain
 pending files. `/health/cases` reports local spool counts even during database
 outages and degrades for
 invalid records or reports retained beyond the delivery health threshold.

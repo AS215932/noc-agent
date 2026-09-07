@@ -69,7 +69,7 @@ async def test_corrupt_record_preserved_and_replay_is_bounded():
     bad.write_text("broken record")
     store = InMemoryCaseStore()
     assert await replay_reports(store, limit=2) == 1
-    assert bad.with_suffix(".invalid").read_text() == "broken record"
+    assert (spool_directory() / "quarantine" / bad.with_suffix(".invalid").name).read_text() == "broken record"
     stats = await spool_stats()
     assert stats["invalid"] == 1
     assert stats["pending"] == 2
@@ -174,7 +174,7 @@ async def test_rejected_record_does_not_block_later_records():
         return await store.enqueue_outbox(item)
 
     assert await replay_reports(SimpleNamespace(enqueue_outbox=enqueue)) == 2
-    assert first.with_suffix(".invalid").exists()
+    assert (spool_directory() / "quarantine" / first.with_suffix(".invalid").name).exists()
     assert (await spool_stats())["invalid"] == 1
     assert (await store.outbox_health()).pending == 2
 
@@ -290,3 +290,37 @@ async def test_large_spool_scan_is_bounded_and_health_is_explicitly_incomplete(m
     assert result["report_spool"]["scan_limited"] is True
     assert result["report_spool"]["invalid"] == MAX_HEALTH_SCAN_ENTRIES
     assert "report_spool_scan_limited" in result["delivery"]["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_replay_does_not_enumerate_retained_quarantine(monkeypatch):
+    from pathlib import Path
+
+    await retain_report(report())
+    quarantine = spool_directory() / "quarantine"
+    quarantine.mkdir()
+    for number in range(1100):
+        (quarantine / f"{number}.invalid").touch()
+    original = os.scandir
+
+    def scan(directory):
+        assert Path(directory) != quarantine, "replay must not scan quarantined history"
+        return original(directory)
+
+    monkeypatch.setattr("app.cases.report_spool.os.scandir", scan)
+    assert await replay_reports(InMemoryCaseStore()) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_quarantine_migrates_in_bounded_batches_without_losing_records():
+    spool_directory().mkdir()
+    for number in range(20):
+        (spool_directory() / f"old-{number}.invalid").write_text(f"retained-{number}")
+    store = InMemoryCaseStore()
+    assert await replay_reports(store, limit=5) == 0
+    assert len(list((spool_directory() / "quarantine").glob("*.invalid"))) == 5
+    for _ in range(4):
+        await replay_reports(store, limit=5)
+    assert not list(spool_directory().glob("*.invalid"))
+    files = list((spool_directory() / "quarantine").glob("*.invalid"))
+    assert {path.read_text() for path in files} == {f"retained-{number}" for number in range(20)}
