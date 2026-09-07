@@ -1683,11 +1683,13 @@ async def _case_service_reactive_primary_response(
     case = getattr(result, "case", None) if result is not None else None
     investigation_case = getattr(investigation_result, "case", None) if investigation_result is not None else None
     if investigation_case is not None:
-        investigation_case = await case_service_runtime.service.claim_investigation(investigation_case)
-    if investigation_case is not None:
+        # Complete fallible report scheduling before claiming investigation;
+        # otherwise a database error could strand a claim behind its cooldown.
         await _maybe_request_reactive_case_report(
             investigation_result.observation, investigation_result, background_tasks=background_tasks,
         )
+        investigation_case = await case_service_runtime.service.claim_investigation(investigation_case)
+    if investigation_case is not None:
         investigation_payload = _case_service_alert_payload_for_result(alert_payload, investigation_result)
         background_tasks.add_task(
             investigate_alert,

@@ -55,6 +55,11 @@ async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_c
         except Exception as exc:
             log.warn("investigation_card_processing_failed", error_type=type(exc).__name__, case_id=case_id)
             return False
+    if reactive_reporting_owns_cards():
+        # A store outage must not bypass the durable facts prerequisite by
+        # creating a terminal-only card through the standalone transport.
+        log.warn("investigation_card_delivery_deferred", case_id=case_id)
+        return False
     # Standalone/dev use has no outbox; give transient failures a bounded retry.
     for attempt in range(3):
         delivered = await notifier(case_id=case_id, revision=revision, **card)

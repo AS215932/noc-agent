@@ -229,7 +229,8 @@ async def test_superseded_legacy_initial_card_allows_newer_terminal_edit(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_missing_report_after_handoff_is_enqueued_and_eventually_unblocks(owned_cards):
+async def test_missing_report_after_handoff_is_enqueued_and_eventually_unblocks(owned_cards, monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
     store = InMemoryCaseStore()
     service = CaseService(store)
     observed = await service.observe(ObservationRecord(source="icinga2", detector="Disk", resource="rtr", severity="HIGH", status="firing"))
@@ -239,16 +240,30 @@ async def test_missing_report_after_handoff_is_enqueued_and_eventually_unblocks(
     await store.upsert_case(case)
     terminal = await store.enqueue_outbox(OutboxIntent(
         case_id=case.case_id, intent_type="report", idempotency_key="handoff-terminal",
-        payload={"card_update": {"title": "Result", "description": "Model result", "color": 0, "level": int(Verbosity.ERROR)}},
+        payload={"card_revision": 10, "card_update": {"title": "Result", "description": "Model result", "color": 0, "level": int(Verbosity.ERROR)}},
     ))
-    notifier = AsyncMock(return_value=True)
+    created, edited = [], []
+
+    async def notifier(case_id, revision=None, **payload):
+        async def create():
+            created.append(payload["title"])
+            return 123
+
+        async def edit(message_id):
+            edited.append(payload["title"])
+            return True
+
+        return await deliver_case_card(destination="handoff-test", case_id=case_id, revision=revision,
+                                       payload=payload, create=create, edit=edit)
     processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}, retry_backoff_s=0)
     assert (await processor.process_intent(terminal)).failed == 1
     prerequisite = await store.get_outbox_by_key(f"report:{case.case_id}:{service.report_state_signature(case)}")
     assert prerequisite is not None and prerequisite.status == "pending"
     assert (await processor.process_intent(prerequisite)).succeeded == 1
     assert (await processor.process_pending()).succeeded == 1
-    assert notifier.await_args_list[-1].kwargs["title"] == "Result"
+    assert prerequisite.payload["card_revision"] == 10
+    assert len(created) == 1
+    assert edited == ["Result"]
 
 
 @pytest.mark.asyncio
@@ -293,3 +308,98 @@ async def test_force_refresh_checks_deleted_card_even_with_identical_cached_payl
     assert await deliver_case_card(**kwargs, revision=2, force_refresh=True)
     edit.assert_awaited_once_with(123)
     assert create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_report_scheduling_failure_does_not_strand_investigation_claim(monkeypatch, owned_cards):
+    import app.main as main
+
+    store = InMemoryCaseStore()
+    state = CaseServiceRuntime(store=store, service=CaseService(store))
+    monkeypatch.setattr(main, "case_service_runtime", state)
+    original = main._maybe_request_reactive_case_report
+
+    async def fail_selected(*args, **kwargs):
+        if kwargs.get("background_tasks") is not None:
+            raise RuntimeError("temporary store failure")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_maybe_request_reactive_case_report", fail_selected)
+    payload = {"source": "alertmanager", "status": "firing", "alerts": [{
+        "status": "firing", "fingerprint": "schedule-failure",
+        "labels": {"alertname": "Disk", "instance": "rtr", "severity": "critical"},
+    }]}
+    with pytest.raises(RuntimeError):
+        await main._case_service_reactive_primary_response(payload, BackgroundTasks(), label="Alert")
+    case = (await store.list_cases())[0]
+    assert not case.last_investigated_at
+    assert state.service.should_investigate(case)
+    monkeypatch.setattr(main, "_maybe_request_reactive_case_report", original)
+    monkeypatch.setattr(main, "send_case_notification", AsyncMock(return_value=True))
+    investigate = AsyncMock()
+    monkeypatch.setattr(main, "investigate_alert", investigate)
+    retry = BackgroundTasks()
+    await main._case_service_reactive_primary_response(payload, retry, label="Alert")
+    await retry()
+    investigate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_persistent_store_outage_never_sends_terminal_directly(monkeypatch, owned_cards):
+    import app.main as main
+
+    store = InMemoryCaseStore()
+    state = CaseServiceRuntime(store=store, service=CaseService(store))
+    monkeypatch.setattr(main, "case_service_runtime", state)
+    notifier = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "send_case_notification", notifier)
+    model = AsyncMock(side_effect=RuntimeError("model unavailable"))
+    monkeypatch.setattr(main, "run_investigation_graph", model)
+    payload = {"source": "alertmanager", "status": "firing", "alerts": [{
+        "status": "firing", "fingerprint": "persistent-failure",
+        "labels": {"alertname": "Disk", "instance": "rtr", "severity": "critical"},
+    }]}
+    tasks = BackgroundTasks()
+    await main._case_service_reactive_primary_response(payload, tasks, label="Alert")
+    monkeypatch.setattr(store, "update_outbox_if_status", AsyncMock(side_effect=RuntimeError("store unavailable")))
+    monkeypatch.setattr(store, "get_case", AsyncMock(side_effect=RuntimeError("store unavailable")))
+    await tasks()
+    model.assert_awaited_once()
+    notifier.assert_not_awaited()
+    assert len(await store.list_outbox(status="pending")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("severity", ["LOW", "MEDIUM"])
+async def test_eligible_terminal_error_includes_lower_severity_facts(monkeypatch, tmp_path, owned_cards, severity):
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "ERROR")
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    observed = await service.observe(ObservationRecord(
+        source="alertmanager", detector="Disk", resource="rtr", status="firing", severity=severity,
+    ))
+    case = observed.case
+    case.summary = "Router filesystem is low"
+    await store.upsert_case(case)
+    await service.request_report(case)
+    terminal = await store.enqueue_outbox(OutboxIntent(
+        case_id=case.case_id, intent_type="report", idempotency_key="eligible-error",
+        payload={"card_update": {"title": "Investigation failed", "description": "Model unavailable",
+                                 "color": 0, "level": int(Verbosity.ERROR)}},
+    ))
+    created = []
+
+    async def notify(case_id, revision=None, **payload):
+        async def create():
+            created.append(payload)
+            return 123
+        return await deliver_case_card(destination="verbosity", case_id=case_id, revision=revision, payload=payload,
+                                       create=create, edit=AsyncMock(return_value=True))
+
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notify)})
+    assert (await processor.process_pending()).succeeded == 2
+    assert len(created) == 1
+    assert created[0]["level"] == Verbosity.ERROR
+    assert created[0]["description"].splitlines() == ["Router filesystem is low", "", "Model unavailable"]
+    assert (await store.get_outbox_by_key(terminal.idempotency_key)).payload["card_update_delivered"]
