@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -33,15 +34,51 @@ async def test_failed_delivery_retries_without_losing_recovery(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_competing_poll_does_not_duplicate_notification(tmp_path, monkeypatch):
+@pytest.mark.parametrize("second_failed", [True, False])
+async def test_competing_polls_serialize_transitions(tmp_path, monkeypatch, second_failed):
+    sending = asyncio.Event()
+    release = asyncio.Event()
+
     async def sender(**kwargs):
-        await report_mailbox_state(str(tmp_path), failed=True, description="Concurrent poll")
+        sending.set()
+        await release.wait()
         return True
 
     send = AsyncMock(side_effect=sender)
     monkeypatch.setattr("app.mail_notifications.send_discord_notification", send)
-    await report_mailbox_state(str(tmp_path), failed=True, description="First poll")
-    assert send.await_count == 1
+    first = asyncio.create_task(report_mailbox_state(str(tmp_path), failed=True, description="First"))
+    await sending.wait()
+    second = asyncio.create_task(report_mailbox_state(str(tmp_path), failed=second_failed, description="Second"))
+    await asyncio.sleep(0.01)
+    assert not second.done()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+    assert send.await_count == (1 if second_failed else 2)
+
+
+@pytest.mark.asyncio
+async def test_failure_waiting_on_recovery_is_not_dropped(tmp_path, monkeypatch):
+    root = tmp_path / ".notifications"
+    root.mkdir()
+    (root / "mailbox-notification.json").write_text('{"failed":true,"delivered":true}')
+    sending = asyncio.Event()
+    release = asyncio.Event()
+
+    async def sender(**kwargs):
+        sending.set()
+        await release.wait()
+        return True
+
+    send = AsyncMock(side_effect=sender)
+    monkeypatch.setattr("app.mail_notifications.send_discord_notification", send)
+    recovery = asyncio.create_task(report_mailbox_state(str(tmp_path), failed=False, description="Recovered"))
+    await sending.wait()
+    failure = asyncio.create_task(report_mailbox_state(str(tmp_path), failed=True, description="Transient failure"))
+    await asyncio.sleep(0.01)
+    release.set()
+    await asyncio.wait_for(asyncio.gather(recovery, failure), timeout=2)
+    assert send.await_count == 2
+    assert "unavailable" in send.call_args.kwargs["title"]
 
 
 @pytest.mark.asyncio

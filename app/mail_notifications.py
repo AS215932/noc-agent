@@ -4,6 +4,7 @@ The poller already has a process lock; a separate notification lock also covers
 manual polls. State contains no mail content, credentials, or exception text.
 """
 
+import asyncio
 import fcntl
 import json
 from pathlib import Path
@@ -21,10 +22,14 @@ async def report_mailbox_state(
     root.mkdir(parents=True, exist_ok=True)
     path = root / "mailbox-notification.json"
     with (root / "mailbox-notification.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return  # The next poll retries if the other sender fails.
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                # Serialize different outcomes without blocking the event loop
+                # or dropping a transient failure between healthy polls.
+                await asyncio.sleep(0.05)
         try:
             try:
                 state = json.loads(path.read_text())

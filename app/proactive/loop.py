@@ -53,7 +53,7 @@ class InvestigationOutcome:
 # async (hotspot, decision_context) -> InvestigationOutcome | None
 Investigator = Callable[[Hotspot, DecisionContext], Awaitable[InvestigationOutcome | None]]
 # async (report, gate_decision) -> None
-Reporter = Callable[[ProactiveCycleReport, GateDecision], Awaitable[None]]
+Reporter = Callable[[ProactiveCycleReport, GateDecision], Awaitable[bool | None]]
 
 _SEVERITY_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟢"}
 _OUTCOME_EXIT = {
@@ -734,16 +734,17 @@ class ProactiveLoop:
         posted = False
         if should:
             try:
-                await self._reporter(report, gate)
+                delivered = await self._reporter(report, gate)
             except Exception as exc:
                 safe = classify_exception(exc)
                 log_exception("proactive_report_failed", exc, category=safe.category)
             else:
                 # Commit de-dup state only after a successful send, so a transient
                 # webhook failure doesn't suppress the next retry.
-                self._last_report_signature, self._last_report_ts = signature, now
-                posted = True
-                await self._case_service_mark_reported_hotspots(report)
+                if delivered is not False:
+                    self._last_report_signature, self._last_report_ts = signature, now
+                    posted = True
+                    await self._case_service_mark_reported_hotspots(report)
         try:
             await _heartbeat(report)
         except Exception as exc:
@@ -767,17 +768,16 @@ class ProactiveLoop:
                 record_case_service_shadow_failure(path="proactive_control", category=safe.category)
                 log_exception("proactive_case_service_mark_reported_failed", exc, category=safe.category)
 
-    async def _default_report(self, report: ProactiveCycleReport, gate: GateDecision) -> None:
+    async def _default_report(self, report: ProactiveCycleReport, gate: GateDecision) -> bool:
         if not report.hotspots and not report.investigated:
             # Reached only on an all-clear transition (the dedup gate suppresses
             # steady-state empty cycles), so confirm the resolution.
-            await send_discord_notification(
+            return await send_discord_notification(
                 title="✅ Proactive sweep: all clear",
                 description="All previously flagged hotspots have resolved.",
                 color=0x2ECC71,
                 level=Verbosity.INFO,
             )
-            return
         top = report.top(6)
         prefix = "🛰️ Proactive sweep"
         if self.settings.shadow:
@@ -801,7 +801,7 @@ class ProactiveLoop:
                     observatory_url=self.settings.observatory_public_url,
                 )
             )
-        await send_discord_notification(
+        return await send_discord_notification(
             title=f"{prefix}: {len(report.hotspots)} hotspot(s)",
             description="\n".join(lines),
             color=color,
