@@ -788,7 +788,7 @@ async def _maybe_request_reactive_case_report(observation, observe_result: objec
     """Optionally let CaseService own reactive report enqueue decisions."""
     if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
         return
-    if getattr(observation, "status", "") != "firing":
+    if getattr(observation, "status", "") not in {"firing", "clean", "resolved"}:
         return
     case = getattr(observe_result, "case", None)
     if case is None:
@@ -1757,6 +1757,9 @@ def _reactive_observations_from_alert_payload(alert_payload: dict):
 def _reactive_report_payload(case, observation) -> dict[str, object]:
     """Bounded, known-safe schema for untrusted monitor text entering outbox."""
 
+    description = getattr(case, "summary", "") or _observation_summary(observation) or "Case observed firing."
+    if getattr(case, "status", "") == "resolved":
+        description = "Monitoring reports recovery. " + (_observation_summary(observation) or "The incident has resolved.")
     return {
         "schema": "reactive_case_report_v1",
         "untrusted_monitor_text": True,
@@ -1770,7 +1773,7 @@ def _reactive_report_payload(case, observation) -> dict[str, object]:
             limit=180,
         ),
         "description": _safe_monitor_text(
-            getattr(case, "summary", "") or _observation_summary(observation) or "Case observed firing.",
+            description,
             limit=700,
         ),
     }

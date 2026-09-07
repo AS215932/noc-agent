@@ -139,12 +139,12 @@ class CaseService:
             stable_json(
                 {
                     "case_id": case.case_id,
+                    "report_generation": case.report_generation,
                     "status": case.status,
                     "severity": case.severity,
                     "signal_signature": case.signal_signature,
                     "resolution_reason": case.resolution_reason,
                     "issue_url": case.issue_url,
-                    "suppressed_until": case.suppressed_until,
                 }
             ).encode("utf-8")
         ).hexdigest()[:16]
@@ -153,11 +153,33 @@ class CaseService:
         signature = self.report_state_signature(case)
         if case.last_reported_signature != signature:
             return True
+        if not case.last_reported_at:
+            return True
+        return self.should_remind(case, now=now)
+
+    def should_remind(self, case: AtomicCaseProjection, *, now: datetime | None = None) -> bool:
+        """Only repeat an unchanged, unacknowledged critical incident.
+
+        Recheck this at delivery as well as enqueue time: queued reports can
+        outlive an acknowledgement, recovery or suppression.
+        """
+        now = now or datetime.now(timezone.utc)
+        if case.severity != "HIGH" or case.acknowledged_at or case.acknowledged_by:
+            return False
+        if case.status in {"resolved", "closed", "expired", "linked", "recovered_pending"}:
+            return False
+        if case.covered_by_meta_case and not case.independent_action_required:
+            return False
+        for until in (case.suppressed_until, case.snoozed_until):
+            deadline = _parse_iso_time(until)
+            if deadline is not None and deadline > now:
+                return False
+        if case.last_reported_signature != self.report_state_signature(case):
+            return False
         last = _parse_iso_time(case.last_reported_at)
         if last is None:
-            return True
-        now = now or datetime.now(timezone.utc)
-        return (now - last) >= timedelta(seconds=self.policy.report_reassert_s)
+            return False
+        return (now - last) >= timedelta(seconds=max(21600, self.policy.report_reassert_s))
 
     async def request_report(
         self,
@@ -169,15 +191,36 @@ class CaseService:
         """Create an idempotent report intent instead of sending directly."""
 
         state_signature = state_signature or self.report_state_signature(case)
+        report_payload = dict(payload or {})
+        idempotency_key = f"report:{case.case_id}:{state_signature}"
+        if case.last_reported_at and case.last_reported_signature == state_signature:
+            # Anchor to the last successful delivery, not a wall-clock bucket.
+            # Retries reuse this identity; only successful delivery advances it.
+            report_payload["reminder_since"] = case.last_reported_at
+            idempotency_key += f":reminder:{case.last_reported_at}"
         intent = await self.store.enqueue_outbox(
             OutboxIntent(
                 case_id=case.case_id,
                 intent_type="report",
-                idempotency_key=f"report:{case.case_id}:{state_signature}",
+                idempotency_key=idempotency_key,
                 state_signature=state_signature,
-                payload=payload or {},
+                payload=report_payload,
             )
         )
+        if (
+            intent.status == "succeeded"
+            and intent.payload.get("notification_suppressed") == "reminder_no_longer_due"
+            and self.should_remind(case)
+        ):
+            # A temporary snooze or an early enqueue must not suppress this
+            # delivery generation forever after it becomes actionable again.
+            retry = intent.model_copy(deep=True)
+            retry.status = "pending"
+            retry.completed_at = None
+            retry.next_attempt_at = utc_now()
+            retry.payload.pop("notification_suppressed", None)
+            updated = await self.store.update_outbox_if_status(retry, expected_status="succeeded")
+            return updated or await self.store.enqueue_outbox(intent)
         # Suppression is a completed no-op only while the delivery policy
         # still excludes this report. Reuse the same identity when policy changes.
         if intent.status == "succeeded" and intent.payload.get("notification_suppressed") == "verbosity":
@@ -971,6 +1014,12 @@ class CaseService:
 
     async def _update_unhealthy(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
         now = utc_now()
+        # Acknowledgement covers this incident at its acknowledged severity,
+        # not a later recurrence or a new escalation to critical.
+        if case.status in {"resolved", "recovered_pending"} or (case.severity != "HIGH" and observation.severity == "HIGH"):
+            case.acknowledged_at = ""
+            case.acknowledged_by = ""
+            case.report_generation += 1
         previous_signature = case.signal_signature
         case.previous_signal_signature = previous_signature if previous_signature != observation.signal_signature else case.previous_signal_signature
         case.signal_signature = observation.signal_signature

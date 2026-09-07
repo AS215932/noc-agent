@@ -266,6 +266,7 @@ class AtomicCaseProjection(BaseModel):
     signal_signature: str = ""
     previous_signal_signature: str = ""
     last_reported_at: str = ""
+    report_generation: int = Field(default=0, ge=0)
     last_reported_signature: str = ""
     last_reasserted_at: str = ""
     last_investigated_at: str = ""

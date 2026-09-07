@@ -12,7 +12,7 @@ from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.service import CaseService
 from app.config import LoopHandoffSettings
-from app.discord import Verbosity, get_verbosity, send_case_notification
+from app.discord import Verbosity, get_verbosity, send_case_notification, send_discord_notification
 from app.knowledge.lhp import build_lhp_knowledge_artifact_handler, build_lhp_knowledge_context_handler
 from app.knowledge.outbox import build_knowledge_candidate_handler
 from app.proactive.handoff import GitHubHandoff, handoff_from_env
@@ -74,6 +74,7 @@ def build_report_handler(
     case_service: CaseService,
     *,
     notifier=send_case_notification,
+    reminder_notifier=send_discord_notification,
     control_public_url: str = "",
 ) -> OutboxHandler:
     async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
@@ -83,6 +84,13 @@ def build_report_handler(
         if not isinstance(case, AtomicCaseProjection):
             raise KeyError(f"atomic case not found for report intent: {intent.case_id}")
         state_signature = intent.state_signature or case_service.report_state_signature(case)
+        reminder_since = intent.payload.get("reminder_since")
+        if reminder_since and (
+            reminder_since != case.last_reported_at
+            or state_signature != case_service.report_state_signature(case)
+            or not case_service.should_remind(case)
+        ):
+            return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
         update = intent.payload.get("card_update")
         if isinstance(update, dict):
             title = str(update["title"])
@@ -97,15 +105,24 @@ def build_report_handler(
         if level < get_verbosity():
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
         revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
-        delivered = await notifier(
-            case_id=case.case_id,
-            title=title,
-            description=description,
-            color=color,
-            fields=fields,
-            level=level,
-            revision=revision,
-        )
+        if reminder_since:
+            delivered = await reminder_notifier(
+                title=f"Unacknowledged critical incident: {title}"[:256],
+                description=description,
+                color=color,
+                fields=fields,
+                level=level,
+            )
+        else:
+            delivered = await notifier(
+                case_id=case.case_id,
+                title=title,
+                description=description,
+                color=color,
+                fields=fields,
+                level=level,
+                revision=revision,
+            )
         # Legacy custom notifiers return None; built-in transports explicitly
         # return False when the card has not been delivered.
         if delivered is CardDeliveryOutcome.SUPERSEDED:

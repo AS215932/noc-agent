@@ -687,7 +687,7 @@ async def test_case_service_report_signature_and_reassertion_are_case_owned():
     store = InMemoryCaseStore()
     service = CaseService(store, policy=CasePolicy(report_reassert_s=3600))
     created = await service.observe(
-        ObservationRecord(source="proactive", rule_id="disk_fill", resource="log", status="firing", signal_snapshot={"free": 4})
+        ObservationRecord(source="proactive", rule_id="disk_fill", resource="log", status="firing", severity="HIGH", signal_snapshot={"free": 4})
     )
     assert created.case is not None
     signature = service.report_state_signature(created.case)
@@ -695,7 +695,8 @@ async def test_case_service_report_signature_and_reassertion_are_case_owned():
 
     reported = await service.mark_reported(created.case.case_id, state_signature=signature)
     assert not service.should_report(reported, now=datetime.now(timezone.utc) + timedelta(seconds=10))
-    assert service.should_report(reported, now=datetime.now(timezone.utc) + timedelta(seconds=3700))
+    assert not service.should_report(reported, now=datetime.now(timezone.utc) + timedelta(seconds=3700))
+    assert service.should_report(reported, now=datetime.now(timezone.utc) + timedelta(seconds=21601))
 
     changed = await service.observe(
         ObservationRecord(source="proactive", rule_id="disk_fill", resource="log", status="firing", signal_snapshot={"free": 2})
