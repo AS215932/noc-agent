@@ -26,16 +26,15 @@ async def send_discord_notification(
     color: int = 0x3498db,
     fields: list[dict[str, Any]] | None = None,
     level: Verbosity = Verbosity.INFO,
-):
+) -> bool:
     """
-    Sends an embed message to a Discord webhook.
+    Send an embed; report whether delivery completed before recording dedup state.
     """
     if level < get_verbosity():
-        return
+        return False
 
     if BOT_NOTIFIER is not None:
-        await BOT_NOTIFIER(title=title, description=description, color=color, fields=fields or [])
-        return
+        return bool(await BOT_NOTIFIER(title=title, description=description, color=color, fields=fields or []))
 
     if not DISCORD_WEBHOOK_URL:
         from app import log
@@ -45,7 +44,7 @@ async def send_discord_notification(
             title=title,
             description=description,
         )
-        return
+        return False
 
     payload = {
         "embeds": [
@@ -62,9 +61,11 @@ async def send_discord_notification(
         try:
             response = await client.post(DISCORD_WEBHOOK_URL, json=payload)
             response.raise_for_status()
+            return True
         except httpx.HTTPError as e:
             safe = classify_exception(e)
             log_exception("discord_notification_failed", e, category=safe.category)
+            return False
 
 
 async def send_case_notification(

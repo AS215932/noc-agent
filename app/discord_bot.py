@@ -140,12 +140,12 @@ class NOCDiscordBot:
             await self._mcp_runtime.disconnect()
             await self._close_owned_case_service_runtime()
 
-    async def send_embed(self, title: str, description: str, color: int, fields: list[dict[str, Any]] | None = None):
+    async def send_embed(self, title: str, description: str, color: int, fields: list[dict[str, Any]] | None = None) -> bool:
         if self.channel_id is None:
-            return
+            return False
         channel = self.client.get_channel(self.channel_id)
         if channel is None:
-            return
+            return False
         embed = discord.Embed(title=title, description=description, color=color)
         for embed_field in fields or []:
             embed.add_field(
@@ -154,6 +154,7 @@ class NOCDiscordBot:
                 inline=bool(embed_field.get("inline", False)),
             )
         await channel.send(embed=embed)
+        return True
 
     async def send_case_embed(
         self,

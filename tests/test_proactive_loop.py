@@ -286,6 +286,19 @@ async def test_unchanged_hotspots_reported_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_investigation_does_not_repost_unchanged_hotspots(tmp_path):
+    cap = _Capture()
+    lp = ProactiveLoop(
+        _runtime(), settings=_settings(tmp_path, report_reassert_s=99999),
+        reporter=cap, model_chain=lambda: ["m"],
+    )
+    report = await lp.run_once(deep=True)
+    report.investigated.append("new-investigation-of-existing-hotspot")
+    should_post, _, _ = lp._report_decision(report)
+    assert not should_post
+
+
+@pytest.mark.asyncio
 async def test_changed_hotspots_repost(tmp_path):
     cap = _Capture()
     runtime = _runtime()
@@ -662,3 +675,37 @@ async def test_case_service_primary_marks_cases_reported_after_successful_digest
         assert case is not None
         assert getattr(case, "last_reported_at")
         assert getattr(case, "last_reported_signature")
+
+
+@pytest.mark.asyncio
+async def test_default_reporter_retries_false_delivery(tmp_path, mocker):
+    send = mocker.patch("app.proactive.loop.send_discord_notification", side_effect=[False, True])
+    lp = ProactiveLoop(
+        _runtime(), settings=_settings(tmp_path, report_reassert_s=99999),
+        model_chain=lambda: ["m"],
+    )
+    await lp.run_once(deep=True)
+    assert lp._last_report_signature is None
+    await lp.run_once(deep=True)
+    assert lp._last_report_signature
+    await lp.run_once(deep=True)
+    assert send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_default_reporter_retries_failed_all_clear(tmp_path, mocker):
+    send = mocker.patch("app.proactive.loop.send_discord_notification", side_effect=[True, False, True])
+    runtime = _runtime()
+    lp = ProactiveLoop(
+        runtime, settings=_settings(tmp_path, report_reassert_s=99999),
+        model_chain=lambda: ["m"],
+    )
+    await lp.run_once(deep=True)
+    for needle in ('state!="Established"', "node_filesystem_size_bytes", "predict_linear"):
+        runtime.by_query[needle] = {"ok": True, "result": []}
+    await lp.run_once(deep=True)
+    assert lp._last_report_signature
+    await lp.run_once(deep=True)
+    assert not lp._last_report_signature
+    await lp.run_once(deep=True)
+    assert send.await_count == 3

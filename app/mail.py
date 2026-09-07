@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app.agent import MailDraftPlan, noc_mail_agent
 from app.model_metrics import record_failure, record_success, start_run
 from app.safe_errors import classify_exception, log_exception
+from app.mail_notifications import report_mailbox_state
 
 
 ROLE_ADDRESSES = {
@@ -224,16 +225,27 @@ async def process_mailbox_once(settings: MailSettings | None = None, model=None)
             )
         else:
             await notify_finish("Mailbox Poll", "No new messages.", level=Verbosity.DEBUG)
+        try:
+            await report_mailbox_state(
+                settings.draft_dir, failed=False,
+                description="Mailbox polling and draft processing completed successfully.",
+            )
+        except Exception as notification_error:
+            log_exception("mailbox_notification_failed", notification_error,
+                          category=classify_exception(notification_error).category)
         return drafts
     except Exception as e:
         safe = classify_exception(e)
         log_exception("mailbox_poll_failed", e, category=safe.category)
-        await notify_finish(
-            "Mailbox Poll",
-            safe.discord_description("Mailbox polling"),
-            is_error=True,
-            safe_category=safe.category,
-        )
+        try:
+            await report_mailbox_state(
+                settings.draft_dir, failed=True,
+                description=safe.discord_description("Mailbox polling"),
+                safe_category=safe.category,
+            )
+        except Exception as notification_error:
+            log_exception("mailbox_notification_failed", notification_error,
+                          category=classify_exception(notification_error).category)
         raise
 
 
