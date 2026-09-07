@@ -10,11 +10,17 @@ import fcntl
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app import log
 from app.safe_errors import classify_exception
+
+
+LOCK_TIMEOUT_S = 30
+DELIVERY_TIMEOUT_S = 60
+CARD_REFRESH_S = 6 * 3600
 
 
 class CardNotFound(Exception):
@@ -38,11 +44,14 @@ async def deliver_case_card(
     try:
         root.mkdir(parents=True, exist_ok=True)
         with (root / f"{key}.lock").open("a") as lock:
+            lock_deadline = asyncio.get_running_loop().time() + LOCK_TIMEOUT_S
             while True:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
+                    if asyncio.get_running_loop().time() >= lock_deadline:
+                        raise TimeoutError("case card lock timed out")
                     await asyncio.sleep(0.05)
             try:
                 path = root / f"{key}.json"
@@ -50,28 +59,31 @@ async def deliver_case_card(
                     state = json.loads(path.read_text())
                     message_id = state["message_id"]
                     previous = state["digest"]
+                    verified_at = state.get("verified_at", 0)
+                    if not isinstance(verified_at, (int, float)):
+                        verified_at = 0
                     if type(message_id) is not int or message_id <= 0 or not isinstance(previous, str):
                         raise ValueError("invalid card state")
                 except FileNotFoundError:
-                    message_id, previous = None, None
+                    message_id, previous, verified_at = None, None, 0
                 except (ValueError, KeyError, TypeError):
                     log.warn("discord_case_state_invalid", case_id=case_id)
-                    message_id, previous = None, None
+                    message_id, previous, verified_at = None, None, 0
                 if message_id is not None:
-                    if previous == digest:
+                    if previous == digest and 0 <= time.time() - verified_at < CARD_REFRESH_S:
                         return True
                     try:
-                        if not await edit(message_id):
+                        if not await asyncio.wait_for(edit(message_id), timeout=DELIVERY_TIMEOUT_S):
                             return False
                     except CardNotFound:
                         message_id = None
                 if message_id is None:
-                    message_id = await create()
+                    message_id = await asyncio.wait_for(create(), timeout=DELIVERY_TIMEOUT_S)
                     if type(message_id) is not int or message_id <= 0:
                         return False
                 temporary = path.with_suffix(".tmp")
                 with temporary.open("w") as output:
-                    json.dump({"message_id": message_id, "digest": digest}, output)
+                    json.dump({"message_id": message_id, "digest": digest, "verified_at": time.time()}, output)
                     output.write("\n")
                     output.flush()
                     os.fsync(output.fileno())

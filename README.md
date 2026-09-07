@@ -316,15 +316,16 @@ parity/failures before any control flag is enabled.
 
 Triage starts, reports, and investigation failures share one case card. Both the
 bot and webhook delivery paths retain the Discord message ID across restarts;
-unchanged content produces no request, and changed content edits the existing
-message. A confirmed deleted message is replaced. Temporary API failures remain
+unchanged content normally produces no request, and changed content edits the
+existing message. At least six hours after the last successful delivery, an
+identical update refreshes the card quietly so deleted cards can be detected. A confirmed deleted message is replaced. Temporary API failures remain
 retryable without posting a duplicate.
 
 Set `DISCORD_CASE_STATE_DIR` to override the state directory. The default is
 `${MAIL_DRAFT_DIR}/.notifications/case-cards` when `MAIL_DRAFT_DIR` is configured,
 otherwise `data/mail-drafts/.notifications/case-cards`. All workers serving the same
 destination must share this writable persistent directory. It contains only
-hashed destination/case keys, message IDs, and content hashes; retain it during
+hashed destination/case keys, message IDs, content hashes, and last-verified times; retain it during
 deployments. Changing the bot account, channel, or webhook creates a separate destination
 identity. Bot permissions must allow sending and editing its own messages.
 

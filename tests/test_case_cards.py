@@ -81,7 +81,7 @@ async def test_destinations_and_cases_have_independent_identities(tmp_path):
     files = list(tmp_path.glob("*.json"))
     assert len(files) == 3
     for path in files:
-        assert set(json.loads(path.read_text())) == {"message_id", "digest"}
+        assert set(json.loads(path.read_text())) == {"message_id", "digest", "verified_at"}
         assert "private-token" not in path.name + path.read_text()
 
 
@@ -239,3 +239,29 @@ async def test_persistence_syncs_file_then_directory(monkeypatch):
     monkeypatch.setattr(os, "fsync", sync)
     assert await deliver(AsyncMock(return_value=123), AsyncMock())
     assert kinds == ["file", "directory"]
+
+@pytest.mark.asyncio
+async def test_identical_card_refresh_detects_deletion_after_six_hours(monkeypatch):
+    import app.case_cards as cards
+
+    now = 100000.0
+    monkeypatch.setattr(cards.time, "time", lambda: now)
+    create, edit = AsyncMock(side_effect=[123, 456]), AsyncMock(return_value=True)
+    assert await deliver(create, edit)
+    assert await deliver(create, edit)
+    edit.assert_not_called()
+    now += cards.CARD_REFRESH_S + 1
+    edit.side_effect = CardNotFound
+    assert await deliver(create, edit)
+    assert create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_hung_transport_is_bounded_and_releases_case_lock(monkeypatch):
+    import app.case_cards as cards
+
+    monkeypatch.setattr(cards, "DELIVERY_TIMEOUT_S", 0.01)
+    async def hung():
+        await asyncio.Event().wait()
+    assert not await deliver(hung, AsyncMock())
+    assert await deliver(AsyncMock(return_value=123), AsyncMock())
