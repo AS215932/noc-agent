@@ -25,7 +25,7 @@ async def test_card_survives_restart_and_identical_updates_are_quiet():
     assert await deliver(create, edit)
     # New callbacks represent a new bot process with no message cache.
     restarted_create, restarted_edit = AsyncMock(return_value=456), AsyncMock(return_value=True)
-    assert not await deliver(restarted_create, restarted_edit)
+    assert await deliver(restarted_create, restarted_edit)
     assert await deliver(restarted_create, restarted_edit, description="investigation failed")
     restarted_create.assert_not_called()
     restarted_edit.assert_awaited_once_with(123)
@@ -108,7 +108,7 @@ async def test_webhook_creates_once_then_patches_across_calls(monkeypatch):
     monkeypatch.setattr(notifications, "CASE_BOT_NOTIFIER", None)
     monkeypatch.setattr(notifications, "DISCORD_WEBHOOK_URL", "https://discord.invalid/api/webhooks/42/secret?thread_id=7")
     assert await notifications.send_case_notification("case-1", "New incident", "first")
-    assert not await notifications.send_case_notification("case-1", "New incident", "first")
+    assert await notifications.send_case_notification("case-1", "New incident", "first")
     assert await notifications.send_case_notification("case-1", "Investigation failed", "dependency unavailable")
     assert [r.method for r in requests] == ["POST", "PATCH"]
     assert requests[0].url.params["wait"] == "true"
@@ -147,9 +147,11 @@ async def test_bot_restart_edits_persisted_card(monkeypatch):
     message = SimpleNamespace(id=123, edit=AsyncMock())
     channel = SimpleNamespace(send=AsyncMock(return_value=message), get_partial_message=Mock(return_value=message))
     first = NOCDiscordBot()
+    first.client._connection.user = SimpleNamespace(id=999)
     monkeypatch.setattr(first.client, "get_channel", lambda _: channel)
     assert await first.send_case_embed("case-1", "Incident", "first", 0)
     restarted = NOCDiscordBot()
+    restarted.client._connection.user = SimpleNamespace(id=999)
     monkeypatch.setattr(restarted.client, "get_channel", lambda _: channel)
     assert await restarted.send_case_embed("case-1", "Failed", "dependency unavailable", 0)
     channel.send.assert_awaited_once()
@@ -205,3 +207,35 @@ async def test_webhook_only_replaces_confirmed_missing_message(monkeypatch, code
     result = await notifications.send_case_notification("case-1", "Failed", "dependency unavailable")
     assert result is (code == 10008)
     assert requests == methods
+
+@pytest.mark.asyncio
+async def test_bot_account_replacement_creates_new_namespace(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from app.discord_bot import NOCDiscordBot
+
+    monkeypatch.setenv("DISCORD_BOT_CHANNEL_ID", "42")
+    message = SimpleNamespace(id=123, edit=AsyncMock())
+    channel = SimpleNamespace(send=AsyncMock(return_value=message), get_partial_message=Mock(return_value=message))
+    for bot_id in [999, 1000]:
+        bot = NOCDiscordBot()
+        bot.client._connection.user = SimpleNamespace(id=bot_id)
+        monkeypatch.setattr(bot.client, "get_channel", lambda _: channel)
+        assert await bot.send_case_embed("case-1", "Incident", "first", 0)
+    assert channel.send.await_count == 2
+    channel.get_partial_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_persistence_syncs_file_then_directory(monkeypatch):
+    import os
+    import stat
+
+    kinds = []
+    original = os.fsync
+    def sync(fd):
+        kinds.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        original(fd)
+    monkeypatch.setattr(os, "fsync", sync)
+    assert await deliver(AsyncMock(return_value=123), AsyncMock())
+    assert kinds == ["file", "directory"]

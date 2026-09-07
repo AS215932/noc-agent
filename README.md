@@ -325,7 +325,7 @@ Set `DISCORD_CASE_STATE_DIR` to override the state directory. The default is
 otherwise `data/mail-drafts/.notifications/case-cards`. All workers serving the same
 destination must share this writable persistent directory. It contains only
 hashed destination/case keys, message IDs, and content hashes; retain it during
-deployments. Changing the bot channel or webhook creates a separate destination
+deployments. Changing the bot account, channel, or webhook creates a separate destination
 identity. Bot permissions must allow sending and editing its own messages.
 
 The state file is atomically replaced after successful delivery. A process crash

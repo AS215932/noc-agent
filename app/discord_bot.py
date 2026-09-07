@@ -162,7 +162,7 @@ class NOCDiscordBot:
         color: int,
         fields: list[dict[str, Any]] | None = None,
     ) -> bool:
-        if self.channel_id is None:
+        if self.channel_id is None or self.client.user is None:
             return False
         channel = self.client.get_channel(self.channel_id)
         if channel is None:
@@ -189,7 +189,7 @@ class NOCDiscordBot:
                 raise
 
         return await deliver_case_card(
-            destination=f"bot:{self.channel_id}",
+            destination=f"bot:{self.client.user.id}:{self.channel_id}",
             case_id=case_id,
             payload=embed.to_dict(),
             create=create,

@@ -348,3 +348,41 @@ async def test_default_handlers_include_knowledge_candidate_and_handoff_only_whe
             loop_handoff_settings=LoopHandoffSettings(enabled=True, knowledge_context_enabled=True, knowledge_candidate_dir=str(tmp_path)),
         )
     ) == {"report", "knowledge_context_requested", "knowledge_artifact_proposed"}
+
+@pytest.mark.asyncio
+async def test_report_outbox_retries_failed_delivery_before_marking_reported(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.case_cards import deliver_case_card
+
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/",
+        status="firing", severity="HIGH",
+    ))
+    assert created.case is not None
+    signature = service.report_state_signature(created.case)
+    await service.request_report(created.case, state_signature=signature)
+    create = AsyncMock(side_effect=[TimeoutError("temporary"), 123])
+    edit = AsyncMock(return_value=True)
+
+    async def notifier(**kwargs):
+        return await deliver_case_card(
+            destination="bot:999:42", case_id=kwargs["case_id"],
+            payload={"description": kwargs["description"]}, create=create, edit=edit,
+        )
+
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}, retry_backoff_s=0)
+    first = await processor.process_pending()
+    assert first.failed == 1 and first.succeeded == 0
+    case = await store.get_case(created.case.case_id)
+    assert not case.last_reported_signature
+    intent = (await store.list_outbox())[0]
+    assert intent.status == "failed" and intent.next_attempt_at
+    second = await processor.process_pending()
+    assert second.succeeded == 1
+    case = await store.get_case(created.case.case_id)
+    assert case.last_reported_signature == signature
+    assert (await store.list_outbox())[0].status == "succeeded"
+    assert create.await_count == 2

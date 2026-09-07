@@ -59,7 +59,7 @@ async def deliver_case_card(
                     message_id, previous = None, None
                 if message_id is not None:
                     if previous == digest:
-                        return False
+                        return True
                     try:
                         if not await edit(message_id):
                             return False
@@ -76,6 +76,11 @@ async def deliver_case_card(
                     output.flush()
                     os.fsync(output.fileno())
                 temporary.replace(path)
+                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
                 return True
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)

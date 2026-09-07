@@ -82,7 +82,7 @@ def build_report_handler(
             raise KeyError(f"atomic case not found for report intent: {intent.case_id}")
         state_signature = intent.state_signature or case_service.report_state_signature(case)
         title, description, fields = _render_case_report(case, intent)
-        await notifier(
+        delivered = await notifier(
             case_id=case.case_id,
             title=title,
             description=description,
@@ -90,6 +90,10 @@ def build_report_handler(
             fields=fields,
             level=Verbosity.WARNING if case.severity in {"HIGH", "MEDIUM"} else Verbosity.INFO,
         )
+        # Legacy custom notifiers return None; built-in transports explicitly
+        # return False when the card has not been delivered.
+        if delivered is False:
+            raise RuntimeError("Discord case notification was not delivered")
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
         await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
         return OutboxHandlerResult(
