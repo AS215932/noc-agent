@@ -388,7 +388,7 @@ async def test_report_outbox_retries_failed_delivery_before_marking_reported(tmp
     assert create.await_count == 2
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("severity,verbosity", [("LOW", "WARNING"), ("HIGH", "ERROR")])
+@pytest.mark.parametrize("severity,verbosity", [("LOW", "WARNING"), ("MEDIUM", "ERROR")])
 async def test_verbosity_filtered_reports_complete_without_retry_or_report_stamp(monkeypatch, severity, verbosity):
     from unittest.mock import AsyncMock
     monkeypatch.setenv("LOG_LEVEL_DISCORD", verbosity)
@@ -491,7 +491,7 @@ async def test_lowering_verbosity_requeues_same_report_identity(monkeypatch):
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(ObservationRecord(
-        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="MEDIUM",
     ))
     original = await service.request_report(created.case)
     notifier = AsyncMock(return_value=True)
@@ -606,7 +606,7 @@ async def test_reopened_intake_does_not_overwrite_later_failure(monkeypatch, tmp
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(ObservationRecord(
-        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="MEDIUM",
     ))
     original = await service.request_report(created.case)
     sent = []

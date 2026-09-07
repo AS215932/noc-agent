@@ -344,6 +344,43 @@ omit a counter increment). Intentionally filtered
 reports complete as suppressed, without being stamped as delivered. Standalone
 use without the case outbox has three bounded attempts but no durable retry.
 
+When both `NOC_CASESERVICE_REACTIVE_REPORT=1` and `NOC_CASE_OUTBOX_ENABLED=1`
+are enabled, monitoring intake first queues and attempts delivery of the case's
+initial facts without calling a model. The investigation no longer posts a
+separate starting message. Its terminal update waits in the outbox until that
+first case report has been delivered, then edits the same card. A failed initial
+send remains retryable without letting a model failure create the first card.
+This ordering applies to Alertmanager and Icinga cases, not manual or proactive
+investigations. HIGH reports use ERROR verbosity so critical incidents remain
+visible at that setting. These flags do not change infrastructure notification
+routes or implement separate escalation/recovery paging.
+
+With both flags enabled, a terminal update that cannot reach the case database
+is retained in a private, atomically written and fsynced local report spool.
+`NOC_REPORT_SPOOL_DIR` defaults to `MAIL_DRAFT_DIR/.notifications/report-spool`
+(`data/mail-drafts/.notifications/report-spool` when the mail directory is unset).
+Keep this directory on persistent storage. The outbox worker replays at most 100
+records per tick with their original idempotency keys and removes each file only
+after the database acknowledges it. Existing retained records drain whenever
+the outbox worker runs, even after reactive ownership is disabled. Invalid records and records rejected by
+database integrity constraints are retained as `.invalid` files in the private
+`quarantine/` subdirectory for inspection, outside replay discovery. Discovery
+examines at most 1,000 top-level entries and migrates legacy top-level invalid
+files in batches no larger than the replay limit. Connection-level failures stop the batch and retain
+pending files. `/health/cases` reports local spool counts even during database
+outages and degrades for
+invalid records or reports retained beyond the delivery health threshold.
+Local health scans examine at most 1,000 directory entries. Larger spools return
+`scan_limited: true` and degraded health; their counts are lower bounds, not a
+claim that the complete retained set was examined.
+If both database and local storage fail, the retention error propagates; there
+is no claim that the result was saved. Owned terminal cards include monitoring
+facts as well as the investigation result, so recreating a remotely deleted card
+preserves the incident context.
+Combined report embeds share one total character budget so contextual facts
+cannot make the terminal result exceed Discord's limits; all selected terminal
+fields retain space, including the next checks or proposal.
+
 The state file is atomically replaced after successful delivery. A process crash
 between Discord accepting a new message and recording its ID can still produce
 one duplicate on retry; Discord does not provide a transactional create with the

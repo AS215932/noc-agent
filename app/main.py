@@ -675,13 +675,16 @@ async def investigate_alert(
         incident_id=(case or {}).get("incident_id"),
         case_number=(case or {}).get("case_number"),
     )
-    await send_case_notification(
-        case_id=(case or {}).get("incident_id", display_title),
-        title=f"⏳ {display_title}",
-        description="Starting investigation and collecting telemetry.",
-        color=0xF39C12,
-        level=Verbosity.INFO,
-    )
+    from app.cases.reporting import reactive_reporting_owns_cards
+
+    if not (reactive_reporting_owns_cards() and alert_payload.get("source") in {"alertmanager", "icinga2"}):
+        await send_case_notification(
+            case_id=(case or {}).get("incident_id", display_title),
+            title=f"⏳ {display_title}",
+            description="Starting investigation and collecting telemetry.",
+            color=0xF39C12,
+            level=Verbosity.INFO,
+        )
 
     await _take_ownership_ack(alert_payload, case, runtime)
 
@@ -707,6 +710,7 @@ async def investigate_alert(
             model=safe.model_name,
         )
         await send_investigation_card(
+            source=str(alert_payload.get("source") or ""),
             runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
             notifier=send_case_notification,
             case_id=(case or {}).get("incident_id", display_title),
@@ -736,6 +740,7 @@ async def investigate_alert(
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
     await send_investigation_card(
+        source=str(alert_payload.get("source") or ""),
         runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
         notifier=send_case_notification,
         case_id=(case or {}).get("incident_id", display_title),
@@ -784,7 +789,9 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> list[object]:
     return results
 
 
-async def _maybe_request_reactive_case_report(observation, observe_result: object) -> None:
+async def _maybe_request_reactive_case_report(
+    observation, observe_result: object, *, background_tasks: BackgroundTasks | None = None,
+) -> None:
     """Optionally let CaseService own reactive report enqueue decisions."""
     if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
         return
@@ -808,6 +815,29 @@ async def _maybe_request_reactive_case_report(observation, observe_result: objec
         outbox_id=intent.outbox_id,
         state_signature=state_signature,
     )
+    from app.cases.reporting import reactive_reporting_owns_cards
+
+    if reactive_reporting_owns_cards() and intent.status == "pending" and background_tasks is not None:
+        from app.cases.handlers import build_report_handler
+        from app.cases.outbox import OutboxProcessor
+
+        # The response acknowledges durable intake immediately. This task is
+        # inserted before investigation tasks, so Discord latency does not cause
+        # monitor webhook retries. Failed delivery remains in the durable outbox.
+        processor = OutboxProcessor(case_service_runtime.store, {
+            "report": build_report_handler(service, notifier=send_case_notification),
+        })
+        async def attempt_initial_delivery():
+            try:
+                await processor.process_intent(intent)
+            except Exception:
+                # BackgroundTasks stops at an escaping exception. Store/claim
+                # failures must not strand the investigation queued after us;
+                # the durable outbox retains retry/lease recovery ownership.
+                log.warning("case_initial_delivery_deferred", case_id=case.case_id,
+                            outbox_id=intent.outbox_id)
+
+        background_tasks.add_task(attempt_initial_delivery)
 
 
 def _case_service_reactive_primary_enabled() -> bool:
@@ -1621,7 +1651,9 @@ def _case_service_alert_payload_for_result(alert_payload: dict, result: object) 
     return selected
 
 
-async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[object]:
+async def _observe_case_service_reactive_primary(
+    alert_payload: dict, *, background_tasks: BackgroundTasks | None = None,
+) -> list[object]:
     """Authoritative CaseService reactive intake; failures must propagate."""
 
     observations = _reactive_observations_from_alert_payload(alert_payload)
@@ -1635,7 +1667,7 @@ async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[ob
             status=getattr(observation, "status", ""),
             action=str(getattr(result, "action", "unknown")),
         )
-        await _maybe_request_reactive_case_report(observation, result)
+        await _maybe_request_reactive_case_report(observation, result, background_tasks=background_tasks)
     if results:
         log.info("case_service_reactive_primary_observed", count=len(results), source=alert_payload.get("source"))
     return results
@@ -1645,12 +1677,19 @@ async def _case_service_reactive_primary_response(
     alert_payload: dict, background_tasks: BackgroundTasks, *, label: str
 ) -> dict:
     _require_case_service_runtime()
+    # Enqueue every observation durably; only the selected investigation's
+    # facts need an immediate attempt ahead of that investigation.
     shadow_results = await _observe_case_service_reactive_primary(alert_payload)
     result = _case_service_primary_result(shadow_results)
     investigation_result = _case_service_reactive_investigation_result(shadow_results)
     case = getattr(result, "case", None) if result is not None else None
     investigation_case = getattr(investigation_result, "case", None) if investigation_result is not None else None
     if investigation_case is not None:
+        # Complete fallible report scheduling before claiming investigation;
+        # otherwise a database error could strand a claim behind its cooldown.
+        await _maybe_request_reactive_case_report(
+            investigation_result.observation, investigation_result, background_tasks=background_tasks,
+        )
         investigation_case = await case_service_runtime.service.claim_investigation(investigation_case)
     if investigation_case is not None:
         investigation_payload = _case_service_alert_payload_for_result(alert_payload, investigation_result)
@@ -1816,20 +1855,8 @@ def _safe_case_service_output_value(value: object, *, string_limit: int = 2000) 
 
 
 def _safe_monitor_text(value: object, *, limit: int) -> str:
-    text = str(value or "")
-    # The source is untrusted monitoring text. Keep only plain, single-line text
-    # and strip markdown/control delimiters so future consumers don't inherit a
-    # prompt-like or rich-text channel from webhook payloads.
-    cleaned = []
-    blocked = set("`<>[]{}")
-    for ch in text:
-        if ch in blocked or ord(ch) < 32:
-            cleaned.append(" ")
-        else:
-            cleaned.append(ch)
-    rendered = " ".join("".join(cleaned).split())
-    return (rendered or "—")[:limit]
-
+    from app.monitor_text import safe_monitor_text
+    return safe_monitor_text(value, limit=limit)
 
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
     """Reshape an Icinga notification into the dict shape investigate_alert expects."""
@@ -3068,12 +3095,38 @@ def _provider_from_model_name(model_name: str) -> str:
 
 @app.get("/health/cases")
 async def health_cases(response: Response):
+    from app.cases.report_spool import spool_stats
+    spool_error = False
+    try:
+        async with asyncio.timeout(2):
+            retained = await spool_stats()
+    except Exception as e:
+        spool_error = True
+        retained = {"status": "unavailable", "error": safe_health_error(e)}
+    spool_reasons = []
+    spool_threshold = max(30, _env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300))
+    if spool_error:
+        spool_reasons.append("report_spool_unavailable")
+    else:
+        if retained["scan_limited"]:
+            spool_reasons.append("report_spool_scan_limited")
+        if retained["invalid"]:
+            spool_reasons.append("retained_reports_invalid")
+        if retained["oldest_retained_at"] is not None:
+            retained_age = max(0, datetime.now(timezone.utc).timestamp() - retained["oldest_retained_at"])
+            if retained_age > spool_threshold:
+                spool_reasons.append("retained_reports_overdue")
     if case_service_runtime is None:
-        if _env_bool("NOC_CASE_OUTBOX_ENABLED", False):
+        enabled = _env_bool("NOC_CASE_OUTBOX_ENABLED", False)
+        reasons = list(spool_reasons)
+        if enabled or (not spool_error and retained["pending"]):
+            reasons.append("worker_runtime_unavailable")
+        if reasons:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {"status": "degraded", "enabled": True,
-                    "delivery": {"status": "degraded", "reasons": ["worker_runtime_unavailable"]}}
-        return {"status": "disabled", "enabled": False}
+            return {"status": "degraded", "enabled": enabled,
+                    "delivery": {"status": "degraded", "reasons": reasons},
+                    "report_spool": retained}
+        return {"status": "disabled", "enabled": False, "report_spool": retained}
     store = case_service_runtime.store
     try:
         async with asyncio.timeout(5):
@@ -3089,6 +3142,7 @@ async def health_cases(response: Response):
             "enabled": True,
             "backend": type(store).__name__,
             "error": safe_health_error(e),
+            "report_spool": retained,
         }
     lhp_settings = load_loop_handoff_settings()
     from app.cases.health import delivery_health
@@ -3100,6 +3154,9 @@ async def health_cases(response: Response):
         stale_after_s=_env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300),
         worker_interval_s=_env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30),
     )
+    delivery["reasons"].extend(spool_reasons)
+    if delivery["reasons"]:
+        delivery["status"] = "degraded"
     if delivery["status"] == "degraded":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
@@ -3113,6 +3170,7 @@ async def health_cases(response: Response):
         },
         "outbox": {"pending": queue_health.pending, "failed": queue_health.failed},
         "delivery": delivery,
+        "report_spool": retained,
         "verifier": {
             "enabled": lhp_settings.enabled and lhp_settings.case_verification_enabled,
             "running": case_verifier_task is not None and not case_verifier_task.done(),

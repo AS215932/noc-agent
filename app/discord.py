@@ -77,6 +77,7 @@ async def send_case_notification(
     fields: list[dict[str, Any]] | None = None,
     level: Verbosity = Verbosity.INFO,
     revision: float | None = None,
+    force_refresh: bool = False,
 ) -> bool | CardDeliveryOutcome:
     if level < get_verbosity():
         return False
@@ -84,6 +85,7 @@ async def send_case_notification(
         return await CASE_BOT_NOTIFIER(
             case_id=case_id,
             revision=revision,
+            force_refresh=force_refresh,
             title=title,
             description=description,
             color=color,
@@ -112,6 +114,7 @@ async def send_case_notification(
 
         return await deliver_case_card(
             destination=f"webhook:{url}",
+            force_refresh=force_refresh,
             case_id=case_id,
             payload=payload,
             revision=revision,

@@ -258,7 +258,9 @@ async def test_health_cases_reports_disabled(monkeypatch):
 
     response = await health_cases(http_response)
 
-    assert response == {"status": "disabled", "enabled": False}
+    assert response["status"] == "disabled"
+    assert response["enabled"] is False
+    assert response["report_spool"]["pending"] == 0
     assert http_response.status_code == status.HTTP_200_OK
 
 

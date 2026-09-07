@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
@@ -13,24 +14,35 @@ from app.discord import Verbosity, get_verbosity, send_case_notification
 from app.model_metrics import record_sanitized_discord_failure
 
 
-async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_case_notification, safe_category: str | None = None, **card) -> bool:
+def reactive_reporting_owns_cards() -> bool:
+    return all(os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"} for name in (
+        "NOC_CASESERVICE_REACTIVE_REPORT", "NOC_CASE_OUTBOX_ENABLED",
+    ))
+
+
+async def send_investigation_card(*, runtime: Any, case_id: str, source: str | None = None, notifier=send_case_notification, safe_category: str | None = None, **card) -> bool:
     card.setdefault("level", Verbosity.INFO)
     card.setdefault("fields", [])
     card.setdefault("color", 0x3498DB)
     if card["level"] < get_verbosity():
         return False
     revision = time.time()
+    ownership_enabled = reactive_reporting_owns_cards()
+    owns_cards = ownership_enabled and source in {"alertmanager", "icinga2"}
     intent = None
+    candidate = OutboxIntent(
+        case_id=case_id, intent_type="report", idempotency_key=f"card-update:{case_id}:{revision}",
+        payload={"card_update": card, "card_revision": revision, "safe_category": safe_category,
+                 "reactive_owned_card": owns_cards},
+    )
     if runtime is not None:
         try:
             case = await runtime.store.get_case(case_id)
             if isinstance(case, AtomicCaseProjection):
-                intent = await runtime.store.enqueue_outbox(OutboxIntent(
-                    case_id=case_id,
-                    intent_type="report",
-                    idempotency_key=f"card-update:{case_id}:{revision}",
-                    payload={"card_update": card, "card_revision": revision, "safe_category": safe_category},
-                ))
+                if source is None:
+                    owns_cards = ownership_enabled and case.identity.get("source") in {"alertmanager", "icinga2"}
+                    candidate.payload["reactive_owned_card"] = owns_cards
+                intent = await runtime.store.enqueue_outbox(candidate)
         except Exception as exc:
             log.warn("investigation_card_enqueue_failed", error_type=type(exc).__name__, case_id=case_id)
     if intent is not None:
@@ -48,6 +60,14 @@ async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_c
         except Exception as exc:
             log.warn("investigation_card_processing_failed", error_type=type(exc).__name__, case_id=case_id)
             return False
+    if owns_cards:
+        from app.cases.report_spool import retain_report
+
+        await retain_report(candidate)
+        # A store outage must not bypass the durable facts prerequisite by
+        # creating a terminal-only card through the standalone transport.
+        log.warn("investigation_card_delivery_deferred", case_id=case_id)
+        return False
     # Standalone/dev use has no outbox; give transient failures a bounded retry.
     for attempt in range(3):
         delivered = await notifier(case_id=case_id, revision=revision, **card)
