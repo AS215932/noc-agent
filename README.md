@@ -361,7 +361,8 @@ is retained in a private, atomically written and fsynced local report spool.
 (`data/mail-drafts/.notifications/report-spool` when the mail directory is unset).
 Keep this directory on persistent storage. The outbox worker replays at most 100
 records per tick with their original idempotency keys and removes each file only
-after the database acknowledges it. Invalid records and records rejected by
+after the database acknowledges it. Existing retained records drain whenever
+the outbox worker runs, even after reactive ownership is disabled. Invalid records and records rejected by
 database integrity constraints are retained as `.invalid` files in the private
 `quarantine/` subdirectory for inspection, outside replay discovery. Discovery
 examines at most 1,000 top-level entries and migrates legacy top-level invalid

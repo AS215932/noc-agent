@@ -58,14 +58,12 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
     from app.cases.handlers import build_default_outbox_handlers
 
     runtime.outbox_last_started_at = time.time()
-    from app.cases.reporting import reactive_reporting_owns_cards
     from app.cases.report_spool import replay_reports
 
-    if reactive_reporting_owns_cards():
-        try:
-            await replay_reports(runtime.store)
-        except Exception as exc:
-            log_exception("report_spool_replay_failed", exc)
+    try:
+        await replay_reports(runtime.store)
+    except Exception as exc:
+        log_exception("report_spool_replay_failed", exc)
     try:
         await enqueue_due_case_reminders(runtime)
     except Exception as exc:

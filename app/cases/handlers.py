@@ -116,7 +116,7 @@ def build_report_handler(
                     bundled_facts_need_stamp = True
                 else:
                     initial = await case_service.store.get_outbox_by_key(f"report:{case.case_id}:{current_signature}")
-                    if initial is None:
+                    if initial is None or initial.payload.get("notification_suppressed") == "verbosity":
                         # Handoff and other non-observation transitions can change
                         # the signature. Ensure the prerequisite actually exists.
                         await case_service.request_report(case, state_signature=current_signature,

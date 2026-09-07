@@ -139,12 +139,13 @@ async def test_retained_backlog_degrades_health_even_with_healthy_worker(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_worker_replays_retained_intent_before_processing(monkeypatch):
+@pytest.mark.parametrize("owns_cards", ["0", "1"])
+async def test_worker_replays_retained_intent_before_processing(monkeypatch, owns_cards):
     from app.cases import CaseService
     from app.cases.runtime import CaseServiceRuntime, process_case_outbox_once
     from app.cases.outbox import OutboxProcessReport
 
-    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_REPORT", "1")
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_REPORT", owns_cards)
     monkeypatch.setenv("NOC_CASE_OUTBOX_ENABLED", "1")
     store = InMemoryCaseStore()
     state = CaseServiceRuntime(store=store, service=CaseService(store))
