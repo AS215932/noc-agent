@@ -1097,6 +1097,9 @@ class CaseService:
         case.updated_at = now
         case.last_seen = observation.observed_at
         case.last_observed_unhealthy = observation.observed_at
+        # Positive-clean evidence belongs to the previous healthy interval.
+        case.resolution_reason = ""
+        case.resolved_at = None
         case.last_evaluated_at = observation.observed_at
         case.last_scan_cycle_id = observation.scan_cycle_id
         case.policy_version = self.policy.policy_version

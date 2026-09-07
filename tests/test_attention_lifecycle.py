@@ -118,3 +118,32 @@ async def test_unacknowledged_rebounds_do_not_create_recurrence():
         await processor.process_pending()
         assert case.report_generation == 0
     assert [call.args[1].kind for call in sender.await_args_list] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_recurrence_clears_evidence_before_graph_resolution():
+    from app.cases.graph_memory import CaseServiceGraphMemory
+
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    sender = AsyncMock(return_value=True)
+    processor = OutboxProcessor(store, {"report": build_attention_handler(store, sender=sender)})
+
+    async def observe(status):
+        case = (await service.observe(ObservationRecord(source="icinga2", detector="Disk", resource="rtr",
+            severity="HIGH", status=status, source_health="healthy"))).case
+        await enqueue_attention(store, case)
+        await processor.process_pending()
+        return case
+
+    await observe("firing")
+    recovered = await observe("clean")
+    assert recovered.resolution_reason == "positive_clean_observation"
+    recurring = await observe("firing")
+    assert recurring.resolution_reason == ""
+    assert recurring.resolved_at is None
+    await CaseServiceGraphMemory(store).update_case(recurring.case_id, {"status": "resolved"})
+    assert await enqueue_attention(store, await store.get_case(recurring.case_id)) is None
+    assert [call.args[1].kind for call in sender.await_args_list] == ["new", "recovery", "recurrence"]
+    await observe("clean")
+    assert sender.await_args_list[-1].args[1].kind == "recovery"
