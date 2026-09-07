@@ -79,7 +79,8 @@ def build_report_handler(
     reminder_notifier=send_discord_notification,
     control_public_url: str = "",
 ) -> OutboxHandler:
-    attention_handler = build_attention_handler(case_service.store, sender=build_attention_sender(notifier=notifier))
+    attention_handler = build_attention_handler(case_service.store, sender=build_attention_sender(notifier=notifier),
+                                                 reminder_seconds=case_service.policy.report_reassert_s)
 
     async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
         if "attention_request" in intent.payload:

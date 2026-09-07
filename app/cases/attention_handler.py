@@ -17,7 +17,7 @@ from app.cases.store import CaseStore
 AttentionSender = Callable[[AtomicCaseProjection, AttentionRequest, OutboxIntent], Awaitable[bool | None]]
 
 
-def build_attention_handler(store: CaseStore, *, sender: AttentionSender) -> OutboxHandler:
+def build_attention_handler(store: CaseStore, *, sender: AttentionSender, reminder_seconds: int = 21600) -> OutboxHandler:
     """Keep ownership until the processor atomically commits successful delivery."""
     async def eligible(intent: OutboxIntent, request: AttentionRequest) -> AtomicCaseProjection | None:
         if not intent.case_id:
@@ -28,7 +28,7 @@ def build_attention_handler(store: CaseStore, *, sender: AttentionSender) -> Out
         if case.identity.get("source") not in {"alertmanager", "icinga2"}:
             return None
         previous = await store.get_attention(case.case_id)
-        current = attention_due(case, previous, now=datetime.now(timezone.utc))
+        current = attention_due(case, previous, now=datetime.now(timezone.utc), reminder_seconds=reminder_seconds)
         return case if current == request else None
 
     async def handle(intent: OutboxIntent) -> OutboxHandlerResult:

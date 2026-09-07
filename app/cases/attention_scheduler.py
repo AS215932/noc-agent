@@ -6,11 +6,12 @@ from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.store import CaseStore
 
 
-async def enqueue_attention(store: CaseStore, case: AtomicCaseProjection, *, now: datetime | None = None) -> OutboxIntent | None:
+async def enqueue_attention(store: CaseStore, case: AtomicCaseProjection, *, now: datetime | None = None,
+                            reminder_seconds: int = 21600) -> OutboxIntent | None:
     if case.identity.get("source") not in {"alertmanager", "icinga2"}:
         return None
     previous = await store.get_attention(case.case_id)
-    request = attention_due(case, previous, now=now or datetime.now(timezone.utc))
+    request = attention_due(case, previous, now=now or datetime.now(timezone.utc), reminder_seconds=reminder_seconds)
     if request is None:
         return None
     intent = await store.enqueue_outbox(OutboxIntent(
@@ -38,11 +39,11 @@ async def enqueue_attention(store: CaseStore, case: AtomicCaseProjection, *, now
 
 
 async def enqueue_attention_batch(store: CaseStore, *, after_case_id: str = "", limit: int = 100,
-                                  now: datetime | None = None) -> tuple[str, int]:
+                                  now: datetime | None = None, reminder_seconds: int = 21600) -> tuple[str, int]:
     limit = max(1, min(limit, 1000))
     cases = await store.list_attention_candidates(after_case_id=after_case_id, limit=limit)
     count = 0
     for case in cases:
-        if await enqueue_attention(store, case, now=now) is not None:
+        if await enqueue_attention(store, case, now=now, reminder_seconds=reminder_seconds) is not None:
             count += 1
     return (cases[-1].case_id if len(cases) == limit else "", count)

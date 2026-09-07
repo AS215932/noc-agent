@@ -47,6 +47,7 @@ async def enqueue_due_case_reminders(runtime: CaseServiceRuntime, *, batch_size:
     if attention_enabled():
         runtime.attention_cursor, count = await enqueue_attention_batch(
             runtime.store, after_case_id=runtime.attention_cursor, limit=batch_size,
+            reminder_seconds=runtime.service.policy.report_reassert_s,
         )
         return count
     if not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
