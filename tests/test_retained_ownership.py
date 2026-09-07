@@ -30,7 +30,7 @@ async def test_retained_owned_terminal_keeps_facts_order_and_sanitization_after_
     initial = await service.request_report(case)
     assert (await processor.process_intent(initial)).failed == 1
     # Store-unavailable creation must retain ownership in the file itself.
-    await send_investigation_card(runtime=None, case_id=case.case_id, notifier=notifier,
+    await send_investigation_card(runtime=None, case_id=case.case_id, source="icinga2", notifier=notifier,
         title="Investigation result", description="Diagnosis retained", level=Verbosity.ERROR)
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_REPORT", "0")
     assert await replay_reports(store) == 1

@@ -84,7 +84,7 @@ async def test_owned_enqueue_failure_retains_terminal_without_channel_fallback(m
     monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
     notifier = AsyncMock()
     runtime = SimpleNamespace(store=SimpleNamespace(get_case=AsyncMock(side_effect=ConnectionError("offline"))))
-    assert not await send_investigation_card(runtime=runtime, case_id="case_test", notifier=notifier,
+    assert not await send_investigation_card(runtime=runtime, case_id="case_test", source="icinga2", notifier=notifier,
                                              description="investigation result")
     notifier.assert_not_awaited()
     store = InMemoryCaseStore()
@@ -101,7 +101,7 @@ async def test_retention_failure_is_not_reported_as_success(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
     monkeypatch.setattr("app.cases.report_spool._retain", lambda _: (_ for _ in ()).throw(OSError("disk full")))
     with pytest.raises(OSError):
-        await send_investigation_card(runtime=None, case_id="case_test", description="result")
+        await send_investigation_card(runtime=None, case_id="case_test", source="icinga2", description="result")
 
 
 @pytest.mark.asyncio

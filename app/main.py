@@ -710,6 +710,7 @@ async def investigate_alert(
             model=safe.model_name,
         )
         await send_investigation_card(
+            source=str(alert_payload.get("source") or ""),
             runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
             notifier=send_case_notification,
             case_id=(case or {}).get("incident_id", display_title),
@@ -739,6 +740,7 @@ async def investigate_alert(
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
     await send_investigation_card(
+        source=str(alert_payload.get("source") or ""),
         runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
         notifier=send_case_notification,
         case_id=(case or {}).get("incident_id", display_title),
