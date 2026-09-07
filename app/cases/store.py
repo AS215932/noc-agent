@@ -171,6 +171,8 @@ class CaseStore(Protocol):
         self, intent: OutboxIntent, *, expected_status: str, expected_claim_token: str | None = None
     ) -> OutboxIntent | None: ...
 
+    async def get_outbox_by_key(self, idempotency_key: str) -> OutboxIntent | None: ...
+
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]: ...
 
     async def outbox_health(self) -> OutboxHealth: ...
@@ -645,6 +647,11 @@ class InMemoryCaseStore:
             self._outbox[stored.outbox_id] = stored
             self._outbox_index[stored.idempotency_key] = stored.outbox_id
             return stored.model_copy(deep=True)
+
+    async def get_outbox_by_key(self, idempotency_key: str) -> OutboxIntent | None:
+        async with self._lock:
+            outbox_id = self._outbox_index.get(idempotency_key)
+            return self._outbox[outbox_id].model_copy(deep=True) if outbox_id else None
 
     async def outbox_health(self) -> OutboxHealth:
         counts = {"pending": 0, "failed": 0, "in_progress": 0}

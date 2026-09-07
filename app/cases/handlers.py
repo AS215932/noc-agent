@@ -8,8 +8,10 @@ from typing import Any
 
 from app.case_cards import CardDeliveryOutcome
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
+from app.monitor_text import safe_monitor_text
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
+from app.cases.reporting import reactive_reporting_owns_cards
 from app.cases.service import CaseService
 from app.config import LoopHandoffSettings
 from app.discord import Verbosity, get_verbosity, send_case_notification, send_discord_notification
@@ -92,19 +94,68 @@ def build_report_handler(
         ):
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
         update = intent.payload.get("card_update")
+        revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
+        bundled_facts_need_stamp = False
         if isinstance(update, dict):
+            level = Verbosity(int(update["level"]))
+            if level < get_verbosity():
+                return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
+            owns_case = (intent.payload.get("reactive_owned_card") is True or reactive_reporting_owns_cards()) and case.identity.get("source") in {"alertmanager", "icinga2"}
+            # Every owned update is self-contained. Discord can delete the
+            # original at any time, including after a successful initial report;
+            # the transport's replacement create must retain monitor facts.
+            bundled_facts = _render_case_report(case, intent) if owns_case else None
+            current_signature = case_service.report_state_signature(case)
+            if (owns_case
+                    and (not case.last_reported_at or case.last_reported_signature != current_signature)):
+                initial_level = _case_report_level(case)
+                if initial_level < get_verbosity():
+                    # An eligible terminal ERROR must not vanish merely because
+                    # its prerequisite facts have a lower severity. Include those
+                    # facts first in this eligible message instead.
+                    bundled_facts = _render_case_report(case, intent)
+                    bundled_facts_need_stamp = True
+                else:
+                    initial = await case_service.store.get_outbox_by_key(f"report:{case.case_id}:{current_signature}")
+                    if initial is None or initial.payload.get("notification_suppressed") == "verbosity":
+                        # Handoff and other non-observation transitions can change
+                        # the signature. Ensure the prerequisite actually exists.
+                        await case_service.request_report(case, state_signature=current_signature,
+                                                          payload={"card_revision": revision})
+                    if not (initial and initial.status == "succeeded" and not initial.payload.get("notification_suppressed")):
+                        raise RuntimeError("Current case facts have not been delivered")
+                    # A local revision cannot prove the remote card still exists.
+                    # Refresh facts at this update's revision before any terminal
+                    # content, so replacement of a deleted legacy card starts with facts.
+                    facts_title, facts_description, facts_fields = _render_case_report(case, initial)
+                    facts_title, facts_description, facts_fields = _budget_report_embed(facts_title, facts_description, facts_fields)
+                    facts_delivered = await notifier(
+                        case_id=case.case_id, title=facts_title, description=facts_description,
+                        fields=facts_fields, color=_severity_color(case.severity), level=initial_level,
+                        revision=revision, force_refresh=True,
+                    )
+                    if facts_delivered is CardDeliveryOutcome.SUPERSEDED:
+                        return OutboxHandlerResult(payload_updates={"notification_superseded": True})
+                    if facts_delivered is False:
+                        raise RuntimeError("Current case facts refresh was not delivered")
+                    await case_service.mark_reported(case.case_id, state_signature=current_signature)
             title = str(update["title"])
             description = str(update["description"])
             fields = update.get("fields") or []
             color = int(update["color"])
-            level = Verbosity(int(update["level"]))
+            if bundled_facts is not None:
+                _, facts_description, facts_fields = bundled_facts
+                description = _clip(facts_description, limit=1000) + "\n\n" + _clip(description, limit=1000)
+                # Investigation actions take priority; facts are also retained
+                # in the description when contextual fields exceed the limit.
+                fields = (list(fields) + facts_fields)[:10]
         else:
             title, description, fields = _render_case_report(case, intent)
             color = _severity_color(case.severity)
-            level = Verbosity.WARNING if case.severity in {"HIGH", "MEDIUM"} else Verbosity.INFO
+            level = _case_report_level(case)
+        title, description, fields = _budget_report_embed(title, description, fields)
         if level < get_verbosity():
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
-        revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
         if reminder_since:
             delivered = await reminder_notifier(
                 title=f"Unacknowledged critical incident: {title}"[:256],
@@ -130,7 +181,9 @@ def build_report_handler(
         if delivered is False:
             raise RuntimeError("Discord case notification was not delivered")
         if isinstance(update, dict):
-            # An investigation update is not a new case-state report signature.
+            if bundled_facts_need_stamp:
+                await case_service.mark_reported(case.case_id, state_signature=current_signature)
+            # Other investigation updates do not advance the facts projection.
             return OutboxHandlerResult(payload_updates={"card_update_delivered": True})
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
         await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
@@ -141,6 +194,28 @@ def build_report_handler(
         )
 
     return handle
+
+
+def _budget_report_embed(title: str, description: str, fields: list[dict]) -> tuple[str, str, list[dict]]:
+    """Reserve room for every selected field within Discord's total limit."""
+    title = _clip(title, limit=256)
+    description = _clip(description, limit=2002)
+    selected = fields[:10]
+    remaining = 5900 - len(title) - len(description)
+    budgeted = []
+    for index, field in enumerate(selected):
+        allowance = remaining // (len(selected) - index)
+        name = _clip(str(field.get("name") or "Details"), limit=min(256, allowance // 2))
+        value = _clip(str(field.get("value") or "—"), limit=min(1024, allowance - len(name)))
+        budgeted.append({**field, "name": name, "value": value})
+        remaining -= len(name) + len(value)
+    return title, description, budgeted
+
+
+def _case_report_level(case: AtomicCaseProjection) -> Verbosity:
+    if case.severity == "HIGH":
+        return Verbosity.ERROR
+    return Verbosity.WARNING if case.severity == "MEDIUM" else Verbosity.INFO
 
 
 def build_engineering_lhp_handoff_handler(
@@ -314,7 +389,10 @@ def _render_case_report(case: AtomicCaseProjection, intent: OutboxIntent) -> tup
         for item in intent.payload.get("fields") or []:
             if isinstance(item, dict) and item.get("name") and item.get("value"):
                 fields.append({"name": _clip(str(item["name"]), limit=256), "value": _clip(str(item["value"])), "inline": bool(item.get("inline", False))})
-    return _clip(title, limit=256), _clip(description, limit=4096), fields[:10]
+    return safe_monitor_text(title, limit=256), safe_monitor_text(description, limit=4096), [
+        {**item, "name": safe_monitor_text(item["name"], limit=256), "value": safe_monitor_text(item["value"], limit=1024)}
+        for item in fields[:10]
+    ]
 
 
 def _handoff_issue_title(case: AtomicCaseProjection, intent: OutboxIntent) -> str:

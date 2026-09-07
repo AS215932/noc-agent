@@ -38,6 +38,7 @@ async def deliver_case_card(
     case_id: str,
     payload: dict[str, Any],
     revision: float | None = None,
+    force_refresh: bool = False,
     create: Callable[[], Awaitable[int | None]],
     edit: Callable[[int], Awaitable[bool]],
 ) -> bool | CardDeliveryOutcome:
@@ -83,7 +84,7 @@ async def deliver_case_card(
                 if message_id is not None:
                     if revision < previous_revision:
                         return CardDeliveryOutcome.SUPERSEDED
-                    if previous == digest and 0 <= verified_now - verified_at < CARD_REFRESH_S:
+                    if not force_refresh and previous == digest and 0 <= verified_now - verified_at < CARD_REFRESH_S:
                         if revision == previous_revision:
                             return True
                         # Advance ordering without a network request or falsely
