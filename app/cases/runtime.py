@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass, field
 
 from app.cases.outbox import OutboxProcessReport, OutboxProcessor
+from app.cases.attention import attention_enabled
+from app.cases.attention_scheduler import enqueue_attention_batch
 from app.cases.policy import CasePolicy
 from app.cases.service import CaseService
 from app.cases.store import CaseStore, InMemoryCaseStore
@@ -20,6 +22,7 @@ class CaseServiceRuntime:
     service: CaseService
     store: CaseStore
     reminder_cursor: str = ""
+    attention_cursor: str = ""
     started_at: float = field(default_factory=time.time)
     started_monotonic: float = field(default_factory=time.monotonic)
     outbox_last_started_at: float = 0.0
@@ -41,6 +44,11 @@ async def enqueue_due_case_reminders(runtime: CaseServiceRuntime, *, batch_size:
     A restart starts another scan; durable report keys make replay harmless.
     Eligibility is checked here and again by the delivery handler.
     """
+    if attention_enabled():
+        runtime.attention_cursor, count = await enqueue_attention_batch(
+            runtime.store, after_case_id=runtime.attention_cursor, limit=batch_size,
+        )
+        return count
     if not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
         return 0
     batch_size = max(1, min(batch_size, 1000))

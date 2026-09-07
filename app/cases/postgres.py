@@ -11,6 +11,7 @@ import json
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, AsyncIterator, cast
+from uuid import uuid4
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -50,6 +51,7 @@ from app.cases.store import (
 )
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
+from app.cases.attention import AttentionDelivery
 
 
 class _GuardAwareAcquire:
@@ -390,6 +392,17 @@ class PostgresCaseStore:
             )
         return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
 
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT payload FROM cases WHERE kind='atomic' AND case_id > $1
+                   AND payload#>>'{identity,source}' IN ('alertmanager', 'icinga2')
+                   AND status NOT IN ('closed','expired','linked','recovered_pending')
+                   ORDER BY case_id LIMIT $2""",
+                after_case_id, max(0, min(limit, 1000)),
+            )
+        return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
+
     async def append_event(self, event: CaseEvent) -> CaseEvent:
         async with self.pool.acquire() as conn:
             return await _insert_case_event(conn, event)
@@ -686,6 +699,76 @@ class PostgresCaseStore:
         if not row:
             raise KeyError(f"outbox intent not found: {intent.outbox_id}")
         return OutboxIntent.model_validate(_row_payload(row))
+
+    async def get_attention(self, case_id: str) -> AttentionDelivery | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM case_attention_delivery WHERE case_id = $1", case_id)
+        return AttentionDelivery.model_validate(_row_payload(row)) if row else None
+
+    async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None:
+        if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:
+            raise ValueError("invalid attention lease")
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", "case-attention:" + intent.case_id)
+            row = await conn.fetchrow(
+                """SELECT outbox_id FROM side_effect_outbox
+                   WHERE outbox_id=$1 AND case_id=$2 AND status='in_progress'
+                     AND COALESCE(payload->>'claim_token', '')=$3
+                     AND EXISTS(SELECT 1 FROM cases WHERE case_id=$2 AND kind='atomic') FOR UPDATE""",
+                intent.outbox_id, intent.case_id, intent.claim_token,
+            )
+            previous = await conn.fetchval("SELECT sequence FROM case_attention_delivery WHERE case_id=$1", intent.case_id)
+            if row is None or (previous or 0) != expected_sequence:
+                return None
+            token = uuid4().hex
+            return await conn.fetchval(
+                """INSERT INTO case_attention_lease(case_id, lease_token, outbox_id, claim_token, expires_at)
+                   VALUES($1,$2,$3,$4,clock_timestamp()+make_interval(secs => $5))
+                   ON CONFLICT(case_id) DO UPDATE SET lease_token=EXCLUDED.lease_token,
+                     outbox_id=EXCLUDED.outbox_id, claim_token=EXCLUDED.claim_token, expires_at=EXCLUDED.expires_at
+                   WHERE case_attention_lease.expires_at <= clock_timestamp() RETURNING lease_token""",
+                intent.case_id, token, intent.outbox_id, intent.claim_token, lease_seconds,
+            )
+
+    async def release_attention(self, case_id: str, lease_token: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2", case_id, lease_token)
+
+    async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str) -> OutboxIntent | None:
+        if intent.status != "succeeded" or intent.case_id != delivery.case_id or delivery.sequence != expected_sequence + 1:
+            raise ValueError("invalid attention completion")
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", "case-attention:" + delivery.case_id)
+            row = await conn.fetchrow(
+                """SELECT outbox_id FROM side_effect_outbox
+                   WHERE outbox_id=$1 AND case_id=$2 AND status='in_progress'
+                     AND COALESCE(payload->>'claim_token', '')=$3 FOR UPDATE""",
+                intent.outbox_id, delivery.case_id, expected_claim_token,
+            )
+            previous = await conn.fetchval("SELECT sequence FROM case_attention_delivery WHERE case_id=$1", delivery.case_id)
+            lease = await conn.fetchrow(
+                """SELECT case_id FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2
+                   AND outbox_id=$3 AND claim_token=$4 AND expires_at > clock_timestamp() FOR UPDATE""",
+                delivery.case_id, lease_token, intent.outbox_id, expected_claim_token,
+            )
+            if row is None or (previous or 0) != expected_sequence or lease is None:
+                return None
+            await conn.execute(
+                """INSERT INTO case_attention_delivery(case_id, sequence, delivered_at, payload)
+                   VALUES($1,$2,$3,$4::jsonb) ON CONFLICT(case_id) DO UPDATE
+                   SET sequence=EXCLUDED.sequence, delivered_at=EXCLUDED.delivered_at, payload=EXCLUDED.payload""",
+                delivery.case_id, delivery.sequence, delivery.delivered_at, delivery.model_dump_json(),
+            )
+            row = await conn.fetchrow(
+                """UPDATE side_effect_outbox SET status=$2, attempts=$3, next_attempt_at=$4,
+                   completed_at=$5, external_id=$6, external_url=$7, error=$8, payload=$9::jsonb,
+                   schema_version=$10 WHERE outbox_id=$1 RETURNING payload""",
+                intent.outbox_id, intent.status, intent.attempts, intent.next_attempt_at, intent.completed_at,
+                intent.external_id, intent.external_url, intent.error, intent.model_dump_json(), intent.schema_version,
+            )
+            await conn.execute("DELETE FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2", delivery.case_id, lease_token)
+            return OutboxIntent.model_validate(_row_payload(row))
 
     async def update_outbox_if_status(
         self, intent: OutboxIntent, *, expected_status: str, expected_claim_token: str | None = None

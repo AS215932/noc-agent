@@ -402,6 +402,8 @@ events remain A4 fixtures/proposals until human review promotes them elsewhere.
 - `NOC_CASESERVICE_SHADOW` (default `0`; best-effort case-service shadow writes)
 - `NOC_CASESERVICE_CONTROL` (deprecated for app runtime; forces proactive case-owned cooldown/report state in custom embeddings)
 - `NOC_CASESERVICE_REACTIVE_REPORT` (default `0`; enqueue reactive report intents from case state)
+- `NOC_CASE_ATTENTION_ENABLED` (default `0`; requires both reactive reporting and the outbox worker;
+  use the separate durable attention clock for reactive incident notifications)
 - `NOC_CASE_REPORT_REASSERT_S` (default `21600`; unchanged-case reminders have a six-hour minimum,
   even if a legacy override is shorter). Only unacknowledged `HIGH` cases remain eligible;
   resolved, closed, expired, linked, recovering, snoozed, suppressed and covered child cases do not repeat.
@@ -536,3 +538,44 @@ See [TESTING.md](TESTING.md).
 The additive `delivery` object exposes heartbeat timestamps/age, oldest report age, count and reason codes without case content. Heartbeat elapsed time uses a process-local monotonic clock and resets on restart; outstanding report age comes from durable outbox creation timestamps and survives restart. Configure an independent monitor against this endpoint before transferring notification ownership. This change does not add monitor routing, disable direct alerts, or activate case-owned reporting.
 
 Delivery health SQL requires PostgreSQL16 or later (production verified on17). It classifies malformed/non-finite report timestamps as invalid rather than aborting the aggregate. The additive side_effect_outbox_health_idx covers pending, failed and in_progress rows, leaving completed history outside the health scan. It is created through the existing bounded schema setup; rollback binaries can leave this compatible index in place.
+
+## Durable reactive incident attention
+
+Keep `NOC_CASE_ATTENTION_ENABLED=0` until initial-card ownership and the independent
+delivery-health monitor have been deployed and validated. Enabling attention also
+requires `NOC_CASESERVICE_REACTIVE_REPORT=1` and `NOC_CASE_OUTBOX_ENABLED=1`.
+Direct monitor notification routes must remain available until the application
+and its independent failure notification path are proven live.
+
+The attention worker scans cases with stable case-ID pagination. Initial attention
+shares the persistent facts card; escalation, recurrence, recovery and six-hour
+unacknowledged critical reminders have separate durable message identities in the
+same destination. Quiet case-card updates never advance the attention clock.
+Human acknowledgement suppresses firing attention until a recurrence or severity
+increase; the automatic Icinga investigation acknowledgement is separate.
+Positive recovery can notify even if the firing incident was acknowledged.
+The new scheduler inhibits the legacy reactive reminder path while ownership is
+enabled. Already queued attention intents retain their handler after flags change.
+
+Successful attention is stored separately from strict case JSON, with its phase,
+severity, generation, sequence and delivery time. Outbox completion and the
+attention projection commit in one transaction. A per-case lease excludes active
+competing deliveries. Fresh eligibility is checked after acquiring it, and the
+60-second delivery deadline is shorter than the 120-second lease. Failure,
+suppression and cancellation do not advance the clock. Temporary suppression or
+verbosity filtering can reopen the same undelivered request when it becomes
+eligible. PostgreSQL tests cover rollback, lease expiry, stale ownership,
+concurrency, restart and pagination.
+
+Discord message identity is persisted locally so ordinary retries after database
+failure reuse the same message. This is not an exactly-once guarantee: a crash
+after Discord accepts a create but before local identity persistence, or loss of
+the local identity directory, can still create a duplicate on retry. Preserve
+`DISCORD_CASE_STATE_DIR` (or the default directory under `MAIL_DRAFT_DIR`) across
+deployments. No synthetic channel traffic is needed for local tests.
+
+Rollback must disable attention creation and restore reviewed direct monitor
+routing if necessary; preserve attention tables, outbox records, and local card
+state. Older binaries ignore the additive tables but do not understand attention
+payloads: drain retained attention work with a compatible binary before rolling
+back the application itself.

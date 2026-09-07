@@ -408,6 +408,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS handoff_transport_deliveries_status_idx
         ON handoff_transport_deliveries (status, next_attempt_at)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS case_attention_delivery (
+        case_id TEXT PRIMARY KEY REFERENCES cases(case_id),
+        sequence BIGINT NOT NULL CHECK (sequence > 0),
+        delivered_at TIMESTAMPTZ NOT NULL,
+        payload JSONB NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS case_attention_lease (
+        case_id TEXT PRIMARY KEY REFERENCES cases(case_id),
+        lease_token TEXT NOT NULL,
+        outbox_id TEXT NOT NULL REFERENCES side_effect_outbox(outbox_id),
+        claim_token TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+    )
+    """,
 )
 
 

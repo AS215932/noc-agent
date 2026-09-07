@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from app.case_cards import CardDeliveryOutcome
+from app.cases.attention_handler import build_attention_handler
+from app.cases.attention_sender import build_attention_sender
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
@@ -77,7 +79,14 @@ def build_report_handler(
     reminder_notifier=send_discord_notification,
     control_public_url: str = "",
 ) -> OutboxHandler:
+    attention_handler = build_attention_handler(case_service.store, sender=build_attention_sender(notifier=notifier))
+
     async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+        if "attention_request" in intent.payload:
+            result = await attention_handler(intent)
+            if result is None:
+                raise RuntimeError("attention handler omitted delivery result")
+            return result
         if not intent.case_id:
             raise ValueError("report intent requires case_id")
         case = await case_service.store.get_case(intent.case_id)

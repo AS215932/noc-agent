@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
+from app.cases.attention import AttentionDelivery
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -141,6 +143,8 @@ class CaseStore(Protocol):
 
     async def list_reminder_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]: ...
 
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]: ...
+
     async def append_event(self, event: CaseEvent) -> CaseEvent: ...
 
     async def case_events(
@@ -164,6 +168,15 @@ class CaseStore(Protocol):
     ) -> CaseLinkResult | None: ...
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
+
+    async def get_attention(self, case_id: str) -> AttentionDelivery | None: ...
+
+    async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None: ...
+
+    async def release_attention(self, case_id: str, lease_token: str) -> None: ...
+
+    async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str) -> OutboxIntent | None: ...
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
@@ -308,6 +321,8 @@ class InMemoryCaseStore:
         self._alias_index: dict[tuple[str, str], str] = {}
         self._outbox: dict[str, OutboxIntent] = {}
         self._outbox_index: dict[str, str] = {}
+        self._attention: dict[str, AttentionDelivery] = {}
+        self._attention_leases: dict[str, tuple[str, str, str, datetime]] = {}
         self._handoffs: dict[str, CaseHandoff] = {}
         self._handoff_idempotency_index: dict[str, str] = {}
         self._active_handoff_index: dict[tuple[str, str, str], str] = {}
@@ -440,6 +455,15 @@ class InMemoryCaseStore:
                  and case.case_id > after_case_id and case.severity == "HIGH" and case.last_reported_at),
                 key=lambda case: case.case_id,
             )
+            return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
+
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
+        async with self._lock:
+            cases = sorted((case for case in self._cases.values()
+                            if isinstance(case, AtomicCaseProjection) and case.case_id > after_case_id
+                            and case.identity.get("source") in {"alertmanager", "icinga2"}
+                            and case.status not in {"closed", "expired", "linked", "recovered_pending"}),
+                           key=lambda case: case.case_id)
             return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
 
     async def append_event(self, event: CaseEvent) -> CaseEvent:
@@ -620,6 +644,54 @@ class InMemoryCaseStore:
         self._outbox[stored.outbox_id] = stored
         self._outbox_index[stored.idempotency_key] = stored.outbox_id
         return stored
+
+    async def get_attention(self, case_id: str) -> AttentionDelivery | None:
+        async with self._lock:
+            value = self._attention.get(case_id)
+            return value.model_copy(deep=True) if value else None
+
+    async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None:
+        if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:
+            raise ValueError("invalid attention lease")
+        async with self._lock:
+            current = self._outbox.get(intent.outbox_id)
+            previous = self._attention.get(intent.case_id)
+            lease = self._attention_leases.get(intent.case_id)
+            now = datetime.now(timezone.utc)
+            if (current is None or current.status != "in_progress" or current.claim_token != intent.claim_token
+                    or current.case_id != intent.case_id or (previous.sequence if previous else 0) != expected_sequence
+                    or (lease is not None and lease[3] > now)):
+                return None
+            self._require_atomic_case_locked(intent.case_id)
+            token = uuid4().hex
+            self._attention_leases[intent.case_id] = (token, intent.outbox_id, intent.claim_token,
+                                                     now + timedelta(seconds=lease_seconds))
+            return token
+
+    async def release_attention(self, case_id: str, lease_token: str) -> None:
+        async with self._lock:
+            lease = self._attention_leases.get(case_id)
+            if lease is not None and lease[0] == lease_token:
+                del self._attention_leases[case_id]
+
+    async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str) -> OutboxIntent | None:
+        if intent.status != "succeeded" or intent.case_id != delivery.case_id or delivery.sequence != expected_sequence + 1:
+            raise ValueError("invalid attention completion")
+        async with self._lock:
+            current = self._outbox.get(intent.outbox_id)
+            previous = self._attention.get(delivery.case_id)
+            lease = self._attention_leases.get(delivery.case_id)
+            if (current is None or current.status != "in_progress" or current.claim_token != expected_claim_token
+                    or current.case_id != delivery.case_id or (previous.sequence if previous else 0) != expected_sequence
+                    or lease is None or lease[:3] != (lease_token, intent.outbox_id, expected_claim_token)
+                    or lease[3] <= datetime.now(timezone.utc)):
+                return None
+            self._require_atomic_case_locked(delivery.case_id)
+            self._attention[delivery.case_id] = delivery.model_copy(deep=True)
+            self._outbox[intent.outbox_id] = intent.model_copy(deep=True)
+            del self._attention_leases[delivery.case_id]
+            return intent.model_copy(deep=True)
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent:
         async with self._lock:

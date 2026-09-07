@@ -12,6 +12,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, cast
+from app.cases.attention import SEVERITY_RANK, attention_enabled
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -163,6 +164,8 @@ class CaseService:
         Recheck this at delivery as well as enqueue time: queued reports can
         outlive an acknowledgement, recovery or suppression.
         """
+        if attention_enabled() and case.identity.get("source") in {"alertmanager", "icinga2"}:
+            return False
         now = now or datetime.now(timezone.utc)
         if case.severity != "HIGH" or case.acknowledged_at or case.acknowledged_by:
             return False
@@ -1015,8 +1018,8 @@ class CaseService:
     async def _update_unhealthy(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
         now = utc_now()
         # Acknowledgement covers this incident at its acknowledged severity,
-        # not a later recurrence or a new escalation to critical.
-        if case.status in {"resolved", "recovered_pending"} or (case.severity != "HIGH" and observation.severity == "HIGH"):
+        # not a later recurrence or an increase beyond that severity.
+        if case.status in {"resolved", "recovered_pending"} or SEVERITY_RANK[observation.severity] > SEVERITY_RANK[case.severity]:
             case.acknowledged_at = ""
             case.acknowledged_by = ""
             case.report_generation += 1
