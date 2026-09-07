@@ -686,6 +686,35 @@ async def test_shadow_observe_alert_payload_can_enqueue_case_report(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_reactive_recovery_enqueues_card_update_and_stops_reminders(monkeypatch, mock_alert_payload):
+    from types import SimpleNamespace
+    import app.main as main_module
+
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_REPORT", "1")
+    monkeypatch.setattr(main_module, "case_service_runtime", SimpleNamespace(service=service))
+    payload = deepcopy(mock_alert_payload)
+    payload["source"] = "alertmanager"
+    firing = await main_module._observe_case_service_reactive_primary(payload)
+    case = firing[0].case
+    await service.mark_reported(case.case_id, state_signature=service.report_state_signature(case))
+
+    payload["status"] = "resolved"
+    payload["alerts"][0]["status"] = "resolved"
+    payload["alerts"][0]["annotations"]["summary"] = "Service is healthy again"
+    recovered = await main_module._observe_case_service_reactive_primary(payload)
+    assert recovered[0].case.case_id == case.case_id
+    assert recovered[0].case.status == "resolved"
+    assert not service.should_remind(recovered[0].case)
+    reports = await store.list_outbox()
+    recovery_reports = [intent for intent in reports if "Monitoring reports recovery" in intent.payload.get("description", "")]
+    assert len(recovery_reports) == 1
+    assert "Service is healthy again" in recovery_reports[0].payload["description"]
+    assert recovery_reports[0].state_signature == service.report_state_signature(recovered[0].case)
+
+
+@pytest.mark.asyncio
 async def test_shadow_observe_alert_payload_preserves_partial_results(monkeypatch, mock_alert_payload):
     class _Result:
         action = "created"

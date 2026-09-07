@@ -113,12 +113,12 @@ async def test_reminder_identity_retries_until_delivery_then_advances():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("recurrence", [False, True])
+@pytest.mark.parametrize("recurrence", [False, "resolved", "recovered_pending"])
 async def test_acknowledgement_does_not_cover_escalation_or_recurrence(recurrence):
     store = InMemoryCaseStore()
     service = CaseService(store)
     case = await reported_case(store, service)
-    case.status = "resolved" if recurrence else "investigating"
+    case.status = recurrence or "investigating"
     case.severity = "HIGH" if recurrence else "MEDIUM"
     await store.upsert_case(case)
     await service.ack(case.case_id, operator="oncall")
@@ -171,3 +171,45 @@ async def test_snoozed_queued_reminder_can_deliver_after_snooze_expires():
     assert reopened.status == "pending"
     assert (await processor.process_pending()).succeeded == 1
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_operator_suppression_expiry_preserves_original_reminder_deadline(monkeypatch):
+    import app.cases.service as service_module
+
+    clock = [datetime.now(timezone.utc)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    monkeypatch.setattr(service_module, "datetime", Clock)
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    case = await reported_case(store, service)
+    original = await service.request_report(case)
+    suppressed = await service.suppress(case.case_id, reason="maintenance", source="operator", operator="oncall", ttl_seconds=60)
+    assert suppressed.suppressed_until
+    assert not service.should_report(suppressed)
+    sent = []
+
+    async def notify(**kwargs):
+        sent.append(kwargs)
+        return True
+
+    processor = OutboxProcessor(store, {"report": build_report_handler(
+        service, notifier=notify, reminder_notifier=notify,
+    )})
+    assert (await processor.process_pending()).succeeded == 1
+    assert not sent
+    clock[0] += timedelta(seconds=61)
+    # The stored deadline need not have been cleared by an expiry job.
+    expired = await store.get_case(case.case_id)
+    assert expired.suppressed_until
+    assert service.should_remind(expired)
+    reopened = await service.request_report(expired)
+    assert reopened.outbox_id == original.outbox_id
+    assert reopened.status == "pending"
+    assert (await processor.process_pending()).succeeded == 1
+    assert len(sent) == 1

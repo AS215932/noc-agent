@@ -145,7 +145,6 @@ class CaseService:
                     "signal_signature": case.signal_signature,
                     "resolution_reason": case.resolution_reason,
                     "issue_url": case.issue_url,
-                    "suppressed_until": case.suppressed_until,
                 }
             ).encode("utf-8")
         ).hexdigest()[:16]
@@ -1017,7 +1016,7 @@ class CaseService:
         now = utc_now()
         # Acknowledgement covers this incident at its acknowledged severity,
         # not a later recurrence or a new escalation to critical.
-        if case.status == "resolved" or (case.severity != "HIGH" and observation.severity == "HIGH"):
+        if case.status in {"resolved", "recovered_pending"} or (case.severity != "HIGH" and observation.severity == "HIGH"):
             case.acknowledged_at = ""
             case.acknowledged_by = ""
             case.report_generation += 1
