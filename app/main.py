@@ -3105,6 +3105,7 @@ def _provider_from_model_name(model_name: str) -> str:
 
 @app.get("/health/cases")
 async def health_cases(response: Response):
+    from app.cases.report_spool import spool_stats
     if case_service_runtime is None:
         if _env_bool("NOC_CASE_OUTBOX_ENABLED", False):
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -3115,6 +3116,7 @@ async def health_cases(response: Response):
     try:
         async with asyncio.timeout(5):
             queue_health = await store.outbox_health()
+            retained = await spool_stats()
             recent_cases = await store.list_cases(limit=1)
     except Exception as e:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -3137,6 +3139,14 @@ async def health_cases(response: Response):
         stale_after_s=_env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300),
         worker_interval_s=_env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30),
     )
+    if retained["invalid"]:
+        delivery["reasons"].append("retained_reports_invalid")
+    if retained["oldest_retained_at"] is not None:
+        retained_age = max(0, datetime.now(timezone.utc).timestamp() - retained["oldest_retained_at"])
+        if retained_age > delivery["stale_after_seconds"]:
+            delivery["reasons"].append("retained_reports_overdue")
+    if delivery["reasons"]:
+        delivery["status"] = "degraded"
     if delivery["status"] == "degraded":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
@@ -3150,6 +3160,7 @@ async def health_cases(response: Response):
         },
         "outbox": {"pending": queue_health.pending, "failed": queue_health.failed},
         "delivery": delivery,
+        "report_spool": retained,
         "verifier": {
             "enabled": lhp_settings.enabled and lhp_settings.case_verification_enabled,
             "running": case_verifier_task is not None and not case_verifier_task.done(),

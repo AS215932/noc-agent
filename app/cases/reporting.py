@@ -28,16 +28,15 @@ async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_c
         return False
     revision = time.time()
     intent = None
+    candidate = OutboxIntent(
+        case_id=case_id, intent_type="report", idempotency_key=f"card-update:{case_id}:{revision}",
+        payload={"card_update": card, "card_revision": revision, "safe_category": safe_category},
+    )
     if runtime is not None:
         try:
             case = await runtime.store.get_case(case_id)
             if isinstance(case, AtomicCaseProjection):
-                intent = await runtime.store.enqueue_outbox(OutboxIntent(
-                    case_id=case_id,
-                    intent_type="report",
-                    idempotency_key=f"card-update:{case_id}:{revision}",
-                    payload={"card_update": card, "card_revision": revision, "safe_category": safe_category},
-                ))
+                intent = await runtime.store.enqueue_outbox(candidate)
         except Exception as exc:
             log.warn("investigation_card_enqueue_failed", error_type=type(exc).__name__, case_id=case_id)
     if intent is not None:
@@ -56,6 +55,9 @@ async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_c
             log.warn("investigation_card_processing_failed", error_type=type(exc).__name__, case_id=case_id)
             return False
     if reactive_reporting_owns_cards():
+        from app.cases.report_spool import retain_report
+
+        await retain_report(candidate)
         # A store outage must not bypass the durable facts prerequisite by
         # creating a terminal-only card through the standalone transport.
         log.warn("investigation_card_delivery_deferred", case_id=case_id)

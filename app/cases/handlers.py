@@ -98,9 +98,13 @@ def build_report_handler(
             level = Verbosity(int(update["level"]))
             if level < get_verbosity():
                 return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
-            bundled_facts = None
+            owns_case = reactive_reporting_owns_cards() and case.identity.get("source") in {"alertmanager", "icinga2"}
+            # Every owned update is self-contained. Discord can delete the
+            # original at any time, including after a successful initial report;
+            # the transport's replacement create must retain monitor facts.
+            bundled_facts = _render_case_report(case, intent) if owns_case else None
             current_signature = case_service.report_state_signature(case)
-            if (reactive_reporting_owns_cards() and case.identity.get("source") in {"alertmanager", "icinga2"}
+            if (owns_case
                     and (not case.last_reported_at or case.last_reported_signature != current_signature)):
                 initial_level = _case_report_level(case)
                 if initial_level < get_verbosity():

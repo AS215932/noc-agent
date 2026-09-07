@@ -11,7 +11,8 @@ from app.discord import Verbosity
 
 
 @pytest.fixture
-def owned_cards(monkeypatch):
+def owned_cards(monkeypatch, tmp_path):
+    monkeypatch.setenv("NOC_REPORT_SPOOL_DIR", str(tmp_path / "report-spool"))
     monkeypatch.setenv("NOC_CASESERVICE_REACTIVE_REPORT", "1")
     monkeypatch.setenv("NOC_CASE_OUTBOX_ENABLED", "1")
     monkeypatch.setenv("NOC_AUTO_ACK_ON_INVESTIGATION", "0")
@@ -403,3 +404,48 @@ async def test_eligible_terminal_error_includes_lower_severity_facts(monkeypatch
     assert created[0]["level"] == Verbosity.ERROR
     assert created[0]["description"].splitlines() == ["Router filesystem is low", "", "Model unavailable"]
     assert (await store.get_outbox_by_key(terminal.idempotency_key)).payload["card_update_delivered"]
+
+
+@pytest.mark.asyncio
+async def test_normally_reported_card_deleted_during_investigation_retains_facts(monkeypatch, tmp_path, owned_cards):
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    observed = await service.observe(ObservationRecord(
+        source="alertmanager", detector="Disk", resource="rtr", status="firing", severity="HIGH",
+    ))
+    case = observed.case
+    case.summary = "Router has 4% free"
+    await store.upsert_case(case)
+    created = []
+    exists = False
+
+    async def notify(case_id, revision=None, force_refresh=False, **payload):
+        async def create():
+            nonlocal exists
+            exists = True
+            created.append(payload)
+            return 123
+
+        async def edit(message_id):
+            if not exists:
+                raise CardNotFound
+            return True
+
+        return await deliver_case_card(destination="normal-deletion", case_id=case_id, payload=payload,
+                                       revision=revision, force_refresh=force_refresh, create=create, edit=edit)
+
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notify)})
+    initial = await service.request_report(case, payload={"card_revision": 10})
+    assert (await processor.process_intent(initial)).succeeded == 1
+    assert (await store.get_case(case.case_id)).last_reported_signature == service.report_state_signature(case)
+    exists = False
+    terminal = await store.enqueue_outbox(OutboxIntent(
+        case_id=case.case_id, intent_type="report", idempotency_key="normal-deletion-terminal",
+        payload={"card_revision": 20, "card_update": {"title": "Investigation failed",
+            "description": "Model unavailable", "color": 0, "level": int(Verbosity.ERROR)}},
+    ))
+    assert (await processor.process_intent(terminal)).succeeded == 1
+    assert len(created) == 2
+    assert "Router has 4% free" in created[-1]["description"]
+    assert "Model unavailable" in created[-1]["description"]
