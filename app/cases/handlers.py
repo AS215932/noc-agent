@@ -13,7 +13,6 @@ from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.service import CaseService
 from app.config import LoopHandoffSettings
 from app.discord import Verbosity, get_verbosity, send_case_notification
-from app.model_metrics import record_sanitized_discord_failure
 from app.knowledge.lhp import build_lhp_knowledge_artifact_handler, build_lhp_knowledge_context_handler
 from app.knowledge.outbox import build_knowledge_candidate_handler
 from app.proactive.handoff import GitHubHandoff, handoff_from_env
@@ -114,8 +113,6 @@ def build_report_handler(
         if delivered is False:
             raise RuntimeError("Discord case notification was not delivered")
         if isinstance(update, dict):
-            if intent.payload.get("safe_category"):
-                record_sanitized_discord_failure(str(intent.payload["safe_category"]))
             # An investigation update is not a new case-state report signature.
             return OutboxHandlerResult(payload_updates={"card_update_delivered": True})
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)

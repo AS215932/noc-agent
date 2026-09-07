@@ -42,8 +42,12 @@ async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_c
         processor = OutboxProcessor(runtime.store, {
             "report": build_report_handler(runtime.service, notifier=notifier),
         })
-        result = await processor.process_intent(intent)
-        return result.succeeded == 1
+        try:
+            result = await processor.process_intent(intent)
+            return result.succeeded == 1
+        except Exception as exc:
+            log.warn("investigation_card_processing_failed", error_type=type(exc).__name__, case_id=case_id)
+            return False
     # Standalone/dev use has no outbox; give transient failures a bounded retry.
     for attempt in range(3):
         delivered = await notifier(case_id=case_id, revision=revision, **card)

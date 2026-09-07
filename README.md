@@ -333,7 +333,14 @@ Event revisions prevent delayed outbox reports from replacing newer triage
 results. With `NOC_CASE_OUTBOX_ENABLED=1` (the production setting), terminal
 investigation updates are queued durably before their immediate delivery attempt.
 Immediate delivery and retries share the same atomic outbox claim, completion
-record, and delivery metrics; failed sends are retried by the existing worker. Intentionally filtered
+record, and delivery metrics; failed sends are retried by the existing worker.
+Report claims expire after ten minutes and recover after a cancelled or restarted
+worker. Claim tokens fence late completion writes; report handlers have a
+three-minute timeout. Recovery covers report delivery only, preserving the
+existing policy for other side effects. Storage failures do not change the
+investigation result. Delivered-failure metrics are recorded after the winning
+claim commits completion (a process crash in that final metric window can still
+omit a counter increment). Intentionally filtered
 reports complete as suppressed, without being stamped as delivered. Standalone
 use without the case outbox has three bounded attempts but no durable retry.
 

@@ -155,7 +155,7 @@ class CaseStore(Protocol):
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
     async def update_outbox_if_status(
-        self, intent: OutboxIntent, *, expected_status: str
+        self, intent: OutboxIntent, *, expected_status: str, expected_claim_token: str | None = None
     ) -> OutboxIntent | None: ...
 
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]: ...
@@ -607,13 +607,15 @@ class InMemoryCaseStore:
             return stored.model_copy(deep=True)
 
     async def update_outbox_if_status(
-        self, intent: OutboxIntent, *, expected_status: str
+        self, intent: OutboxIntent, *, expected_status: str, expected_claim_token: str | None = None
     ) -> OutboxIntent | None:
         async with self._lock:
             current = self._outbox.get(intent.outbox_id)
             if current is None:
                 return None
             if current.status != expected_status:
+                return None
+            if expected_claim_token is not None and current.claim_token != expected_claim_token:
                 return None
             stored = intent.model_copy(deep=True)
             self._outbox[stored.outbox_id] = stored

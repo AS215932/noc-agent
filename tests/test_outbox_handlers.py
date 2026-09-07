@@ -526,7 +526,7 @@ async def test_failure_metric_recorded_once_by_delivery_outbox(monkeypatch, imme
     monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
     metric = Mock()
     monkeypatch.setattr("app.cases.reporting.record_sanitized_discord_failure", metric)
-    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.outbox.record_sanitized_discord_failure", metric)
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(ObservationRecord(
@@ -564,7 +564,7 @@ async def test_superseded_failure_is_not_counted_as_delivered(monkeypatch, tmp_p
     monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
     metric = Mock()
     monkeypatch.setattr("app.cases.reporting.record_sanitized_discord_failure", metric)
-    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.outbox.record_sanitized_discord_failure", metric)
     store = InMemoryCaseStore()
     service = CaseService(store)
     created = await service.observe(ObservationRecord(
@@ -624,7 +624,7 @@ async def test_reopened_intake_does_not_overwrite_later_failure(monkeypatch, tmp
     processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)})
     assert (await processor.process_pending()).succeeded == 1
     metric = Mock()
-    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.outbox.record_sanitized_discord_failure", metric)
     assert await send_investigation_card(
         runtime=SimpleNamespace(store=store, service=service), case_id=created.case.case_id,
         notifier=notifier, title="Investigation unavailable", description="Dependency failed",
@@ -661,7 +661,7 @@ async def test_immediate_failure_metric_survives_newer_card(monkeypatch, tmp_pat
             payload={"title": kwargs["title"]}, revision=kwargs["revision"], create=create, edit=edit,
         )
     metric = Mock()
-    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.outbox.record_sanitized_discord_failure", metric)
     runtime = SimpleNamespace(store=store, service=service)
     assert await send_investigation_card(
         runtime=runtime, case_id=created.case.case_id, notifier=notifier,
@@ -700,7 +700,7 @@ async def test_immediate_delivery_and_worker_share_one_claim(monkeypatch):
         return True
     notifier = AsyncMock(side_effect=transport)
     metric = Mock()
-    monkeypatch.setattr("app.cases.handlers.record_sanitized_discord_failure", metric)
+    monkeypatch.setattr("app.cases.outbox.record_sanitized_discord_failure", metric)
     task = asyncio.create_task(send_investigation_card(
         runtime=SimpleNamespace(store=store, service=service), case_id=created.case.case_id,
         notifier=notifier, safe_category="infrastructure",
@@ -716,3 +716,45 @@ async def test_immediate_delivery_and_worker_share_one_claim(monkeypatch):
     notifier.assert_awaited_once()
     metric.assert_called_once_with("infrastructure")
     assert (await store.list_outbox())[0].status == "succeeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_status", ["pending", "in_progress"])
+async def test_notification_storage_failure_does_not_escape_and_remains_recoverable(monkeypatch, fail_status):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from app.cases.reporting import send_investigation_card
+    from app.discord import Verbosity
+
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    created = await service.observe(ObservationRecord(
+        source="icinga2", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
+    ))
+    original = store.update_outbox_if_status
+    failed = False
+    async def flaky(intent, *, expected_status, expected_claim_token=None):
+        nonlocal failed
+        if not failed and expected_status == fail_status:
+            failed = True
+            raise ConnectionError("test storage outage")
+        return await original(intent, expected_status=expected_status, expected_claim_token=expected_claim_token)
+    monkeypatch.setattr(store, "update_outbox_if_status", flaky)
+    metric = Mock()
+    monkeypatch.setattr("app.cases.outbox.record_sanitized_discord_failure", metric)
+    notifier = AsyncMock(return_value=True)
+    assert not await send_investigation_card(
+        runtime=SimpleNamespace(store=store, service=service), case_id=created.case.case_id,
+        notifier=notifier, safe_category="infrastructure",
+        title="Unavailable", description="Dependency failed", level=Verbosity.ERROR,
+    )
+    metric.assert_not_called()
+    row = (await store.list_outbox())[0]
+    assert row.status == fail_status
+    if row.status == "in_progress":
+        row.claim_expires_at = "2000-01-01T00:00:00+00:00"
+        await store.update_outbox(row)
+    result = await OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}).process_pending()
+    assert result.succeeded == 1
+    metric.assert_called_once_with("infrastructure")

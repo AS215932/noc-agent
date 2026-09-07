@@ -675,7 +675,7 @@ class PostgresCaseStore:
         return OutboxIntent.model_validate(_row_payload(row))
 
     async def update_outbox_if_status(
-        self, intent: OutboxIntent, *, expected_status: str
+        self, intent: OutboxIntent, *, expected_status: str, expected_claim_token: str | None = None
     ) -> OutboxIntent | None:
         payload = intent.model_dump(mode="json")
         async with self.pool.acquire() as conn:
@@ -692,6 +692,7 @@ class PostgresCaseStore:
                     payload = $9::jsonb,
                     schema_version = $10
                 WHERE outbox_id = $1 AND status = $11
+                  AND ($12::text IS NULL OR COALESCE(payload->>'claim_token', '') = $12)
                 RETURNING payload
                 """,
                 intent.outbox_id,
@@ -705,6 +706,7 @@ class PostgresCaseStore:
                 json.dumps(payload),
                 intent.schema_version,
                 expected_status,
+                expected_claim_token,
             )
         return OutboxIntent.model_validate(_row_payload(row)) if row else None
 
