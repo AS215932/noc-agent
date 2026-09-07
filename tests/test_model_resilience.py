@@ -238,7 +238,7 @@ async def test_investigate_alert_sanitizes_provider_failure(mock_alert_payload, 
             },
         )
 
-    send_discord = mocker.patch("app.discord.send_discord_notification")
+    send_discord = mocker.patch("app.main.send_case_notification")
     store = InMemoryCaseStore()
     service = CaseService(store)
     observation = observations_from_alertmanager({**mock_alert_payload, "source": "alertmanager"})[0]

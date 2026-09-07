@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, suppress
 
 from app import log
 from app.agent import noc_triage_agent
+from app.cases.reporting import send_investigation_card
 from app.discord import Verbosity, send_case_notification, notify_start, notify_finish
 from app.icinga_ack import acknowledge_icinga
 from app.discord import install_bot_notifier, install_case_notifier
@@ -652,8 +653,10 @@ async def investigate_alert(
     *,
     mcp_runtime=None,
     graph_memory=None,
+    case_runtime=None,
 ):
     runtime = mcp_runtime if mcp_runtime is not None else globals()["mcp_runtime"]
+    notification_runtime = case_runtime if case_runtime is not None else case_service_runtime
     event = (case or {}).get("latest_event") or case_event_from_alert(alert_payload)
     display_title = case_display_title(case, event)
     if _is_recovery_alert(alert_payload):
@@ -703,11 +706,15 @@ async def investigate_alert(
             provider=safe.provider,
             model=safe.model_name,
         )
-        await notify_finish(
-            f"NOC Triage: {display_title}",
-            safe.discord_description("NOC triage"),
-            is_error=True,
+        await send_investigation_card(
+            runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
+            notifier=send_case_notification,
+            case_id=(case or {}).get("incident_id", display_title),
             safe_category=safe.category,
+            title=f"❌ Investigation unavailable: {display_title}",
+            description=safe.discord_description("NOC triage"),
+            color=0xE74C3C,
+            level=Verbosity.ERROR,
         )
         # Return None so callers (e.g. the proactive investigator) can tell a
         # swallowed triage failure from a successful investigation.
@@ -728,7 +735,9 @@ async def investigate_alert(
 
     color = _severity_color(plan.severity, plan.requires_human)
     fields = _triage_fields(plan, alert_payload)
-    await send_case_notification(
+    await send_investigation_card(
+        runtime=notification_runtime if _env_bool("NOC_CASE_OUTBOX_ENABLED", False) else None,
+        notifier=send_case_notification,
         case_id=(case or {}).get("incident_id", display_title),
         title=f"Detailed Report: {display_title}",
         description=_truncate_discord(

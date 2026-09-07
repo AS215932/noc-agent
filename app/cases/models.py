@@ -437,6 +437,8 @@ class OutboxIntent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     status: OutboxStatus = "pending"
     attempts: int = 0
+    claim_token: str = ""
+    claim_expires_at: str | None = None
     next_attempt_at: str = Field(default_factory=utc_now)
     created_at: str = Field(default_factory=utc_now)
     completed_at: str | None = None

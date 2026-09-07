@@ -169,7 +169,7 @@ class CaseService:
         """Create an idempotent report intent instead of sending directly."""
 
         state_signature = state_signature or self.report_state_signature(case)
-        return await self.store.enqueue_outbox(
+        intent = await self.store.enqueue_outbox(
             OutboxIntent(
                 case_id=case.case_id,
                 intent_type="report",
@@ -178,6 +178,22 @@ class CaseService:
                 payload=payload or {},
             )
         )
+        # Suppression is a completed no-op only while the delivery policy
+        # still excludes this report. Reuse the same identity when policy changes.
+        if intent.status == "succeeded" and intent.payload.get("notification_suppressed") == "verbosity":
+            from app.discord import get_verbosity
+
+            required_level = intent.payload.get("notification_level")
+            if isinstance(required_level, int) and required_level >= int(get_verbosity()):
+                retry = intent.model_copy(deep=True)
+                retry.status = "pending"
+                retry.completed_at = None
+                retry.next_attempt_at = utc_now()
+                retry.payload.pop("notification_suppressed", None)
+                retry.payload.pop("notification_level", None)
+                updated = await self.store.update_outbox_if_status(retry, expected_status="succeeded")
+                return updated or await self.store.enqueue_outbox(intent)
+        return intent
 
     async def mark_reported(self, case_id: str, *, state_signature: str, reasserted: bool = False) -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)

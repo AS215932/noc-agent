@@ -4,12 +4,12 @@ import asyncio
 import json
 import os
 import re
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from app import log
+from app.case_cards import CardDeliveryOutcome, CardNotFound, deliver_case_card
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.cases.models import ObservationRecord
 from app.cases.runtime import build_case_service_runtime_from_env
@@ -122,8 +122,6 @@ class NOCDiscordBot:
         self._mcp_runtime = MCPRuntime(owner="discord_bot")
         self._case_service_runtime = None
         self._tasks: set[asyncio.Task] = set()
-        self._max_case_messages = int(os.getenv("DISCORD_CASE_MESSAGE_CACHE_MAX", "1000"))
-        self._case_messages = OrderedDict()
         self._register_handlers()
 
     async def start(self):
@@ -163,12 +161,13 @@ class NOCDiscordBot:
         description: str,
         color: int,
         fields: list[dict[str, Any]] | None = None,
-    ):
-        if self.channel_id is None:
-            return
+        revision: float | None = None,
+    ) -> bool | CardDeliveryOutcome:
+        if self.channel_id is None or self.client.user is None:
+            return False
         channel = self.client.get_channel(self.channel_id)
         if channel is None:
-            return
+            return False
         embed = discord.Embed(title=title, description=description, color=color)
         for embed_field in fields or []:
             embed.add_field(
@@ -176,25 +175,28 @@ class NOCDiscordBot:
                 value=str(embed_field.get("value", "")),
                 inline=bool(embed_field.get("inline", False)),
             )
-        message = self._case_messages.get(case_id)
-        if message is not None and callable(getattr(message, "edit", None)):
-            try:
-                await message.edit(embed=embed)
-                self._remember_case_message(case_id, message)
-                return
-            except Exception as exc:
-                safe = classify_exception(exc)
-                log_exception("discord_case_embed_edit_failed", exc, category=safe.category, case_id=case_id)
-        sent = await channel.send(embed=embed)
-        self._remember_case_message(case_id, sent)
 
-    def _remember_case_message(self, case_id: str, message) -> None:
-        if self._max_case_messages <= 0:
-            return
-        self._case_messages[case_id] = message
-        self._case_messages.move_to_end(case_id)
-        while len(self._case_messages) > self._max_case_messages:
-            self._case_messages.popitem(last=False)
+        async def create() -> int | None:
+            sent = await channel.send(embed=embed)
+            return sent.id
+
+        async def edit(message_id: int) -> bool:
+            try:
+                await channel.get_partial_message(message_id).edit(embed=embed)
+                return True
+            except discord.NotFound as exc:
+                if exc.code == 10008:
+                    raise CardNotFound from exc
+                raise
+
+        return await deliver_case_card(
+            destination=f"bot:{self.client.user.id}:{self.channel_id}",
+            case_id=case_id,
+            payload=embed.to_dict(),
+            revision=revision,
+            create=create,
+            edit=edit,
+        )
 
     def _register_handlers(self) -> None:
         @self.client.event

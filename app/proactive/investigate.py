@@ -105,6 +105,7 @@ def build_investigator(
                 case=graph_case,
                 mcp_runtime=runtime,
                 graph_memory=graph_memory,
+                case_runtime=runtime_owner,
             )
         except Exception as exc:  # surfaced to the loop's error list
             safe = classify_exception(exc)

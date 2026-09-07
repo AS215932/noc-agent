@@ -312,6 +312,45 @@ parity/failures before any control flag is enabled.
 
 ## Discord bot
 
+### Persistent case messages
+
+Triage starts, reports, and investigation failures share one case card. Both the
+bot and webhook delivery paths retain the Discord message ID across restarts;
+unchanged content normally produces no request, and changed content edits the
+existing message. At least six hours after the last successful delivery, an
+identical update refreshes the card quietly so deleted cards can be detected. A confirmed deleted message is replaced. Temporary API failures remain
+retryable without posting a duplicate.
+
+Set `DISCORD_CASE_STATE_DIR` to override the state directory. The default is
+`${MAIL_DRAFT_DIR}/.notifications/case-cards` when `MAIL_DRAFT_DIR` is configured,
+otherwise `data/mail-drafts/.notifications/case-cards`. All workers serving the same
+destination must share this writable persistent directory. It contains only
+hashed destination/case keys, message IDs, content hashes, event revisions, and last-verified times; retain it during
+deployments. Changing the bot account, channel, or webhook creates a separate destination
+identity. Bot permissions must allow sending and editing its own messages.
+
+Event revisions prevent delayed outbox reports from replacing newer triage
+results. With `NOC_CASE_OUTBOX_ENABLED=1` (the production setting), terminal
+investigation updates are queued durably before their immediate delivery attempt.
+Immediate delivery and retries share the same atomic outbox claim, completion
+record, and delivery metrics; failed sends are retried by the existing worker.
+Report claims expire after ten minutes and recover after a cancelled or restarted
+worker. Claim tokens fence late completion writes; report handlers have a
+three-minute timeout. Recovery covers report delivery only, preserving the
+existing policy for other side effects. Storage failures do not change the
+investigation result. Delivered-failure metrics are recorded after the winning
+claim commits completion (a process crash in that final metric window can still
+omit a counter increment). Intentionally filtered
+reports complete as suppressed, without being stamped as delivered. Standalone
+use without the case outbox has three bounded attempts but no durable retry.
+
+The state file is atomically replaced after successful delivery. A process crash
+between Discord accepting a new message and recording its ID can still produce
+one duplicate on retry; Discord does not provide a transactional create with the
+local state store. This does not yet implement incident escalation/recovery
+paging or the six-hour critical reminder policy.
+
+
 When `DISCORD_BOT_TOKEN` is present, the service starts a `discord.py` bot that
 supports:
 
