@@ -11,7 +11,8 @@ import pytest
 
 from app.cases.attention import AttentionDelivery
 from app.cases.attention_scheduler import enqueue_attention_batch
-from app.cases.models import AtomicCaseProjection, OutboxIntent
+from app.cases.models import AtomicCaseProjection, MetaCaseProjection, OutboxIntent
+from app.cases.correlation import CorrelationService
 from app.cases.postgres import PostgresCaseStore
 from app.cases.service import CaseService
 
@@ -127,9 +128,20 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         assert not await restarted.has_pending_attention("page-4")
         assert not await restarted.has_pending_attention(case.case_id)
         await pool.close()
-        pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=1,
+        pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=3,
                                         server_settings={"search_path": schema})
-        assert await PostgresCaseStore(pool).acknowledgement_scope(case.case_id, current.acknowledged_at) == "HIGH"
+        restarted = PostgresCaseStore(pool)
+        assert await restarted.acknowledgement_scope(case.case_id, current.acknowledged_at) == "HIGH"
+        meta = MetaCaseProjection()
+        await restarted.upsert_case(meta)
+        correlation = CorrelationService(restarted)
+        await asyncio.wait_for(asyncio.gather(
+            correlation.attach_child(meta.case_id, "page-0", reason="shared event", confidence=1),
+            correlation.attach_child(meta.case_id, "page-3", reason="shared event", confidence=1),
+            CaseService(restarted).ack("page-0", operator="oncall"),
+        ), timeout=3)
+        assert set((await restarted.get_case(meta.case_id)).child_case_ids) == {"page-0", "page-3"}
+        assert (await restarted.get_case("page-0")).acknowledged_by == "oncall"
     finally:
         if pool is not None:
             await pool.close()

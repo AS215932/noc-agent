@@ -149,43 +149,46 @@ class CorrelationService:
         actor_id: str = "",
         independent_action_required: bool = False,
     ) -> MetaCaseResult:
-        meta = await self._require_meta_case(meta_case_id)
-        child = await self._require_atomic_case(child_case_id)
-        if child.meta_case_id and child.meta_case_id != meta.case_id:
-            other = await self.store.get_case(child.meta_case_id)
-            if isinstance(other, MetaCaseProjection) and other.status not in {"split", "merged", "resolved", "closed"}:
-                raise ValueError(f"child case {child.case_id} is already attached to active meta-case {child.meta_case_id}")
-        if child.case_id not in meta.child_case_ids:
-            meta.child_case_ids.append(child.case_id)
-        if child.resource_id and child.resource_id not in meta.affected_entities:
-            meta.affected_entities.append(child.resource_id)
-        meta.last_child_update_at = utc_now()
-        meta.updated_at = utc_now()
-        meta.policy_version = self.policy.policy_version
-        child.meta_case_id = meta.case_id
-        child.covered_by_meta_case = not independent_action_required
-        child.independent_action_required = independent_action_required
-        child.updated_at = utc_now()
-        child.policy_version = self.policy.policy_version
-        meta = cast(MetaCaseProjection, await self.store.upsert_case(meta))
-        await self.store.upsert_case(child)
-        event = await self.store.append_event(
-            CaseEvent(
-                case_id=child.case_id,
-                meta_case_id=meta.case_id,
-                event_type="child_case_attached_to_meta_case",
-                actor_type="operator" if actor_id else "system",
-                actor_id=actor_id,
-                policy_version=self.policy.policy_version,
-                payload={
-                    "reason": reason,
-                    "confidence": confidence,
-                    "covered_by_meta_case": child.covered_by_meta_case,
-                    "independent_action_required": independent_action_required,
-                },
+        # Lock both projections in stable order; different children may update the same meta-case.
+        first, second = sorted((meta_case_id, child_case_id))
+        async with self.store.case_write_guard(first), self.store.case_write_guard(second):
+            meta = await self._require_meta_case(meta_case_id)
+            child = await self._require_atomic_case(child_case_id)
+            if child.meta_case_id and child.meta_case_id != meta.case_id:
+                other = await self.store.get_case(child.meta_case_id)
+                if isinstance(other, MetaCaseProjection) and other.status not in {"split", "merged", "resolved", "closed"}:
+                    raise ValueError(f"child case {child.case_id} is already attached to active meta-case {child.meta_case_id}")
+            if child.case_id not in meta.child_case_ids:
+                meta.child_case_ids.append(child.case_id)
+            if child.resource_id and child.resource_id not in meta.affected_entities:
+                meta.affected_entities.append(child.resource_id)
+            meta.last_child_update_at = utc_now()
+            meta.updated_at = utc_now()
+            meta.policy_version = self.policy.policy_version
+            child.meta_case_id = meta.case_id
+            child.covered_by_meta_case = not independent_action_required
+            child.independent_action_required = independent_action_required
+            child.updated_at = utc_now()
+            child.policy_version = self.policy.policy_version
+            meta = cast(MetaCaseProjection, await self.store.upsert_case(meta))
+            await self.store.upsert_case(child)
+            event = await self.store.append_event(
+                CaseEvent(
+                    case_id=child.case_id,
+                    meta_case_id=meta.case_id,
+                    event_type="child_case_attached_to_meta_case",
+                    actor_type="operator" if actor_id else "system",
+                    actor_id=actor_id,
+                    policy_version=self.policy.policy_version,
+                    payload={
+                        "reason": reason,
+                        "confidence": confidence,
+                        "covered_by_meta_case": child.covered_by_meta_case,
+                        "independent_action_required": independent_action_required,
+                    },
+                )
             )
-        )
-        return MetaCaseResult("attached", meta, [event])
+            return MetaCaseResult("attached", meta, [event])
 
     async def detach_child(
         self,
@@ -195,31 +198,34 @@ class CorrelationService:
         reason: str,
         actor_id: str = "",
     ) -> MetaCaseResult:
-        meta = await self._require_meta_case(meta_case_id)
-        child = await self._require_atomic_case(child_case_id)
-        meta.child_case_ids = [case_id for case_id in meta.child_case_ids if case_id != child.case_id]
-        meta.last_child_update_at = utc_now()
-        meta.updated_at = utc_now()
-        meta.policy_version = self.policy.policy_version
-        if child.meta_case_id == meta.case_id:
-            child.meta_case_id = ""
-            child.covered_by_meta_case = False
-        child.updated_at = utc_now()
-        child.policy_version = self.policy.policy_version
-        meta = cast(MetaCaseProjection, await self.store.upsert_case(meta))
-        await self.store.upsert_case(child)
-        event = await self.store.append_event(
-            CaseEvent(
-                case_id=child.case_id,
-                meta_case_id=meta.case_id,
-                event_type="child_case_detached_from_meta_case",
-                actor_type="operator" if actor_id else "system",
-                actor_id=actor_id,
-                policy_version=self.policy.policy_version,
-                payload={"reason": reason},
+        # Lock both projections in stable order; different children may update the same meta-case.
+        first, second = sorted((meta_case_id, child_case_id))
+        async with self.store.case_write_guard(first), self.store.case_write_guard(second):
+            meta = await self._require_meta_case(meta_case_id)
+            child = await self._require_atomic_case(child_case_id)
+            meta.child_case_ids = [case_id for case_id in meta.child_case_ids if case_id != child.case_id]
+            meta.last_child_update_at = utc_now()
+            meta.updated_at = utc_now()
+            meta.policy_version = self.policy.policy_version
+            if child.meta_case_id == meta.case_id:
+                child.meta_case_id = ""
+                child.covered_by_meta_case = False
+            child.updated_at = utc_now()
+            child.policy_version = self.policy.policy_version
+            meta = cast(MetaCaseProjection, await self.store.upsert_case(meta))
+            await self.store.upsert_case(child)
+            event = await self.store.append_event(
+                CaseEvent(
+                    case_id=child.case_id,
+                    meta_case_id=meta.case_id,
+                    event_type="child_case_detached_from_meta_case",
+                    actor_type="operator" if actor_id else "system",
+                    actor_id=actor_id,
+                    policy_version=self.policy.policy_version,
+                    payload={"reason": reason},
+                )
             )
-        )
-        return MetaCaseResult("detached", meta, [event])
+            return MetaCaseResult("detached", meta, [event])
 
     async def mark_independent_action_required(
         self,
@@ -229,27 +235,28 @@ class CorrelationService:
         reason: str,
         actor_id: str = "",
     ) -> AtomicCaseProjection:
-        child = await self._require_atomic_case(child_case_id)
-        child.independent_action_required = required
-        if required:
-            child.covered_by_meta_case = False
-        elif child.meta_case_id:
-            child.covered_by_meta_case = True
-        child.updated_at = utc_now()
-        child.policy_version = self.policy.policy_version
-        child = cast(AtomicCaseProjection, await self.store.upsert_case(child))
-        await self.store.append_event(
-            CaseEvent(
-                case_id=child.case_id,
-                meta_case_id=child.meta_case_id or None,
-                event_type="child_case_independent_action_required_set",
-                actor_type="operator" if actor_id else "system",
-                actor_id=actor_id,
-                policy_version=self.policy.policy_version,
-                payload={"required": required, "reason": reason},
+        async with self.store.case_write_guard(child_case_id):
+            child = await self._require_atomic_case(child_case_id)
+            child.independent_action_required = required
+            if required:
+                child.covered_by_meta_case = False
+            elif child.meta_case_id:
+                child.covered_by_meta_case = True
+            child.updated_at = utc_now()
+            child.policy_version = self.policy.policy_version
+            child = cast(AtomicCaseProjection, await self.store.upsert_case(child))
+            await self.store.append_event(
+                CaseEvent(
+                    case_id=child.case_id,
+                    meta_case_id=child.meta_case_id or None,
+                    event_type="child_case_independent_action_required_set",
+                    actor_type="operator" if actor_id else "system",
+                    actor_id=actor_id,
+                    policy_version=self.policy.policy_version,
+                    payload={"required": required, "reason": reason},
+                )
             )
-        )
-        return child
+            return child
 
     async def _require_meta_case(self, meta_case_id: str) -> MetaCaseProjection:
         case = await self.store.get_case(meta_case_id)

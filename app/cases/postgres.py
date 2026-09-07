@@ -216,9 +216,9 @@ class PostgresCaseStore:
     async def case_write_guard(self, case_id: str) -> AsyncIterator[None]:
         """Serialize a short case read/modify/write and its event on one connection."""
         async with self.pool.acquire() as conn, conn.transaction():
-            found = await conn.fetchval("SELECT case_id FROM cases WHERE case_id=$1 AND kind='atomic' FOR UPDATE", case_id)
+            found = await conn.fetchval("SELECT case_id FROM cases WHERE case_id=$1 FOR UPDATE", case_id)
             if found is None:
-                raise KeyError("atomic case not found")
+                raise KeyError("case not found")
             token = self._guarded_connection.set(conn)
             try:
                 yield

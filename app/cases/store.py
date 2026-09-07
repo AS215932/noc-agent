@@ -398,7 +398,8 @@ class InMemoryCaseStore:
     @asynccontextmanager
     async def case_write_guard(self, case_id: str) -> AsyncIterator[None]:
         async with self._lock:
-            self._require_atomic_case_locked(case_id)
+            if case_id not in self._cases:
+                raise KeyError("case not found")
             yield
 
     async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None:
