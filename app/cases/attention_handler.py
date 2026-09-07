@@ -8,13 +8,14 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from app.case_cards import SupersededCardDelivery
 from app.cases.attention import AttentionDelivery, AttentionRequest, attention_due
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.store import CaseStore
 
 
-AttentionSender = Callable[[AtomicCaseProjection, AttentionRequest, OutboxIntent], Awaitable[bool | None]]
+AttentionSender = Callable[[AtomicCaseProjection, AttentionRequest, OutboxIntent], Awaitable[bool | SupersededCardDelivery | None]]
 
 
 def build_attention_handler(store: CaseStore, *, sender: AttentionSender, reminder_seconds: int = 21600) -> OutboxHandler:
@@ -51,12 +52,13 @@ def build_attention_handler(store: CaseStore, *, sender: AttentionSender, remind
                 sent = await sender(case, request, intent)
                 if sent is None:
                     return OutboxHandlerResult(payload_updates={"notification_suppressed": "attention_verbosity"})
-                if sent is not True:
+                if sent is not True and not isinstance(sent, SupersededCardDelivery):
                     raise RuntimeError("attention notification was not delivered")
                 delivery = AttentionDelivery(
                     case_id=case.case_id, generation=request.generation, phase=request.phase,
                     severity=request.severity, sequence=request.expected_sequence + 1,
-                    delivered_at=datetime.now(timezone.utc),
+                    delivered_at=(datetime.fromtimestamp(sent.verified_at, timezone.utc)
+                                  if isinstance(sent, SupersededCardDelivery) else datetime.now(timezone.utc)),
                 )
             success = True
             return OutboxHandlerResult(attention_delivery=delivery, attention_lease_token=lease,

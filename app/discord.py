@@ -3,7 +3,7 @@ import httpx
 from typing import Any
 import enum
 
-from app.case_cards import CardDeliveryOutcome, CardNotFound, deliver_case_card
+from app.case_cards import CardDeliveryOutcome, CardNotFound, SupersededCardDelivery, deliver_case_card
 from app.model_metrics import record_sanitized_discord_failure
 from app.safe_errors import classify_exception, log_exception
 
@@ -78,7 +78,8 @@ async def send_case_notification(
     level: Verbosity = Verbosity.INFO,
     revision: float | None = None,
     force_refresh: bool = False,
-) -> bool | CardDeliveryOutcome:
+    superseded_receipt: bool = False,
+) -> bool | CardDeliveryOutcome | SupersededCardDelivery:
     if level < get_verbosity():
         return False
     if CASE_BOT_NOTIFIER is not None:
@@ -86,6 +87,7 @@ async def send_case_notification(
             case_id=case_id,
             revision=revision,
             force_refresh=force_refresh,
+            superseded_receipt=superseded_receipt,
             title=title,
             description=description,
             color=color,
@@ -115,6 +117,7 @@ async def send_case_notification(
         return await deliver_case_card(
             destination=f"webhook:{url}",
             force_refresh=force_refresh,
+            superseded_receipt=superseded_receipt,
             case_id=case_id,
             payload=payload,
             revision=revision,

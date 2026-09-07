@@ -24,7 +24,7 @@ async def test_initial_attention_reuses_existing_facts_card(monkeypatch, tmp_pat
 
     async def notify(**card):
         return await deliver_case_card(destination="test-channel", case_id=card.pop("case_id"),
-                                        revision=card.pop("revision"), payload=card, create=create, edit=edit)
+                                        revision=card.pop("revision"), superseded_receipt=card.pop("superseded_receipt", False), payload=card, create=create, edit=edit)
 
     request = attention_due(case, None, now=datetime.now(timezone.utc))
     intent = OutboxIntent(case_id=case.case_id, intent_type="report", idempotency_key=request.idempotency_key)
@@ -53,7 +53,7 @@ async def test_lifecycle_attention_retries_reuse_one_event_message(monkeypatch, 
     async def notify(**card):
         observed.append(dict(card))
         return await deliver_case_card(destination="test-channel", case_id=card.pop("case_id"),
-                                        revision=card.pop("revision"), payload=card, create=create, edit=edit)
+                                        revision=card.pop("revision"), superseded_receipt=card.pop("superseded_receipt", False), payload=card, create=create, edit=edit)
 
     assert await build_attention_sender(notifier=notify)(case, request, intent) is True
     assert await build_attention_sender(notifier=notify)(case, request, intent) is True
@@ -83,3 +83,47 @@ async def test_verbosity_suppressed_attention_reopens_only_when_eligible(monkeyp
     assert reopened.outbox_id == original.outbox_id and reopened.status == "pending"
     assert (await processor.process_pending()).succeeded == 1
     notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delayed_initial_attention_preserves_triage_and_original_delivery_clock(monkeypatch, tmp_path):
+    from datetime import timedelta
+    from app.case_cards import SupersededCardDelivery
+
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
+    now = datetime.now(timezone.utc)
+    created = now - timedelta(minutes=10)
+    verified = (now - timedelta(minutes=5)).timestamp()
+    monkeypatch.setattr("app.case_cards.time.time", lambda: verified)
+    create, edit = AsyncMock(return_value=789), AsyncMock(return_value=True)
+    case = AtomicCaseProjection(severity="HIGH", opened_at=created.isoformat(), identity={"source": "icinga2"})
+    assert await deliver_case_card(destination="test-channel", case_id=case.case_id,
+        payload={"description": "detailed triage result"}, revision=created.timestamp() + 1,
+        create=create, edit=edit)
+    monkeypatch.setattr("app.case_cards.time.time", lambda: now.timestamp())
+
+    async def notify(**card):
+        return await deliver_case_card(destination="test-channel", case_id=card.pop("case_id"),
+            revision=card.pop("revision"), superseded_receipt=card.pop("superseded_receipt", False),
+            payload=card, create=create, edit=edit)
+
+    store = InMemoryCaseStore()
+    await store.upsert_case(case)
+    intent = await enqueue_attention(store, case)
+    request = attention_due(case, None, now=now)
+    # Simulate a transport result lost before its database completion, then a
+    # fresh worker. Neither attempt may replace the newer triage card.
+    receipt = await build_attention_sender(notifier=notify)(case, request, intent)
+    assert isinstance(receipt, SupersededCardDelivery)
+    assert receipt.verified_at == verified
+    processor = OutboxProcessor(store, {"report": build_attention_handler(store,
+        sender=build_attention_sender(notifier=notify))})
+    assert (await processor.process_pending()).succeeded == 1
+    delivery = await store.get_attention(case.case_id)
+    assert delivery.delivered_at.timestamp() == verified
+    assert delivery.sequence == 1
+    assert await enqueue_attention(store, case) is None
+    create.assert_awaited_once()
+    edit.assert_not_awaited()
+    assert (await processor.process_pending()).processed == 0
