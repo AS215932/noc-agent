@@ -15,6 +15,7 @@ from uuid import uuid4
 from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
 from app.cases.attention import AttentionDelivery
 
+
 from app.cases.lhp import (
     CallbackInboxRecord,
     CaseHandoff,
@@ -113,6 +114,8 @@ class CaseStore(Protocol):
     async def get_observation(self, observation_id: str) -> ObservationRecord | None: ...
 
     async def upsert_case(self, case: CaseProjection) -> CaseProjection: ...
+
+    def case_write_guard(self, case_id: str) -> AsyncContextManager[None]: ...
 
     async def create_atomic_case(
         self,
@@ -303,6 +306,27 @@ class CaseStore(Protocol):
     async def count_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int: ...
 
 
+class _TaskReentrantLock:
+    """Reference-backend transaction lock; nested store calls reuse ownership."""
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        if task is not self._owner:
+            await self._lock.acquire()
+            self._owner = task
+        self._depth += 1
+
+    async def __aexit__(self, *_exc) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+
 class InMemoryCaseStore:
     """Reference implementation for tests and local service development.
 
@@ -312,7 +336,7 @@ class InMemoryCaseStore:
     """
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock = _TaskReentrantLock()
         self._observations: dict[str, ObservationRecord] = {}
         self._cases: dict[str, CaseProjection] = {}
         self._events: dict[str, CaseEvent] = {}
@@ -360,6 +384,12 @@ class InMemoryCaseStore:
             stored = case.model_copy(deep=True)
             self._cases[stored.case_id] = stored
             return stored.model_copy(deep=True)
+
+    @asynccontextmanager
+    async def case_write_guard(self, case_id: str) -> AsyncIterator[None]:
+        async with self._lock:
+            self._require_atomic_case_locked(case_id)
+            yield
 
     async def create_atomic_case(
         self,

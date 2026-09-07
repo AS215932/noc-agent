@@ -211,6 +211,19 @@ class PostgresCaseStore:
             )
         return _case_from_payload(_row_payload(row))
 
+    @asynccontextmanager
+    async def case_write_guard(self, case_id: str) -> AsyncIterator[None]:
+        """Serialize a short case read/modify/write and its event on one connection."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            found = await conn.fetchval("SELECT case_id FROM cases WHERE case_id=$1 AND kind='atomic' FOR UPDATE", case_id)
+            if found is None:
+                raise KeyError("atomic case not found")
+            token = self._guarded_connection.set(conn)
+            try:
+                yield
+            finally:
+                self._guarded_connection.reset(token)
+
     async def create_atomic_case(
         self,
         case: AtomicCaseProjection,

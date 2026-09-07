@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, cast
+from typing import Any, Awaitable, Callable, Literal, TypeVar, cast
 from app.cases.attention import SEVERITY_RANK, attention_enabled
 
 from app.cases.lhp import (
@@ -71,6 +73,32 @@ class ObserveResult:
     observation: ObservationRecord
     case: AtomicCaseProjection | None
     events: list[CaseEvent]
+
+
+_CaseWriteMethod = TypeVar("_CaseWriteMethod", bound=Callable[..., Awaitable[Any]])
+
+
+def _serialize_case_write(method: _CaseWriteMethod) -> _CaseWriteMethod:
+    """Guard database-only projection transitions; never wrap external sends."""
+    target_name = list(signature(method).parameters)[1]
+
+    @wraps(method)
+    async def guarded(self, *args, **kwargs):
+        if args:
+            target, *remaining = args
+        else:
+            target = kwargs.pop(target_name)
+            remaining = []
+        case_id = target if isinstance(target, str) else target.case_id
+        if not case_id:
+            return await method(self, target, *remaining, **kwargs)
+        async with self.store.case_write_guard(case_id):
+            if isinstance(target, AtomicCaseProjection):
+                # observe() resolves the alias before entering this guard. Its
+                # original snapshot may predate an ack or another observation.
+                target = await self._require_atomic_case(case_id)
+            return await method(self, target, *remaining, **kwargs)
+    return cast(_CaseWriteMethod, guarded)
 
 
 class CaseService:
@@ -241,6 +269,7 @@ class CaseService:
                 return updated or await self.store.enqueue_outbox(intent)
         return intent
 
+    @_serialize_case_write
     async def mark_reported(self, case_id: str, *, state_signature: str, reasserted: bool = False) -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)
         now = utc_now()
@@ -310,6 +339,7 @@ class CaseService:
             event=event,
         )
 
+    @_serialize_case_write
     async def record_investigation_result(
         self,
         case_id: str,
@@ -346,6 +376,7 @@ class CaseService:
         )
         return case
 
+    @_serialize_case_write
     async def ack(self, case_id: str, *, operator: str, event_id: str = "") -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)
         now = utc_now()
@@ -367,6 +398,7 @@ class CaseService:
         await self.store.append_event(CaseEvent(**event_payload))
         return case
 
+    @_serialize_case_write
     async def suppress(
         self,
         case_id: str,
@@ -401,6 +433,7 @@ class CaseService:
         await self.store.append_event(CaseEvent(**event_payload))
         return case
 
+    @_serialize_case_write
     async def expire_suppression(self, case_id: str, *, now: datetime | None = None) -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)
         expiry = _parse_iso_time(case.suppressed_until or case.snoozed_until)
@@ -861,6 +894,7 @@ class CaseService:
     async def list_lhp_outcomes(self, *, case_id: str | None = None) -> list[OutcomeRecord]:
         return await self.store.list_outcomes(case_id=case_id)
 
+    @_serialize_case_write
     async def record_trace(self, trace: TraceRecord) -> TraceRecord:
         stored = await self.store.record_trace(trace)
         if stored.case_id:
@@ -872,6 +906,7 @@ class CaseService:
                 await self.store.upsert_case(case)
         return stored
 
+    @_serialize_case_write
     async def record_operator_feedback(
         self,
         feedback: OperatorFeedback,
@@ -897,6 +932,7 @@ class CaseService:
             )
         return stored
 
+    @_serialize_case_write
     async def record_knowledge_citations(
         self,
         case_id: str,
@@ -925,6 +961,7 @@ class CaseService:
         )
         return case
 
+    @_serialize_case_write
     async def record_handoff_result(self, case_id: str, *, issue_url: str, issue_id: str = "") -> AtomicCaseProjection:
         case = await self._require_atomic_case(case_id)
         now = utc_now()
@@ -1015,6 +1052,7 @@ class CaseService:
             return await self._update_unhealthy(case, observation)
         return ObserveResult("created", observation, case, events)
 
+    @_serialize_case_write
     async def _update_unhealthy(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
         now = utc_now()
         # Acknowledgement covers this incident at its acknowledged severity,
@@ -1054,6 +1092,7 @@ class CaseService:
         )
         return ObserveResult("updated", observation, case, [event])
 
+    @_serialize_case_write
     async def _record_clean(self, case: AtomicCaseProjection, observation: ObservationRecord) -> ObserveResult:
         now = utc_now()
         case.updated_at = now

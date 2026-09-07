@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 from uuid import uuid4
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -12,6 +13,7 @@ from app.cases.attention import AttentionDelivery
 from app.cases.attention_scheduler import enqueue_attention_batch
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.postgres import PostgresCaseStore
+from app.cases.service import CaseService
 
 
 SOCKET = os.getenv("NOC_TEST_ATTENTION_PG_SOCKET", "")
@@ -19,7 +21,7 @@ pytestmark = pytest.mark.skipif(not SOCKET, reason="isolated PostgreSQL Unix soc
 
 
 @pytest.mark.asyncio
-async def test_atomic_attention_rollback_concurrency_and_restart():
+async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
     assert SOCKET.startswith("/tmp/as215932-attention-pg-")
     assert (Path(SOCKET) / ".s.PGSQL.5432").is_socket()
     schema = "attention_test_" + uuid4().hex
@@ -73,11 +75,27 @@ async def test_atomic_attention_rollback_concurrency_and_restart():
             assert await conn.fetchval("SELECT count(*) FROM case_attention_lease") == 0
         assert (await store.get_case(case.case_id)).model_dump() == case.model_dump()
         await pool.close()
-        pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=2,
+        pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=1,
                                         server_settings={"search_path": schema})
         restarted = PostgresCaseStore(pool)
         assert await restarted.get_attention(case.case_id) == delivery
         assert len(await restarted.list_outbox(status="succeeded")) == 1
+        # The outer case transaction must reuse its connection for nested store
+        # calls even with a one-connection pool, and roll back a failed event.
+        service = CaseService(restarted)
+        append_event = restarted.append_event
+        monkeypatch.setattr(restarted, "append_event", AsyncMock(side_effect=RuntimeError("event write failed")))
+        with pytest.raises(RuntimeError, match="event write failed"):
+            await asyncio.wait_for(service.ack(case_id=case.case_id, operator="not-committed"), timeout=2)
+        assert not (await restarted.get_case(case.case_id)).acknowledged_by
+        monkeypatch.setattr(restarted, "append_event", append_event)
+        await asyncio.wait_for(asyncio.gather(
+            service.ack(case_id=case.case_id, operator="oncall"),
+            service.mark_reported(case_id=case.case_id, state_signature="current-facts"),
+        ), timeout=2)
+        current = await restarted.get_case(case.case_id)
+        assert current.acknowledged_by == "oncall"
+        assert current.last_reported_signature == "current-facts"
         # Stable keyset pagination must survive changes to recent telemetry and
         # skip retired/manual cases without excluding a pending recovery.
         for number, status, source in [
