@@ -3106,12 +3106,16 @@ def _provider_from_model_name(model_name: str) -> str:
 @app.get("/health/cases")
 async def health_cases(response: Response):
     if case_service_runtime is None:
+        if _env_bool("NOC_CASE_OUTBOX_ENABLED", False):
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"status": "degraded", "enabled": True,
+                    "delivery": {"status": "degraded", "reasons": ["worker_runtime_unavailable"]}}
         return {"status": "disabled", "enabled": False}
     store = case_service_runtime.store
     try:
-        pending = await store.list_outbox(status="pending")
-        failed = await store.list_outbox(status="failed")
-        recent_cases = await store.list_cases(limit=1)
+        async with asyncio.timeout(5):
+            queue_health = await store.outbox_health()
+            recent_cases = await store.list_cases(limit=1)
     except Exception as e:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         safe = classify_exception(e)
@@ -3124,8 +3128,19 @@ async def health_cases(response: Response):
             "error": safe_health_error(e),
         }
     lhp_settings = load_loop_handoff_settings()
+    from app.cases.health import delivery_health
+
+    delivery = delivery_health(
+        case_service_runtime, queue_health,
+        enabled=_env_bool("NOC_CASE_OUTBOX_ENABLED", False),
+        running=case_outbox_task is not None and not case_outbox_task.done(),
+        stale_after_s=_env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300),
+        worker_interval_s=_env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30),
+    )
+    if delivery["status"] == "degraded":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
-        "status": "ok",
+        "status": delivery["status"],
         "enabled": True,
         "backend": type(store).__name__,
         "sample_case_count": len(recent_cases),
@@ -3133,7 +3148,8 @@ async def health_cases(response: Response):
             "enabled": _env_bool("NOC_CASE_OUTBOX_ENABLED", False),
             "running": case_outbox_task is not None and not case_outbox_task.done(),
         },
-        "outbox": {"pending": len(pending), "failed": len(failed)},
+        "outbox": {"pending": queue_health.pending, "failed": queue_health.failed},
+        "delivery": delivery,
         "verifier": {
             "enabled": lhp_settings.enabled and lhp_settings.case_verification_enabled,
             "running": case_verifier_task is not None and not case_verifier_task.done(),

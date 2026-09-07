@@ -538,3 +538,12 @@ See [TESTING.md](TESTING.md).
 ---
 
 *Part of [Hyrule Networks (AS215932)](https://github.com/AS215932).*
+
+
+### Case delivery health
+
+`GET /health/cases` reports delivery independently of model and intake health. With `NOC_CASE_OUTBOX_ENABLED=1`, it returns HTTP503 if the worker is not running, no outbox tick has completed within `NOC_CASE_OUTBOX_HEALTH_STALE_S` (default300 seconds, minimum30), or an outstanding report is older than that threshold. Pending, failed and in-progress reports all count; unrelated handoffs do not. Heartbeat grace/staleness is the greater of the delivery threshold and twice the configured NOC_CASE_OUTBOX_INTERVAL_S plus 30 seconds. This avoids false alarms during a normal long polling interval without relaxing the overdue-report threshold. Runtime startup gets that same bounded heartbeat grace. Enabling the worker without a CaseService runtime returns degraded HTTP503. An empty successful tick refreshes the heartbeat; a store exception does not. A database-side aggregate returns one small row of counts and the oldest outstanding report timestamp without loading or deserializing queue payloads. Health reads have a five-second deadline and failures return sanitized degraded health. Long batches can legitimately exceed the threshold: this is delivery latency degradation, not proof of process death.
+
+The additive `delivery` object exposes heartbeat timestamps/age, oldest report age, count and reason codes without case content. Heartbeat elapsed time uses a process-local monotonic clock and resets on restart; outstanding report age comes from durable outbox creation timestamps and survives restart. Configure an independent monitor against this endpoint before transferring notification ownership. This change does not add monitor routing, disable direct alerts, or activate case-owned reporting.
+
+Delivery health SQL requires PostgreSQL16 or later (production verified on17). It classifies malformed/non-finite report timestamps as invalid rather than aborting the aggregate. The additive side_effect_outbox_health_idx covers pending, failed and in_progress rows, leaving completed history outside the health scan. It is created through the existing bounded schema setup; rollback binaries can leave this compatible index in place.
