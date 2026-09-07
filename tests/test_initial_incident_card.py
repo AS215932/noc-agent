@@ -26,8 +26,14 @@ async def test_initial_facts_arrive_before_model_failure_and_share_one_card(monk
     store = InMemoryCaseStore()
     runtime = CaseServiceRuntime(store=store, service=CaseService(store))
     monkeypatch.setattr(main, "case_service_runtime", runtime)
-    monkeypatch.setattr(main, "run_investigation_graph", AsyncMock(side_effect=RuntimeError("model unavailable")))
     created, edited = [], []
+
+    async def fail_model(*args, **kwargs):
+        assert len(created) == 1
+        assert "4% free" in created[0]["description"]
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(main, "run_investigation_graph", AsyncMock(side_effect=fail_model))
 
     async def notify(case_id, revision=None, **payload):
         async def create():
@@ -50,16 +56,17 @@ async def test_initial_facts_arrive_before_model_failure_and_share_one_card(monk
     }]}
     background = BackgroundTasks()
     result = await main._case_service_reactive_primary_response(payload, background, label="Alert")
-    assert len(created) == 1
-    assert "4% free" in created[0]["description"]
+    # Durable intake can acknowledge before Discord I/O or model execution.
+    assert not created
     assert not edited
     case = await store.get_case(result["incident_id"])
-    assert case.last_reported_at
+    assert not case.last_reported_at
     main.run_investigation_graph.assert_not_called()
     await background()
     main.run_investigation_graph.assert_awaited_once()
     assert len(created) == 1
     assert len(edited) == 1
+    assert (await store.get_case(case.case_id)).last_reported_at
     assert "Starting investigation" not in edited[0]["description"]
 
 

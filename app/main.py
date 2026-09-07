@@ -787,7 +787,9 @@ async def _shadow_observe_alert_payload(alert_payload: dict) -> list[object]:
     return results
 
 
-async def _maybe_request_reactive_case_report(observation, observe_result: object) -> None:
+async def _maybe_request_reactive_case_report(
+    observation, observe_result: object, *, background_tasks: BackgroundTasks | None = None,
+) -> None:
     """Optionally let CaseService own reactive report enqueue decisions."""
     if case_service_runtime is None or not _env_bool("NOC_CASESERVICE_REACTIVE_REPORT", False):
         return
@@ -813,16 +815,17 @@ async def _maybe_request_reactive_case_report(observation, observe_result: objec
     )
     from app.cases.reporting import reactive_reporting_owns_cards
 
-    if reactive_reporting_owns_cards() and intent.status == "pending":
+    if reactive_reporting_owns_cards() and intent.status == "pending" and background_tasks is not None:
         from app.cases.handlers import build_report_handler
         from app.cases.outbox import OutboxProcessor
 
-        # Deliver the deterministic incident facts before starting a model-based
-        # investigation. Failure stays in the same durable outbox for retries.
+        # The response acknowledges durable intake immediately. This task is
+        # inserted before investigation tasks, so Discord latency does not cause
+        # monitor webhook retries. Failed delivery remains in the durable outbox.
         processor = OutboxProcessor(case_service_runtime.store, {
             "report": build_report_handler(service, notifier=send_case_notification),
         })
-        await processor.process_intent(intent)
+        background_tasks.add_task(processor.process_intent, intent)
 
 
 def _case_service_reactive_primary_enabled() -> bool:
@@ -1636,7 +1639,9 @@ def _case_service_alert_payload_for_result(alert_payload: dict, result: object) 
     return selected
 
 
-async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[object]:
+async def _observe_case_service_reactive_primary(
+    alert_payload: dict, *, background_tasks: BackgroundTasks | None = None,
+) -> list[object]:
     """Authoritative CaseService reactive intake; failures must propagate."""
 
     observations = _reactive_observations_from_alert_payload(alert_payload)
@@ -1650,7 +1655,7 @@ async def _observe_case_service_reactive_primary(alert_payload: dict) -> list[ob
             status=getattr(observation, "status", ""),
             action=str(getattr(result, "action", "unknown")),
         )
-        await _maybe_request_reactive_case_report(observation, result)
+        await _maybe_request_reactive_case_report(observation, result, background_tasks=background_tasks)
     if results:
         log.info("case_service_reactive_primary_observed", count=len(results), source=alert_payload.get("source"))
     return results
@@ -1660,7 +1665,7 @@ async def _case_service_reactive_primary_response(
     alert_payload: dict, background_tasks: BackgroundTasks, *, label: str
 ) -> dict:
     _require_case_service_runtime()
-    shadow_results = await _observe_case_service_reactive_primary(alert_payload)
+    shadow_results = await _observe_case_service_reactive_primary(alert_payload, background_tasks=background_tasks)
     result = _case_service_primary_result(shadow_results)
     investigation_result = _case_service_reactive_investigation_result(shadow_results)
     case = getattr(result, "case", None) if result is not None else None
