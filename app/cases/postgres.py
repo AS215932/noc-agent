@@ -728,18 +728,25 @@ class PostgresCaseStore:
         # into the HTTP process while an outage grows the queue.
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("""
+                WITH outstanding AS (
+                    SELECT status, intent_type,
+                        CASE WHEN intent_type = 'report'
+                                  AND pg_input_is_valid(created_at, 'timestamp with time zone')
+                             THEN CASE WHEN isfinite(created_at::timestamptz)
+                                       THEN created_at::timestamptz END
+                        END AS report_created_at
+                    FROM side_effect_outbox
+                    WHERE status IN ('pending', 'failed', 'in_progress')
+                )
                 SELECT json_build_object(
                     'pending', count(*) FILTER (WHERE status = 'pending'),
                     'failed', count(*) FILTER (WHERE status = 'failed'),
                     'in_progress', count(*) FILTER (WHERE status = 'in_progress'),
                     'outstanding_reports', count(*) FILTER (WHERE intent_type = 'report'),
                     'invalid_report_timestamps', count(*) FILTER
-                        (WHERE intent_type = 'report' AND created_at = ''),
-                    'oldest_report_timestamp', extract(epoch FROM min(
-                        CASE WHEN intent_type = 'report' THEN nullif(created_at, '')::timestamptz END
-                    ))
-                ) AS payload
-                FROM side_effect_outbox WHERE status IN ('pending', 'failed', 'in_progress')
+                        (WHERE intent_type = 'report' AND report_created_at IS NULL),
+                    'oldest_report_timestamp', extract(epoch FROM min(report_created_at))
+                ) AS payload FROM outstanding
             """)
         return OutboxHealth(**_row_payload(row))
 

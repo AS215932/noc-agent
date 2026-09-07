@@ -15,13 +15,18 @@ def delivery_health(
     stale_after_s: int = 300,
     worker_interval_s: int = 30,
     now: float | None = None,
+    monotonic_now: float | None = None,
 ) -> dict:
     now = time.time() if now is None else now
+    monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
     threshold = max(30, stale_after_s)
     heartbeat_threshold = max(threshold, 2 * max(1, worker_interval_s) + 30)
     completed = getattr(runtime, "outbox_last_completed_at", 0.0)
-    baseline = completed or getattr(runtime, "started_at", 0.0)
-    heartbeat_age = max(0.0, now - baseline)
+    baseline = float(getattr(runtime, "started_monotonic", monotonic_now))
+    completion_clock = getattr(runtime, "outbox_last_completed_monotonic", None)
+    if completion_clock is not None:
+        baseline = float(completion_clock)
+    heartbeat_age = max(0.0, monotonic_now - baseline)
     oldest = max(0.0, now - outstanding.oldest_report_timestamp) if outstanding.oldest_report_timestamp is not None else 0.0
     reports = outstanding.outstanding_reports
     undated = outstanding.invalid_report_timestamps

@@ -144,15 +144,38 @@ async def test_postgres_outbox_health_aggregates_without_reading_payloads():
         ("d", "pending", "handoff", "2020-01-01T00:00:00+00:00"),
         ("e", "succeeded", "report", "2020-01-01T00:00:00+00:00"),
         ("f", "pending", "report", ""),
+        ("g", "failed", "report", "not-a-timestamp"),
+        ("h", "pending", "report", "2026-02-30T00:00:00Z"),
+        ("i", "pending", "report", "infinity"),
     ]:
         key = "health:" + suffix
         sql("INSERT INTO side_effect_outbox(outbox_id,idempotency_key,status,intent_type,created_at,payload) VALUES ("
             + ",".join(map(sql_literal, [key, key, status, kind, created, "{}"])) + ");")
     try:
-        health = await PostgresCaseStore(Pool()).outbox_health()
-        assert (health.pending, health.failed, health.in_progress) == (3, 1, 1)
-        assert health.outstanding_reports == 4
-        assert health.invalid_report_timestamps == 1
+        index = next(x for x in SCHEMA_STATEMENTS if "CREATE INDEX IF NOT EXISTS side_effect_outbox_health_idx" in x)
+        sql(index + ";")
+        sql("INSERT INTO side_effect_outbox(outbox_id,idempotency_key,status,intent_type,created_at,payload) "
+            "SELECT 'health:history-' || n, 'health:history-' || n, 'succeeded', 'report', "
+            "'2020-01-01T00:00:00Z', '{}'::jsonb FROM generate_series(1,10000) n;")
+        sql("ANALYZE side_effect_outbox;")
+        queries = []
+
+        class CapturedConnection(Connection):
+            async def fetchrow(self, query, *args):
+                queries.append(query)
+                return await super().fetchrow(query, *args)
+
+        class CapturedPool:
+            def acquire(self):
+                return CapturedConnection()
+
+        health = await PostgresCaseStore(CapturedPool()).outbox_health()
+        plan = json.loads(sql("EXPLAIN (FORMAT JSON) " + queries[-1]))
+        assert "side_effect_outbox_health_idx" in str(plan)
+
+        assert (health.pending, health.failed, health.in_progress) == (5, 2, 1)
+        assert health.outstanding_reports == 7
+        assert health.invalid_report_timestamps == 4
         assert health.oldest_report_timestamp == 1788739200
     finally:
         sql("DELETE FROM side_effect_outbox WHERE outbox_id LIKE 'health:%';")

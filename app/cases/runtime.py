@@ -21,8 +21,10 @@ class CaseServiceRuntime:
     store: CaseStore
     reminder_cursor: str = ""
     started_at: float = field(default_factory=time.time)
+    started_monotonic: float = field(default_factory=time.monotonic)
     outbox_last_started_at: float = 0.0
     outbox_last_completed_at: float = 0.0
+    outbox_last_completed_monotonic: float | None = None
 
     async def close(self) -> None:
         close = getattr(self.store, "close", None)
@@ -78,6 +80,7 @@ async def process_case_outbox_once(runtime: CaseServiceRuntime, *, limit: int | 
     )
     report = await processor.process_pending(limit=limit or _env_int("NOC_CASE_OUTBOX_LIMIT", 10))
     runtime.outbox_last_completed_at = time.time()
+    runtime.outbox_last_completed_monotonic = time.monotonic()
     return report
 
 
