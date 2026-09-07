@@ -344,6 +344,17 @@ omit a counter increment). Intentionally filtered
 reports complete as suppressed, without being stamped as delivered. Standalone
 use without the case outbox has three bounded attempts but no durable retry.
 
+When both `NOC_CASESERVICE_REACTIVE_REPORT=1` and `NOC_CASE_OUTBOX_ENABLED=1`
+are enabled, monitoring intake first queues and attempts delivery of the case's
+initial facts without calling a model. The investigation no longer posts a
+separate starting message. Its terminal update waits in the outbox until that
+first case report has been delivered, then edits the same card. A failed initial
+send remains retryable without letting a model failure create the first card.
+This ordering applies to Alertmanager and Icinga cases, not manual or proactive
+investigations. HIGH reports use ERROR verbosity so critical incidents remain
+visible at that setting. These flags do not change infrastructure notification
+routes or implement separate escalation/recovery paging.
+
 The state file is atomically replaced after successful delivery. A process crash
 between Discord accepting a new message and recording its ID can still produce
 one duplicate on retry; Discord does not provide a transactional create with the

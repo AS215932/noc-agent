@@ -10,6 +10,7 @@ from app.case_cards import CardDeliveryOutcome
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
+from app.cases.reporting import reactive_reporting_owns_cards
 from app.cases.service import CaseService
 from app.config import LoopHandoffSettings
 from app.discord import Verbosity, get_verbosity, send_case_notification, send_discord_notification
@@ -93,6 +94,15 @@ def build_report_handler(
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
         update = intent.payload.get("card_update")
         if isinstance(update, dict):
+            if (reactive_reporting_owns_cards() and case.identity.get("source") in {"alertmanager", "icinga2"}
+                    and not case.last_reported_at):
+                initial_level = _case_report_level(case)
+                if initial_level < get_verbosity():
+                    return OutboxHandlerResult(payload_updates={"notification_suppressed": "initial_report_verbosity"})
+                # A model result may finish while the initial Discord send is
+                # retrying. Keep its update queued instead of creating the first
+                # card with only investigation/dependency-failure information.
+                raise RuntimeError("Initial case card has not been delivered")
             title = str(update["title"])
             description = str(update["description"])
             fields = update.get("fields") or []
@@ -101,7 +111,7 @@ def build_report_handler(
         else:
             title, description, fields = _render_case_report(case, intent)
             color = _severity_color(case.severity)
-            level = Verbosity.WARNING if case.severity in {"HIGH", "MEDIUM"} else Verbosity.INFO
+            level = _case_report_level(case)
         if level < get_verbosity():
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
         revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
@@ -141,6 +151,12 @@ def build_report_handler(
         )
 
     return handle
+
+
+def _case_report_level(case: AtomicCaseProjection) -> Verbosity:
+    if case.severity == "HIGH":
+        return Verbosity.ERROR
+    return Verbosity.WARNING if case.severity == "MEDIUM" else Verbosity.INFO
 
 
 def build_engineering_lhp_handoff_handler(

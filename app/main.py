@@ -675,13 +675,16 @@ async def investigate_alert(
         incident_id=(case or {}).get("incident_id"),
         case_number=(case or {}).get("case_number"),
     )
-    await send_case_notification(
-        case_id=(case or {}).get("incident_id", display_title),
-        title=f"⏳ {display_title}",
-        description="Starting investigation and collecting telemetry.",
-        color=0xF39C12,
-        level=Verbosity.INFO,
-    )
+    from app.cases.reporting import reactive_reporting_owns_cards
+
+    if not (reactive_reporting_owns_cards() and alert_payload.get("source") in {"alertmanager", "icinga2"}):
+        await send_case_notification(
+            case_id=(case or {}).get("incident_id", display_title),
+            title=f"⏳ {display_title}",
+            description="Starting investigation and collecting telemetry.",
+            color=0xF39C12,
+            level=Verbosity.INFO,
+        )
 
     await _take_ownership_ack(alert_payload, case, runtime)
 
@@ -808,6 +811,18 @@ async def _maybe_request_reactive_case_report(observation, observe_result: objec
         outbox_id=intent.outbox_id,
         state_signature=state_signature,
     )
+    from app.cases.reporting import reactive_reporting_owns_cards
+
+    if reactive_reporting_owns_cards() and intent.status == "pending":
+        from app.cases.handlers import build_report_handler
+        from app.cases.outbox import OutboxProcessor
+
+        # Deliver the deterministic incident facts before starting a model-based
+        # investigation. Failure stays in the same durable outbox for retries.
+        processor = OutboxProcessor(case_service_runtime.store, {
+            "report": build_report_handler(service, notifier=send_case_notification),
+        })
+        await processor.process_intent(intent)
 
 
 def _case_service_reactive_primary_enabled() -> bool:

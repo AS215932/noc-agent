@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
@@ -11,6 +12,12 @@ from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxProcessor
 from app.discord import Verbosity, get_verbosity, send_case_notification
 from app.model_metrics import record_sanitized_discord_failure
+
+
+def reactive_reporting_owns_cards() -> bool:
+    return all(os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"} for name in (
+        "NOC_CASESERVICE_REACTIVE_REPORT", "NOC_CASE_OUTBOX_ENABLED",
+    ))
 
 
 async def send_investigation_card(*, runtime: Any, case_id: str, notifier=send_case_notification, safe_category: str | None = None, **card) -> bool:
