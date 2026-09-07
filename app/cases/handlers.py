@@ -93,6 +93,7 @@ def build_report_handler(
         ):
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
         update = intent.payload.get("card_update")
+        revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
         if isinstance(update, dict):
             current_signature = case_service.report_state_signature(case)
             if (reactive_reporting_owns_cards() and case.identity.get("source") in {"alertmanager", "icinga2"}
@@ -101,12 +102,26 @@ def build_report_handler(
                 if initial_level < get_verbosity():
                     return OutboxHandlerResult(payload_updates={"notification_suppressed": "initial_report_verbosity"})
                 initial = await case_service.store.get_outbox_by_key(f"report:{case.case_id}:{current_signature}")
-                # A legacy card may already have a newer revision. Its completed
-                # superseded report establishes card existence without pretending
-                # these facts were delivered or advancing the reminder clock.
-                if not (initial and initial.status == "succeeded"
-                        and initial.payload.get("notification_superseded") is True):
+                if initial is None:
+                    # Handoff and other non-observation transitions can change
+                    # the signature. Ensure the prerequisite actually exists.
+                    await case_service.request_report(case, state_signature=current_signature)
+                if not (initial and initial.status == "succeeded" and initial.payload.get("notification_superseded") is True):
                     raise RuntimeError("Current case facts have not been delivered")
+                # A local revision cannot prove the remote card still exists.
+                # Refresh facts at this update's revision before any terminal
+                # content, so replacement of a deleted legacy card starts with facts.
+                facts_title, facts_description, facts_fields = _render_case_report(case, initial)
+                facts_delivered = await notifier(
+                    case_id=case.case_id, title=facts_title, description=facts_description,
+                    fields=facts_fields, color=_severity_color(case.severity), level=initial_level,
+                    revision=revision, force_refresh=True,
+                )
+                if facts_delivered is CardDeliveryOutcome.SUPERSEDED:
+                    return OutboxHandlerResult(payload_updates={"notification_superseded": True})
+                if facts_delivered is False:
+                    raise RuntimeError("Current case facts refresh was not delivered")
+                await case_service.mark_reported(case.case_id, state_signature=current_signature)
             title = str(update["title"])
             description = str(update["description"])
             fields = update.get("fields") or []
@@ -118,7 +133,6 @@ def build_report_handler(
             level = _case_report_level(case)
         if level < get_verbosity():
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
-        revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
         if reminder_since:
             delivered = await reminder_notifier(
                 title=f"Unacknowledged critical incident: {title}"[:256],

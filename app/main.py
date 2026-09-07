@@ -1675,7 +1675,9 @@ async def _case_service_reactive_primary_response(
     alert_payload: dict, background_tasks: BackgroundTasks, *, label: str
 ) -> dict:
     _require_case_service_runtime()
-    shadow_results = await _observe_case_service_reactive_primary(alert_payload, background_tasks=background_tasks)
+    # Enqueue every observation durably; only the selected investigation's
+    # facts need an immediate attempt ahead of that investigation.
+    shadow_results = await _observe_case_service_reactive_primary(alert_payload)
     result = _case_service_primary_result(shadow_results)
     investigation_result = _case_service_reactive_investigation_result(shadow_results)
     case = getattr(result, "case", None) if result is not None else None
@@ -1683,6 +1685,9 @@ async def _case_service_reactive_primary_response(
     if investigation_case is not None:
         investigation_case = await case_service_runtime.service.claim_investigation(investigation_case)
     if investigation_case is not None:
+        await _maybe_request_reactive_case_report(
+            investigation_result.observation, investigation_result, background_tasks=background_tasks,
+        )
         investigation_payload = _case_service_alert_payload_for_result(alert_payload, investigation_result)
         background_tasks.add_task(
             investigate_alert,

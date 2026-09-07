@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import BackgroundTasks
 
-from app.case_cards import deliver_case_card
+from app.case_cards import CardNotFound, deliver_case_card
 from app.cases import CaseService, InMemoryCaseStore, ObservationRecord, OutboxIntent, OutboxProcessor
 from app.cases.handlers import build_report_handler
 from app.cases.runtime import CaseServiceRuntime
@@ -181,7 +181,8 @@ async def test_prior_report_does_not_allow_current_facts_to_be_overtaken(owned_c
 
 
 @pytest.mark.asyncio
-async def test_superseded_legacy_initial_card_allows_newer_terminal_edit(monkeypatch, tmp_path, owned_cards):
+@pytest.mark.parametrize("deleted", [False, True])
+async def test_superseded_legacy_initial_card_allows_newer_terminal_edit(monkeypatch, tmp_path, owned_cards, deleted):
     monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
     store = InMemoryCaseStore()
     service = CaseService(store)
@@ -189,21 +190,27 @@ async def test_superseded_legacy_initial_card_allows_newer_terminal_edit(monkeyp
         source="icinga2", detector="DiskLow", resource="rtr", severity="HIGH", status="firing",
     ))
     created, edited = [], []
+    exists = True
 
-    async def notify(case_id, revision=None, **payload):
+    async def notify(case_id, revision=None, force_refresh=False, **payload):
         async def create():
+            nonlocal exists
+            exists = True
             created.append(payload["title"])
             return 321
 
         async def edit(message_id):
             assert message_id == 321
+            if not exists:
+                raise CardNotFound
             edited.append(payload["title"])
             return True
 
         return await deliver_case_card(destination="test", case_id=case_id, payload=payload,
-                                       revision=revision, create=create, edit=edit)
+                                       revision=revision, force_refresh=force_refresh, create=create, edit=edit)
 
     await notify(case_id=observed.case.case_id, title="Legacy card", revision=20)
+    exists = not deleted
     initial = await service.request_report(observed.case, payload={"title": "Old initial facts", "card_revision": 10})
     processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notify)})
     assert (await processor.process_intent(initial)).succeeded == 1
@@ -215,8 +222,74 @@ async def test_superseded_legacy_initial_card_allows_newer_terminal_edit(monkeyp
                                                      "color": 0, "level": int(Verbosity.ERROR)}},
     ))
     assert (await processor.process_intent(terminal)).succeeded == 1
-    assert created == ["Legacy card"]
-    assert edited == ["New terminal"]
-    # Superseded facts establish card existence, not a delivered-facts timestamp.
-    assert not (await store.get_case(observed.case.case_id)).last_reported_at
+    assert created == (["Legacy card", "Old initial facts"] if deleted else ["Legacy card"])
+    assert edited == (["New terminal"] if deleted else ["Old initial facts", "New terminal"])
+    assert (await store.get_case(observed.case.case_id)).last_reported_at
     assert await store.get_outbox_by_key("missing") is None
+
+
+@pytest.mark.asyncio
+async def test_missing_report_after_handoff_is_enqueued_and_eventually_unblocks(owned_cards):
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    observed = await service.observe(ObservationRecord(source="icinga2", detector="Disk", resource="rtr", severity="HIGH", status="firing"))
+    await service.mark_reported(observed.case.case_id, state_signature=service.report_state_signature(observed.case))
+    case = await store.get_case(observed.case.case_id)
+    case.issue_url = "https://github.com/example/example/issues/1"
+    await store.upsert_case(case)
+    terminal = await store.enqueue_outbox(OutboxIntent(
+        case_id=case.case_id, intent_type="report", idempotency_key="handoff-terminal",
+        payload={"card_update": {"title": "Result", "description": "Model result", "color": 0, "level": int(Verbosity.ERROR)}},
+    ))
+    notifier = AsyncMock(return_value=True)
+    processor = OutboxProcessor(store, {"report": build_report_handler(service, notifier=notifier)}, retry_backoff_s=0)
+    assert (await processor.process_intent(terminal)).failed == 1
+    prerequisite = await store.get_outbox_by_key(f"report:{case.case_id}:{service.report_state_signature(case)}")
+    assert prerequisite is not None and prerequisite.status == "pending"
+    assert (await processor.process_intent(prerequisite)).succeeded == 1
+    assert (await processor.process_pending()).succeeded == 1
+    assert notifier.await_args_list[-1].kwargs["title"] == "Result"
+
+
+@pytest.mark.asyncio
+async def test_group_only_attempts_selected_facts_before_triage(monkeypatch, owned_cards):
+    import app.main as main
+
+    store = InMemoryCaseStore()
+    state = CaseServiceRuntime(store=store, service=CaseService(store))
+    monkeypatch.setattr(main, "case_service_runtime", state)
+    sent = []
+
+    async def notify(**kwargs):
+        sent.append(kwargs["case_id"])
+        assert len(sent) == 1, "Unrelated Discord sends must not precede triage"
+        return True
+
+    async def investigate(*args, **kwargs):
+        assert sent == [kwargs["case"]["incident_id"]]
+
+    monkeypatch.setattr(main, "send_case_notification", notify)
+    model = AsyncMock(side_effect=investigate)
+    monkeypatch.setattr(main, "investigate_alert", model)
+    payload = {"source": "alertmanager", "status": "firing", "alerts": [
+        {"status": "firing", "fingerprint": f"group-{i}",
+         "labels": {"alertname": "Disk", "instance": f"host-{i}", "severity": "critical"},
+         "annotations": {"summary": "Disk almost full"}} for i in range(3)
+    ]}
+    background = BackgroundTasks()
+    await main._case_service_reactive_primary_response(payload, background, label="Alert")
+    await background()
+    model.assert_awaited_once()
+    assert len(await store.list_outbox(status="pending")) == 2
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_checks_deleted_card_even_with_identical_cached_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_CASE_STATE_DIR", str(tmp_path))
+    create = AsyncMock(return_value=123)
+    edit = AsyncMock(side_effect=CardNotFound)
+    kwargs = dict(destination="test", case_id="deleted", payload={"facts": "critical disk"}, create=create, edit=edit)
+    assert await deliver_case_card(**kwargs, revision=1)
+    assert await deliver_case_card(**kwargs, revision=2, force_refresh=True)
+    edit.assert_awaited_once_with(123)
+    assert create.await_count == 2
