@@ -246,3 +246,47 @@ async def test_spool_read_failure_is_visible_without_hiding_database_health(monk
     assert result["outbox"] == {"pending": 0, "failed": 0}
     assert "report_spool_unavailable" in result["delivery"]["reasons"]
     assert "private path" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_large_spool_scan_is_bounded_and_health_is_explicitly_incomplete(monkeypatch):
+    from fastapi import Response
+    import app.main as main
+    from app.cases import CaseService
+    from app.cases.runtime import CaseServiceRuntime
+    from app.cases.report_spool import MAX_HEALTH_SCAN_ENTRIES
+
+    spool_directory().mkdir()
+    for number in range(MAX_HEALTH_SCAN_ENTRIES + 50):
+        (spool_directory() / f"{number}.invalid").touch()
+    original = os.scandir
+    consumed = 0
+
+    class CountedScan:
+        def __init__(self, directory):
+            self.scan = original(directory)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.scan.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal consumed
+            consumed += 1
+            assert consumed <= MAX_HEALTH_SCAN_ENTRIES + 1
+            return next(self.scan)
+
+    monkeypatch.setattr("app.cases.report_spool.os.scandir", CountedScan)
+    store = InMemoryCaseStore()
+    monkeypatch.setattr(main, "case_service_runtime", CaseServiceRuntime(store=store, service=CaseService(store)))
+    response = Response()
+    result = await main.health_cases(response)
+    assert response.status_code == 503
+    assert result["report_spool"]["scan_limited"] is True
+    assert result["report_spool"]["invalid"] == MAX_HEALTH_SCAN_ENTRIES
+    assert "report_spool_scan_limited" in result["delivery"]["reasons"]

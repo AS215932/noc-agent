@@ -94,6 +94,7 @@ def build_report_handler(
             return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
         update = intent.payload.get("card_update")
         revision = float(intent.payload.get("card_revision") or datetime.fromisoformat(intent.created_at).timestamp())
+        bundled_facts_need_stamp = False
         if isinstance(update, dict):
             level = Verbosity(int(update["level"]))
             if level < get_verbosity():
@@ -112,6 +113,7 @@ def build_report_handler(
                     # its prerequisite facts have a lower severity. Include those
                     # facts first in this eligible message instead.
                     bundled_facts = _render_case_report(case, intent)
+                    bundled_facts_need_stamp = True
                 else:
                     initial = await case_service.store.get_outbox_by_key(f"report:{case.case_id}:{current_signature}")
                     if initial is None:
@@ -177,7 +179,9 @@ def build_report_handler(
         if delivered is False:
             raise RuntimeError("Discord case notification was not delivered")
         if isinstance(update, dict):
-            # An investigation update is not a new case-state report signature.
+            if bundled_facts_need_stamp:
+                await case_service.mark_reported(case.case_id, state_signature=current_signature)
+            # Other investigation updates do not advance the facts projection.
             return OutboxHandlerResult(payload_updates={"card_update_delivered": True})
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
         await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)

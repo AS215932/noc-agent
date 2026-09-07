@@ -404,6 +404,13 @@ async def test_eligible_terminal_error_includes_lower_severity_facts(monkeypatch
     assert created[0]["level"] == Verbosity.ERROR
     assert created[0]["description"].splitlines() == ["Router filesystem is low", "", "Model unavailable"]
     assert (await store.get_outbox_by_key(terminal.idempotency_key)).payload["card_update_delivered"]
+    current = await store.get_case(case.case_id)
+    assert current.last_reported_signature == service.report_state_signature(current)
+    assert current.last_reported_at
+    monkeypatch.setenv("LOG_LEVEL_DISCORD", "INFO")
+    # The facts were delivered with the eligible terminal. Lowering verbosity
+    # must not resurrect the older suppressed initial report as unreported.
+    assert not service.should_report(current)
 
 
 @pytest.mark.asyncio

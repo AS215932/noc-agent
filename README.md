@@ -367,6 +367,9 @@ outside the replay queue. Connection-level failures stop the batch and retain
 pending files. `/health/cases` reports local spool counts even during database
 outages and degrades for
 invalid records or reports retained beyond the delivery health threshold.
+Local health scans examine at most 1,000 directory entries. Larger spools return
+`scan_limited: true` and degraded health; their counts are lower bounds, not a
+claim that the complete retained set was examined.
 If both database and local storage fail, the retention error propagates; there
 is no claim that the result was saved. Owned terminal cards include monitoring
 facts as well as the investigation result, so recreating a remotely deleted card

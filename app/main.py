@@ -3149,8 +3149,11 @@ async def health_cases(response: Response):
     )
     if spool_error:
         delivery["reasons"].append("report_spool_unavailable")
-    elif retained["invalid"]:
-        delivery["reasons"].append("retained_reports_invalid")
+    else:
+        if retained["scan_limited"]:
+            delivery["reasons"].append("report_spool_scan_limited")
+        if retained["invalid"]:
+            delivery["reasons"].append("retained_reports_invalid")
     if not spool_error and retained["oldest_retained_at"] is not None:
         retained_age = max(0, datetime.now(timezone.utc).timestamp() - retained["oldest_retained_at"])
         if retained_age > delivery["stale_after_seconds"]:

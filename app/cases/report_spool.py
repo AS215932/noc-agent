@@ -13,6 +13,7 @@ from app.cases.store import CaseStore
 
 
 MAX_RECORD_BYTES = 262144
+MAX_HEALTH_SCAN_ENTRIES = 1000
 
 
 def spool_directory() -> Path:
@@ -58,19 +59,27 @@ def _stats() -> dict:
     directory = spool_directory()
     count = invalid = 0
     oldest = None
-    if directory.exists():
-        for path in directory.iterdir():
-            if path.suffix == ".invalid":
+    limited = False
+    try:
+        entries = os.scandir(directory)
+    except FileNotFoundError:
+        return {"pending": 0, "invalid": 0, "oldest_retained_at": None, "scan_limited": False}
+    with entries:
+        for index, entry in enumerate(entries):
+            if index >= MAX_HEALTH_SCAN_ENTRIES:
+                limited = True
+                break
+            if entry.name.endswith(".invalid"):
                 invalid += 1
-            if path.suffix != ".json":
+            if not entry.name.endswith(".json"):
                 continue
             try:
-                stamp = path.stat(follow_symlinks=False).st_mtime
+                stamp = entry.stat(follow_symlinks=False).st_mtime
             except FileNotFoundError:
                 continue
             count += 1
             oldest = stamp if oldest is None else min(oldest, stamp)
-    return {"pending": count, "invalid": invalid, "oldest_retained_at": oldest}
+    return {"pending": count, "invalid": invalid, "oldest_retained_at": oldest, "scan_limited": limited}
 
 
 async def spool_stats() -> dict:
