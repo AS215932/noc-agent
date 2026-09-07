@@ -1081,7 +1081,10 @@ class CaseService:
                 covered_severity = scope
         # Acknowledgement covers this incident at its acknowledged severity,
         # not a later recurrence or an increase beyond that severity.
-        if case.status in {"resolved", "recovered_pending"} or SEVERITY_RANK[observation.severity] > SEVERITY_RANK[covered_severity]:
+        if case.status in {"resolved", "recovered_pending"} or (
+            bool(case.acknowledged_at or case.acknowledged_by)
+            and SEVERITY_RANK[observation.severity] > SEVERITY_RANK[covered_severity]
+        ):
             case.acknowledged_at = ""
             case.acknowledged_by = ""
             case.report_generation += 1

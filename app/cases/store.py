@@ -513,7 +513,11 @@ class InMemoryCaseStore:
             cases = sorted((case for case in self._cases.values()
                             if isinstance(case, AtomicCaseProjection) and case.case_id > after_case_id
                             and case.identity.get("source") in {"alertmanager", "icinga2"}
-                            and case.status not in {"closed", "expired", "linked", "recovered_pending"}),
+                            and case.status not in {"closed", "expired", "linked", "recovered_pending"}
+                            and (case.status != "resolved" or (
+                                case.resolution_reason == "positive_clean_observation"
+                                and case.case_id in self._attention
+                                and self._attention[case.case_id].phase == "firing"))),
                            key=lambda case: case.case_id)
             return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
 

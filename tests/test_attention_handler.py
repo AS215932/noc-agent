@@ -86,6 +86,7 @@ async def test_recovery_supersedes_queued_reminder_and_delivers_once():
     reminder = await enqueue_attention(store, case)
     assert reminder.payload["attention_request"]["kind"] == "reminder"
     case.status = "resolved"
+    case.resolution_reason = "positive_clean_observation"
     await store.upsert_case(case)
     recovery = await enqueue_attention(store, case)
     assert recovery.payload["attention_request"]["kind"] == "recovery"

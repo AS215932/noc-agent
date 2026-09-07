@@ -122,7 +122,7 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         first.signal_signature = "new quiet telemetry"
         await restarted.upsert_case(first)
         remaining = await restarted.list_attention_candidates(after_case_id=cursor, limit=2)
-        assert [item.case_id for item in remaining] == ["page-4"]
+        assert remaining == []  # No prior firing delivery needs recovery.
         assert await enqueue_attention_batch(restarted, after_case_id=cursor, limit=2) == ("", 0)
         await enqueue_attention_batch(restarted)
         assert len(await restarted.list_outbox(status="pending")) == 2
@@ -189,6 +189,18 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         restarted = PostgresCaseStore(pool)
         assert (await restarted.get_attention(legacy_case.case_id)).sequence == 1
         assert await enqueue_attention(restarted, await restarted.get_case(legacy_case.case_id)) is None
+        legacy_case = await restarted.get_case(legacy_case.case_id)
+        legacy_case.status = "resolved"
+        legacy_case.resolution_reason = "positive_clean_observation"
+        await restarted.upsert_case(legacy_case)
+        assert legacy_case.case_id in {c.case_id for c in await restarted.list_attention_candidates()}
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE case_attention_delivery SET payload=jsonb_set(payload, '{phase}', '\"recovered\"') WHERE case_id=$1",
+                               legacy_case.case_id)
+        assert legacy_case.case_id not in {c.case_id for c in await restarted.list_attention_candidates()}
+        legacy_case.status = "investigating"
+        await restarted.upsert_case(legacy_case)
+        assert legacy_case.case_id in {c.case_id for c in await restarted.list_attention_candidates()}
     finally:
         if pool is not None:
             await pool.close()

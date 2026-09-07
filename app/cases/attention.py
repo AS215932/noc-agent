@@ -62,6 +62,8 @@ def attention_due(case: AtomicCaseProjection, previous: AttentionDelivery | None
     phase: Literal["firing", "recovered"] = "recovered" if case.status == "resolved" else "firing"
     kind: Literal["new", "recurrence", "escalation", "recovery", "reminder"] | None = None
     if phase == "recovered":
+        if case.resolution_reason != "positive_clean_observation":
+            return None
         if previous is not None and previous.phase == "firing":
             kind = "recovery"
     elif case.acknowledged_at or case.acknowledged_by:

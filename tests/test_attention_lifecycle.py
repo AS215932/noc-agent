@@ -103,3 +103,18 @@ async def test_acknowledgement_covers_lower_severity_rebounds(covered):
     acknowledged_again = await service.ack(case.case_id, operator="oncall")
     assert await store.acknowledgement_scope(case.case_id, acknowledged_again.acknowledged_at) == "LOW"
     assert not (await observe("MEDIUM")).acknowledged_by
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_rebounds_do_not_create_recurrence():
+    store = InMemoryCaseStore()
+    service = CaseService(store)
+    sender = AsyncMock(return_value=True)
+    processor = OutboxProcessor(store, {"report": build_attention_handler(store, sender=sender)})
+    for severity in ("HIGH", "LOW", "MEDIUM", "HIGH"):
+        case = (await service.observe(ObservationRecord(source="icinga2", detector="Disk", resource="rtr",
+            severity=severity, status="firing"))).case
+        await enqueue_attention(store, case)
+        await processor.process_pending()
+        assert case.report_generation == 0
+    assert [call.args[1].kind for call in sender.await_args_list] == ["new"]

@@ -31,6 +31,7 @@ def test_human_ack_stops_reminders_and_recovery_still_notifies():
     case.acknowledged_by = "operator"
     assert attention_due(case, prior, now=START + timedelta(hours=7)) is None
     case.status = "resolved"
+    case.resolution_reason = "positive_clean_observation"
     assert attention_due(case, prior, now=START + timedelta(hours=7)).kind == "recovery"
 
 
@@ -42,6 +43,7 @@ def test_new_escalation_recurrence_and_duplicate_recovery():
     assert attention_due(case, prior, now=START).kind == "escalation"
     recovered = delivered(case, phase="recovered")
     case.status = "resolved"
+    case.resolution_reason = "positive_clean_observation"
     assert attention_due(case, recovered, now=START) is None
     case.status = "investigating"
     case.report_generation += 1
@@ -57,3 +59,14 @@ def test_ack_and_snooze_are_rechecked_without_changing_retry_identity():
     assert attention_due(case, prior, now=now) is None
     case.snoozed_until = ""
     assert attention_due(case, prior, now=now).idempotency_key == request.idempotency_key
+
+
+def test_operator_resolution_does_not_claim_monitor_recovery():
+    case = AtomicCaseProjection(severity="HIGH")
+    prior = delivered(case)
+    case.status = "resolved"
+    for reason in ("", "operator_approved", "operator_rejected", "graph_update"):
+        case.resolution_reason = reason
+        assert attention_due(case, prior, now=START) is None
+    case.resolution_reason = "positive_clean_observation"
+    assert attention_due(case, prior, now=START).kind == "recovery"

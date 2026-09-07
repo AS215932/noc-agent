@@ -424,10 +424,14 @@ class PostgresCaseStore:
     async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT payload FROM cases WHERE kind='atomic' AND case_id > $1
-                   AND payload#>>'{identity,source}' IN ('alertmanager', 'icinga2')
-                   AND status NOT IN ('closed','expired','linked','recovered_pending')
-                   ORDER BY case_id LIMIT $2""",
+                """SELECT c.payload FROM cases c WHERE c.kind='atomic' AND c.case_id > $1
+                   AND c.payload#>>'{identity,source}' IN ('alertmanager', 'icinga2')
+                   AND c.status NOT IN ('closed','expired','linked','recovered_pending')
+                   AND (c.status <> 'resolved' OR (
+                       c.payload->>'resolution_reason' = 'positive_clean_observation'
+                       AND EXISTS (SELECT 1 FROM case_attention_delivery a
+                                   WHERE a.case_id=c.case_id AND a.payload->>'phase'='firing')))
+                   ORDER BY c.case_id LIMIT $2""",
                 after_case_id, max(0, min(limit, 1000)),
             )
         return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
