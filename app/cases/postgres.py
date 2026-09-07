@@ -39,6 +39,7 @@ from app.cases.models import (
     TraceRecord,
 )
 from app.cases.store import (
+    OutboxHealth,
     CallbackClaimResult,
     CaseLinkResult,
     CaseProjection,
@@ -721,6 +722,26 @@ class PostgresCaseStore:
                 expected_claim_token,
             )
         return OutboxIntent.model_validate(_row_payload(row)) if row else None
+
+    async def outbox_health(self) -> OutboxHealth:
+        # Return one small aggregate row; never load/deserialise case payloads
+        # into the HTTP process while an outage grows the queue.
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT json_build_object(
+                    'pending', count(*) FILTER (WHERE status = 'pending'),
+                    'failed', count(*) FILTER (WHERE status = 'failed'),
+                    'in_progress', count(*) FILTER (WHERE status = 'in_progress'),
+                    'outstanding_reports', count(*) FILTER (WHERE intent_type = 'report'),
+                    'invalid_report_timestamps', count(*) FILTER
+                        (WHERE intent_type = 'report' AND created_at = ''),
+                    'oldest_report_timestamp', extract(epoch FROM min(
+                        CASE WHEN intent_type = 'report' THEN nullif(created_at, '')::timestamptz END
+                    ))
+                ) AS payload
+                FROM side_effect_outbox WHERE status IN ('pending', 'failed', 'in_progress')
+            """)
+        return OutboxHealth(**_row_payload(row))
 
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
         async with self.pool.acquire() as conn:

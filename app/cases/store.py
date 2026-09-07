@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
 
 from app.cases.lhp import (
@@ -40,6 +41,16 @@ from app.cases.models import (
 
 CaseProjection = AtomicCaseProjection | MetaCaseProjection
 TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
+
+
+@dataclass(frozen=True)
+class OutboxHealth:
+    pending: int = 0
+    failed: int = 0
+    in_progress: int = 0
+    outstanding_reports: int = 0
+    oldest_report_timestamp: float | None = None
+    invalid_report_timestamps: int = 0
 
 
 def case_status_for_handoff(status: HandoffStatus) -> CaseStatus:
@@ -161,6 +172,8 @@ class CaseStore(Protocol):
     ) -> OutboxIntent | None: ...
 
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]: ...
+
+    async def outbox_health(self) -> OutboxHealth: ...
 
     async def create_handoff_with_objectives(
         self,
@@ -632,6 +645,29 @@ class InMemoryCaseStore:
             self._outbox[stored.outbox_id] = stored
             self._outbox_index[stored.idempotency_key] = stored.outbox_id
             return stored.model_copy(deep=True)
+
+    async def outbox_health(self) -> OutboxHealth:
+        counts = {"pending": 0, "failed": 0, "in_progress": 0}
+        reports = invalid = 0
+        oldest = None
+        async with self._lock:
+            for intent in self._outbox.values():
+                if intent.status not in counts:
+                    continue
+                counts[intent.status] += 1
+                if intent.intent_type != "report":
+                    continue
+                reports += 1
+                try:
+                    value = datetime.fromisoformat(intent.created_at.replace("Z", "+00:00"))
+                    if value.tzinfo is None:
+                        value = value.replace(tzinfo=timezone.utc)
+                    stamp = value.timestamp()
+                    oldest = stamp if oldest is None else min(oldest, stamp)
+                except (ValueError, TypeError, AttributeError):
+                    invalid += 1
+        return OutboxHealth(**counts, outstanding_reports=reports, oldest_report_timestamp=oldest,
+                            invalid_report_timestamps=invalid)
 
     async def list_outbox(self, *, status: str | None = None) -> list[OutboxIntent]:
         async with self._lock:

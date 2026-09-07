@@ -268,8 +268,9 @@ async def test_health_cases_reports_runtime_status(monkeypatch):
         async def list_cases(self, *, kind=None, limit=100):
             return [object()]
 
-        async def list_outbox(self, *, status=None):
-            return [object(), object()] if status == "pending" else [object()]
+        async def outbox_health(self):
+            from app.cases.store import OutboxHealth
+            return OutboxHealth(pending=2, failed=1)
 
     class _Runtime:
         store = _Store()
