@@ -123,6 +123,9 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
         assert await enqueue_attention_batch(restarted, after_case_id=cursor, limit=2) == ("", 0)
         await enqueue_attention_batch(restarted)
         assert len(await restarted.list_outbox(status="pending")) == 2
+        assert await restarted.has_pending_attention("page-0")
+        assert not await restarted.has_pending_attention("page-4")
+        assert not await restarted.has_pending_attention(case.case_id)
         await pool.close()
         pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=1,
                                         server_settings={"search_path": schema})

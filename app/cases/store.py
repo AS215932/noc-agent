@@ -179,6 +179,8 @@ class CaseStore(Protocol):
 
     async def get_attention(self, case_id: str) -> AttentionDelivery | None: ...
 
+    async def has_pending_attention(self, case_id: str) -> bool: ...
+
     async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None: ...
 
     async def release_attention(self, case_id: str, lease_token: str) -> None: ...
@@ -697,6 +699,12 @@ class InMemoryCaseStore:
         async with self._lock:
             value = self._attention.get(case_id)
             return value.model_copy(deep=True) if value else None
+
+    async def has_pending_attention(self, case_id: str) -> bool:
+        async with self._lock:
+            return any(item.case_id == case_id and item.intent_type == "report"
+                       and item.status in {"pending", "failed", "in_progress"}
+                       and "attention_request" in item.payload for item in self._outbox.values())
 
     async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None:
         if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:

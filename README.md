@@ -618,6 +618,9 @@ deployments. No synthetic channel traffic is needed for local tests.
 
 Rollback must disable attention creation and restore reviewed direct monitor
 routing if necessary; preserve attention tables, outbox records, and local card
-state. Older binaries ignore the additive tables but do not understand attention
+state. The compatible runtime defers legacy reminders while attention remains
+pending and uses the newer of the case-report and attention-delivery timestamps
+at both scheduling and delivery. This avoids resetting the reminder interval
+when the attention flag is disabled. Older binaries ignore the additive tables but do not understand attention
 payloads: drain retained attention work with a compatible binary before rolling
 back the application itself.

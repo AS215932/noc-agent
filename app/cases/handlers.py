@@ -97,6 +97,11 @@ def build_report_handler(
             raise KeyError(f"atomic case not found for report intent: {intent.case_id}")
         state_signature = intent.state_signature or case_service.report_state_signature(case)
         reminder_since = intent.payload.get("reminder_since")
+        if reminder_since:
+            reminder_case = await case_service.legacy_reminder_projection(case)
+            if reminder_case is None:
+                return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
+            case = reminder_case
         if reminder_since and (
             reminder_since != case.last_reported_at
             or state_signature != case_service.report_state_signature(case)

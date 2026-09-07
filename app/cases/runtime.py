@@ -56,8 +56,9 @@ async def enqueue_due_case_reminders(runtime: CaseServiceRuntime, *, batch_size:
     cases = await runtime.store.list_reminder_candidates(after_case_id=runtime.reminder_cursor, limit=batch_size)
     enqueued = 0
     for case in cases:
-        if runtime.service.should_remind(case):
-            await runtime.service.request_report(case, payload={"source": "reminder_scheduler"})
+        reminder_case = await runtime.service.legacy_reminder_projection(case)
+        if reminder_case is not None and runtime.service.should_remind(reminder_case):
+            await runtime.service.request_report(reminder_case, payload={"source": "reminder_scheduler"})
             enqueued += 1
     runtime.reminder_cursor = cases[-1].case_id if len(cases) == batch_size else ""
     return enqueued

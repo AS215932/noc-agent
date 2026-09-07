@@ -151,6 +151,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         WHERE status IN ('pending', 'failed', 'in_progress')
     """,
     """
+    CREATE INDEX IF NOT EXISTS side_effect_outbox_attention_case_idx ON side_effect_outbox(case_id)
+        WHERE intent_type='report' AND status IN ('pending','failed','in_progress')
+          AND payload->'payload' ? 'attention_request'
+    """,
+    """
     CREATE TABLE IF NOT EXISTS meta_case_correlation_evidence (
         evidence_id TEXT PRIMARY KEY,
         meta_case_id TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,

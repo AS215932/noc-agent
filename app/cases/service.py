@@ -186,6 +186,18 @@ class CaseService:
             return True
         return self.should_remind(case, now=now)
 
+    async def legacy_reminder_projection(self, case: AtomicCaseProjection) -> AtomicCaseProjection | None:
+        """Bridge retained attention into legacy reminders without changing facts."""
+        if case.identity.get("source") not in {"alertmanager", "icinga2"}:
+            return case
+        if await self.store.has_pending_attention(case.case_id):
+            return None
+        attention = await self.store.get_attention(case.case_id)
+        reported = _parse_iso_time(case.last_reported_at)
+        if attention is not None and (reported is None or attention.delivered_at > reported):
+            return case.model_copy(update={"last_reported_at": attention.delivered_at.isoformat()})
+        return case
+
     def should_remind(self, case: AtomicCaseProjection, *, now: datetime | None = None) -> bool:
         """Only repeat an unchanged, unacknowledged critical incident.
 

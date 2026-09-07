@@ -734,6 +734,14 @@ class PostgresCaseStore:
             row = await conn.fetchrow("SELECT payload FROM case_attention_delivery WHERE case_id = $1", case_id)
         return AttentionDelivery.model_validate(_row_payload(row)) if row else None
 
+    async def has_pending_attention(self, case_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM side_effect_outbox WHERE case_id=$1 AND intent_type='report'
+                   AND status IN ('pending','failed','in_progress') AND payload->'payload' ? 'attention_request')""",
+                case_id,
+            ))
+
     async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None:
         if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:
             raise ValueError("invalid attention lease")
