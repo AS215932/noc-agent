@@ -624,3 +624,5 @@ at both scheduling and delivery. This avoids resetting the reminder interval
 when the attention flag is disabled. Older binaries ignore the additive tables but do not understand attention
 payloads: drain retained attention work with a compatible binary before rolling
 back the application itself.
+
+Legacy reactive reminders share the attention delivery lease, including during mixed-configuration rollouts. Successful legacy reminders also advance the durable attention clock atomically with their outbox completion; quiet case-card updates still do not. Both delivery paths recheck eligibility after claiming the lease and bound external work to 60 seconds within the 120-second lease. Failed or suppressed legacy sends release ownership without advancing attention.

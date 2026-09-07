@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app.case_cards import CardDeliveryOutcome
+from app.cases.attention import AttentionDelivery
 from app.cases.attention_handler import build_attention_handler
 from app.cases.attention_sender import build_attention_sender
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
@@ -84,7 +86,8 @@ def build_report_handler(
     attention_handler = build_attention_handler(case_service.store, sender=build_attention_sender(notifier=notifier),
                                                  reminder_seconds=case_service.policy.report_reassert_s)
 
-    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+    async def deliver(intent: OutboxIntent, *, attention_sequence: int | None = None,
+                      lease_token: str = "") -> OutboxHandlerResult:
         if "attention_request" in intent.payload:
             result = await attention_handler(intent)
             if result is None:
@@ -203,10 +206,44 @@ def build_report_handler(
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
         await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
         return OutboxHandlerResult(
+            attention_delivery=(AttentionDelivery(
+                case_id=case.case_id, generation=case.report_generation, phase="firing",
+                severity=case.severity, delivered_at=datetime.now(timezone.utc),
+                sequence=attention_sequence + 1,
+            ) if attention_sequence is not None else None),
+            attention_lease_token=lease_token,
             external_id=case.case_number or case.case_id,
             external_url=_case_url(case, control_public_url),
             payload_updates={"state_signature": state_signature, "case_number": case.case_number},
         )
+
+    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+        if "attention_request" in intent.payload or not intent.payload.get("reminder_since") or not intent.case_id:
+            return await deliver(intent)
+        store = case_service.store
+        case = await store.get_case(intent.case_id)
+        if not isinstance(case, AtomicCaseProjection) or case.identity.get("source") not in {"alertmanager", "icinga2"}:
+            return await deliver(intent)
+        # Both send paths share ownership even during a mixed-configuration
+        # rollout. Fresh eligibility is checked inside deliver after the lease.
+        previous = await store.get_attention(case.case_id)
+        sequence = previous.sequence if previous else 0
+        lease = await store.claim_attention(intent, expected_sequence=sequence, lease_seconds=120)
+        if lease is None:
+            raise RuntimeError("incident notification already claimed or superseded")
+        success = False
+        try:
+            async with asyncio.timeout(60):
+                result = await deliver(intent, attention_sequence=sequence, lease_token=lease)
+            success = result.attention_delivery is not None
+            return result
+        finally:
+            if not success:
+                try:
+                    async with asyncio.timeout(5):
+                        await store.release_attention(case.case_id, lease)
+                except Exception:
+                    pass
 
     return handle
 
