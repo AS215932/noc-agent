@@ -3,6 +3,7 @@ import httpx
 from typing import Any
 import enum
 
+from app.case_cards import CardNotFound, deliver_case_card
 from app.model_metrics import record_sanitized_discord_failure
 from app.safe_errors import classify_exception, log_exception
 
@@ -75,19 +76,45 @@ async def send_case_notification(
     color: int = 0x3498db,
     fields: list[dict[str, Any]] | None = None,
     level: Verbosity = Verbosity.INFO,
-):
+) -> bool:
     if level < get_verbosity():
-        return
+        return False
     if CASE_BOT_NOTIFIER is not None:
-        await CASE_BOT_NOTIFIER(
+        return bool(await CASE_BOT_NOTIFIER(
             case_id=case_id,
             title=title,
             description=description,
             color=color,
             fields=fields or [],
+        ))
+    if not DISCORD_WEBHOOK_URL:
+        return False
+    payload = {"embeds": [{
+        "title": title, "description": description, "color": color, "fields": fields or [],
+    }]}
+    url = httpx.URL(DISCORD_WEBHOOK_URL)
+    async with httpx.AsyncClient() as client:
+        async def create() -> int | None:
+            response = await client.post(url.copy_merge_params({"wait": "true"}), json=payload)
+            response.raise_for_status()
+            message_id = response.json().get("id")
+            return int(message_id) if str(message_id).isdigit() else None
+
+        async def edit(message_id: int) -> bool:
+            edit_url = url.copy_with(path=url.path.rstrip("/") + f"/messages/{message_id}")
+            response = await client.patch(edit_url, json=payload)
+            if response.status_code == 404 and response.json().get("code") == 10008:
+                raise CardNotFound
+            response.raise_for_status()
+            return True
+
+        return await deliver_case_card(
+            destination=f"webhook:{url}",
+            case_id=case_id,
+            payload=payload,
+            create=create,
+            edit=edit,
         )
-        return
-    await send_discord_notification(title=title, description=description, color=color, fields=fields or [], level=level)
 
 
 def install_bot_notifier(notifier):
