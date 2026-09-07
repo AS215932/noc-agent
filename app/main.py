@@ -1853,20 +1853,8 @@ def _safe_case_service_output_value(value: object, *, string_limit: int = 2000) 
 
 
 def _safe_monitor_text(value: object, *, limit: int) -> str:
-    text = str(value or "")
-    # The source is untrusted monitoring text. Keep only plain, single-line text
-    # and strip markdown/control delimiters so future consumers don't inherit a
-    # prompt-like or rich-text channel from webhook payloads.
-    cleaned = []
-    blocked = set("`<>[]{}")
-    for ch in text:
-        if ch in blocked or ord(ch) < 32:
-            cleaned.append(" ")
-        else:
-            cleaned.append(ch)
-    rendered = " ".join("".join(cleaned).split())
-    return (rendered or "—")[:limit]
-
+    from app.monitor_text import safe_monitor_text
+    return safe_monitor_text(value, limit=limit)
 
 def _icinga_to_alert_payload(notif: IcingaNotification) -> dict:
     """Reshape an Icinga notification into the dict shape investigate_alert expects."""
@@ -3113,11 +3101,28 @@ async def health_cases(response: Response):
     except Exception as e:
         spool_error = True
         retained = {"status": "unavailable", "error": safe_health_error(e)}
+    spool_reasons = []
+    spool_threshold = max(30, _env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300))
+    if spool_error:
+        spool_reasons.append("report_spool_unavailable")
+    else:
+        if retained["scan_limited"]:
+            spool_reasons.append("report_spool_scan_limited")
+        if retained["invalid"]:
+            spool_reasons.append("retained_reports_invalid")
+        if retained["oldest_retained_at"] is not None:
+            retained_age = max(0, datetime.now(timezone.utc).timestamp() - retained["oldest_retained_at"])
+            if retained_age > spool_threshold:
+                spool_reasons.append("retained_reports_overdue")
     if case_service_runtime is None:
-        if _env_bool("NOC_CASE_OUTBOX_ENABLED", False):
+        enabled = _env_bool("NOC_CASE_OUTBOX_ENABLED", False)
+        reasons = list(spool_reasons)
+        if enabled or (not spool_error and retained["pending"]):
+            reasons.append("worker_runtime_unavailable")
+        if reasons:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            return {"status": "degraded", "enabled": True,
-                    "delivery": {"status": "degraded", "reasons": ["worker_runtime_unavailable"]},
+            return {"status": "degraded", "enabled": enabled,
+                    "delivery": {"status": "degraded", "reasons": reasons},
                     "report_spool": retained}
         return {"status": "disabled", "enabled": False, "report_spool": retained}
     store = case_service_runtime.store
@@ -3147,17 +3152,7 @@ async def health_cases(response: Response):
         stale_after_s=_env_int("NOC_CASE_OUTBOX_HEALTH_STALE_S", 300),
         worker_interval_s=_env_int("NOC_CASE_OUTBOX_INTERVAL_S", 30),
     )
-    if spool_error:
-        delivery["reasons"].append("report_spool_unavailable")
-    else:
-        if retained["scan_limited"]:
-            delivery["reasons"].append("report_spool_scan_limited")
-        if retained["invalid"]:
-            delivery["reasons"].append("retained_reports_invalid")
-    if not spool_error and retained["oldest_retained_at"] is not None:
-        retained_age = max(0, datetime.now(timezone.utc).timestamp() - retained["oldest_retained_at"])
-        if retained_age > delivery["stale_after_seconds"]:
-            delivery["reasons"].append("retained_reports_overdue")
+    delivery["reasons"].extend(spool_reasons)
     if delivery["reasons"]:
         delivery["status"] = "degraded"
     if delivery["status"] == "degraded":

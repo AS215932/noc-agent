@@ -8,6 +8,7 @@ from typing import Any
 
 from app.case_cards import CardDeliveryOutcome
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
+from app.monitor_text import safe_monitor_text
 from app.cases.models import AtomicCaseProjection, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.reporting import reactive_reporting_owns_cards
@@ -99,7 +100,7 @@ def build_report_handler(
             level = Verbosity(int(update["level"]))
             if level < get_verbosity():
                 return OutboxHandlerResult(payload_updates={"notification_suppressed": "verbosity", "notification_level": int(level)})
-            owns_case = reactive_reporting_owns_cards() and case.identity.get("source") in {"alertmanager", "icinga2"}
+            owns_case = (intent.payload.get("reactive_owned_card") is True or reactive_reporting_owns_cards()) and case.identity.get("source") in {"alertmanager", "icinga2"}
             # Every owned update is self-contained. Discord can delete the
             # original at any time, including after a successful initial report;
             # the transport's replacement create must retain monitor facts.
@@ -387,7 +388,10 @@ def _render_case_report(case: AtomicCaseProjection, intent: OutboxIntent) -> tup
         for item in intent.payload.get("fields") or []:
             if isinstance(item, dict) and item.get("name") and item.get("value"):
                 fields.append({"name": _clip(str(item["name"]), limit=256), "value": _clip(str(item["value"])), "inline": bool(item.get("inline", False))})
-    return _clip(title, limit=256), _clip(description, limit=4096), fields[:10]
+    return safe_monitor_text(title, limit=256), safe_monitor_text(description, limit=4096), [
+        {**item, "name": safe_monitor_text(item["name"], limit=256), "value": safe_monitor_text(item["value"], limit=1024)}
+        for item in fields[:10]
+    ]
 
 
 def _handoff_issue_title(case: AtomicCaseProjection, intent: OutboxIntent) -> str:
