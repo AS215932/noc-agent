@@ -127,3 +127,35 @@ async def test_delayed_initial_attention_preserves_triage_and_original_delivery_
     create.assert_awaited_once()
     edit.assert_not_awaited()
     assert (await processor.process_pending()).processed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('severity,verbosity', [('HIGH', 'ERROR'), ('MEDIUM', 'WARNING')])
+async def test_icinga_recovery_survives_firing_verbosity_threshold(monkeypatch, severity, verbosity):
+    monkeypatch.setenv('LOG_LEVEL_DISCORD', verbosity)
+    case = AtomicCaseProjection(status='resolved', severity='LOW',
+                                resolution_reason='positive_clean_observation', identity={'source': 'icinga2'})
+    previous = AttentionDelivery(case_id=case.case_id, generation=case.report_generation,
+                                 phase='firing', severity=severity, delivered_at=datetime.now(timezone.utc), sequence=1)
+    request = attention_due(case, previous, now=datetime.now(timezone.utc))
+    assert request.kind == 'recovery' and request.severity == severity
+    intent = OutboxIntent(case_id=case.case_id, intent_type='report', idempotency_key=request.idempotency_key)
+    notify = AsyncMock(return_value=True)
+    assert await build_attention_sender(notifier=notify)(case, request, intent) is True
+    notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_legacy_none_notifier_completes_attention_without_retry(monkeypatch):
+    monkeypatch.setenv('LOG_LEVEL_DISCORD', 'INFO')
+    store = InMemoryCaseStore()
+    case = AtomicCaseProjection(severity='HIGH', identity={'source': 'icinga2'})
+    await store.upsert_case(case)
+    await enqueue_attention(store, case)
+    notify = AsyncMock(return_value=None)
+    processor = OutboxProcessor(store, {'report': build_attention_handler(store,
+        sender=build_attention_sender(notifier=notify))})
+    assert (await processor.process_pending()).succeeded == 1
+    assert (await store.get_attention(case.case_id)).sequence == 1
+    assert (await processor.process_pending()).processed == 0
+    notify.assert_awaited_once()

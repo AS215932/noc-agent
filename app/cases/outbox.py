@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from app.cases.models import OutboxIntent, utc_now
+from app.cases.models import CaseEvent, OutboxIntent, utc_now
 from app.cases.attention import AttentionDelivery
 from app.cases.store import CaseStore
 from app.model_metrics import record_case_service_outbox_processed, record_sanitized_discord_failure
@@ -28,6 +28,7 @@ class OutboxHandlerResult:
     payload_updates: dict[str, Any] = field(default_factory=dict)
     attention_delivery: AttentionDelivery | None = None
     attention_lease_token: str = ""
+    report_event: CaseEvent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +116,7 @@ class OutboxProcessor:
                     expected_sequence=result.attention_delivery.sequence - 1,
                     expected_claim_token=claimed.claim_token,
                     lease_token=result.attention_lease_token,
+                    report_event=result.report_event,
                 )
             else:
                 stored_completion = await self.store.update_outbox_if_status(

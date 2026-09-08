@@ -40,6 +40,8 @@ def build_attention_sender(*, notifier=send_case_notification) -> AttentionSende
                                 level=level, revision=revision, superseded_receipt=request.kind == "new")
         if request.kind == "new" and isinstance(result, SupersededCardDelivery):
             return result
-        return result is True
+        # Legacy custom callbacks signal success by returning normally with None.
+        # Verbosity suppression has already returned before invoking them.
+        return result is None or result is True
 
     return send

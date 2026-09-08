@@ -47,6 +47,20 @@ CaseProjection = AtomicCaseProjection | MetaCaseProjection
 TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
 
 
+def apply_report_completion(case: AtomicCaseProjection, event: CaseEvent) -> AtomicCaseProjection:
+    """Apply report fields to a fresh locked case, preserving concurrent state."""
+    if event.case_id != case.case_id or event.event_type not in {"case_reported", "case_reasserted"}:
+        raise ValueError("invalid report completion event")
+    updated = case.model_copy(deep=True)
+    updated.last_reported_at = event.occurred_at
+    updated.last_reported_signature = str(event.payload["state_signature"])
+    if event.event_type == "case_reasserted":
+        updated.last_reasserted_at = event.occurred_at
+    updated.updated_at = event.occurred_at
+    updated.policy_version = event.policy_version
+    return updated
+
+
 @dataclass(frozen=True)
 class OutboxHealth:
     pending: int = 0
@@ -187,7 +201,8 @@ class CaseStore(Protocol):
     async def release_attention(self, case_id: str, lease_token: str) -> None: ...
 
     async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
-                                 expected_sequence: int, expected_claim_token: str, lease_token: str) -> OutboxIntent | None: ...
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str,
+                                 report_event: CaseEvent | None = None) -> OutboxIntent | None: ...
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
@@ -736,7 +751,8 @@ class InMemoryCaseStore:
                 del self._attention_leases[case_id]
 
     async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
-                                 expected_sequence: int, expected_claim_token: str, lease_token: str) -> OutboxIntent | None:
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str,
+                                 report_event: CaseEvent | None = None) -> OutboxIntent | None:
         if intent.status != "succeeded" or intent.case_id != delivery.case_id or delivery.sequence != expected_sequence + 1:
             raise ValueError("invalid attention completion")
         async with self._lock:
@@ -748,7 +764,11 @@ class InMemoryCaseStore:
                     or lease is None or lease[:3] != (lease_token, intent.outbox_id, expected_claim_token)
                     or lease[3] <= datetime.now(timezone.utc)):
                 return None
-            self._require_atomic_case_locked(delivery.case_id)
+            case = self._require_atomic_case_locked(delivery.case_id)
+            if report_event is not None:
+                case = apply_report_completion(case, report_event)
+                self._cases[case.case_id] = case
+                self._store_event_locked(report_event)
             self._attention[delivery.case_id] = delivery.model_copy(deep=True)
             self._outbox[intent.outbox_id] = intent.model_copy(deep=True)
             del self._attention_leases[delivery.case_id]

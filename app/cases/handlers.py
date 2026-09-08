@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from app.case_cards import CardDeliveryOutcome
-from app.cases.attention import AttentionDelivery
+from app.cases.attention import AttentionDelivery, attention_enabled
 from app.cases.attention_handler import build_attention_handler
 from app.cases.attention_sender import build_attention_sender
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
 from app.monitor_text import safe_monitor_text
-from app.cases.models import AtomicCaseProjection, OutboxIntent
+from app.cases.models import AtomicCaseProjection, CaseEvent, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.reporting import reactive_reporting_owns_cards
 from app.cases.service import CaseService
@@ -204,8 +204,15 @@ def build_report_handler(
             # Other investigation updates do not advance the facts projection.
             return OutboxHandlerResult(payload_updates={"card_update_delivered": True})
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
-        await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
+        report_event = None
+        if attention_sequence is None:
+            await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
+        else:
+            report_event = CaseEvent(case_id=case.case_id,
+                event_type="case_reasserted" if reasserted else "case_reported",
+                policy_version=case_service.policy.policy_version, payload={"state_signature": state_signature})
         return OutboxHandlerResult(
+            report_event=report_event,
             attention_delivery=(AttentionDelivery(
                 case_id=case.case_id, generation=case.report_generation, phase="firing",
                 severity=case.severity, delivered_at=datetime.now(timezone.utc),
@@ -218,7 +225,9 @@ def build_report_handler(
         )
 
     async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
-        if "attention_request" in intent.payload or not intent.payload.get("reminder_since") or not intent.case_id:
+        if ("attention_request" in intent.payload or not intent.case_id
+                or (not intent.payload.get("reminder_since")
+                    and (not attention_enabled() or isinstance(intent.payload.get("card_update"), dict)))):
             return await deliver(intent)
         store = case_service.store
         case = await store.get_case(intent.case_id)
@@ -227,6 +236,8 @@ def build_report_handler(
         # Both send paths share ownership even during a mixed-configuration
         # rollout. Fresh eligibility is checked inside deliver after the lease.
         previous = await store.get_attention(case.case_id)
+        if previous is not None and not intent.payload.get("reminder_since"):
+            return await deliver(intent)
         sequence = previous.sequence if previous else 0
         lease = await store.claim_attention(intent, expected_sequence=sequence, lease_seconds=120)
         if lease is None:

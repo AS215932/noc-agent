@@ -82,8 +82,11 @@ def attention_due(case: AtomicCaseProjection, previous: AttentionDelivery | None
     if kind is None:
         return None
     sequence = previous.sequence if previous else 0
+    # Clean Icinga observations normalize severity to LOW. Recovery must reach
+    # the same verbosity threshold as the firing notification it closes.
+    severity = previous.severity if kind == "recovery" and previous is not None else case.severity
     return AttentionRequest(
-        kind=kind, generation=case.report_generation, phase=phase, severity=case.severity,
+        kind=kind, generation=case.report_generation, phase=phase, severity=severity,
         expected_sequence=sequence,
-        idempotency_key=f"attention:{case.case_id}:{case.report_generation}:{phase}:{case.severity}:{sequence}:{kind}",
+        idempotency_key=f"attention:{case.case_id}:{case.report_generation}:{phase}:{severity}:{sequence}:{kind}",
     )

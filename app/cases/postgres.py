@@ -42,6 +42,7 @@ from app.cases.models import (
     TraceRecord,
 )
 from app.cases.store import (
+    apply_report_completion,
     OutboxHealth,
     CallbackClaimResult,
     CaseLinkResult,
@@ -776,6 +777,9 @@ class PostgresCaseStore:
         if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:
             raise ValueError("invalid attention lease")
         async with self.pool.acquire() as conn, conn.transaction():
+            parent = await conn.fetchrow("SELECT payload FROM cases WHERE case_id=$1 FOR UPDATE", intent.case_id)
+            if parent is None:
+                return None
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", "case-attention:" + intent.case_id)
             row = await conn.fetchrow(
                 """SELECT outbox_id FROM side_effect_outbox
@@ -802,10 +806,14 @@ class PostgresCaseStore:
             await conn.execute("DELETE FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2", case_id, lease_token)
 
     async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
-                                 expected_sequence: int, expected_claim_token: str, lease_token: str) -> OutboxIntent | None:
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str,
+                                 report_event: CaseEvent | None = None) -> OutboxIntent | None:
         if intent.status != "succeeded" or intent.case_id != delivery.case_id or delivery.sequence != expected_sequence + 1:
             raise ValueError("invalid attention completion")
         async with self.pool.acquire() as conn, conn.transaction():
+            parent = await conn.fetchrow("SELECT payload FROM cases WHERE case_id=$1 FOR UPDATE", delivery.case_id)
+            if parent is None:
+                return None
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", "case-attention:" + delivery.case_id)
             row = await conn.fetchrow(
                 """SELECT outbox_id FROM side_effect_outbox
@@ -821,6 +829,15 @@ class PostgresCaseStore:
             )
             if row is None or (previous or 0) != expected_sequence or lease is None:
                 return None
+            if report_event is not None:
+                case = _case_from_payload(_row_payload(parent))
+                if not isinstance(case, AtomicCaseProjection):
+                    raise ValueError("report completion requires atomic case")
+                case = apply_report_completion(case, report_event)
+                await conn.execute("""UPDATE cases SET payload=$2::jsonb, updated_at=$3,
+                                   row_version=row_version+1 WHERE case_id=$1""",
+                                   case.case_id, case.model_dump_json(), case.updated_at)
+                await _insert_case_event(conn, report_event)
             await conn.execute(
                 """INSERT INTO case_attention_delivery(case_id, sequence, delivered_at, payload)
                    VALUES($1,$2,$3,$4::jsonb) ON CONFLICT(case_id) DO UPDATE

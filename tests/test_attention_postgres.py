@@ -13,7 +13,7 @@ from app.cases.attention import AttentionDelivery, attention_due
 from app.cases.attention_scheduler import enqueue_attention, enqueue_attention_batch
 from app.cases.handlers import build_report_handler
 from app.cases.outbox import OutboxProcessor
-from app.cases.models import AtomicCaseProjection, MetaCaseProjection, OutboxIntent
+from app.cases.models import AtomicCaseProjection, CaseEvent, MetaCaseProjection, OutboxIntent
 from app.cases.correlation import CorrelationService
 from app.cases.postgres import PostgresCaseStore
 from app.cases.service import CaseService
@@ -55,7 +55,9 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
                                      delivered_at=datetime.now(timezone.utc), sequence=1)
         assert await store.complete_attention(completed, delivery, expected_sequence=0,
                                               expected_claim_token="owner", lease_token=old_lease) is None
-        # Fail the second write after the attention projection was inserted.
+        report_event = CaseEvent(case_id=case.case_id, event_type="case_reported",
+                                 payload={"state_signature": "delivered-facts"})
+        # Fail the final outbox write after the report, event and attention writes.
         # PostgreSQL must roll back both changes, not leave a false delivery.
         async with pool.acquire() as conn:
             await conn.execute("""CREATE FUNCTION reject_completion() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -63,20 +65,27 @@ async def test_atomic_attention_rollback_concurrency_and_restart(monkeypatch):
                 CREATE TRIGGER reject_completion BEFORE UPDATE ON side_effect_outbox
                 FOR EACH ROW WHEN (NEW.status='succeeded') EXECUTE FUNCTION reject_completion();""")
         with pytest.raises(asyncpg.RaiseError):
-            await store.complete_attention(completed, delivery, expected_sequence=0, expected_claim_token="owner", lease_token=lease)
+            await store.complete_attention(completed, delivery, expected_sequence=0, expected_claim_token="owner", lease_token=lease, report_event=report_event)
+        assert (await store.get_case(case.case_id)).model_dump() == case.model_dump()
+        assert await store.case_events(case.case_id) == []
         assert await store.get_attention(case.case_id) is None
         assert len(await store.list_outbox(status="in_progress")) == 1
         async with pool.acquire() as conn:
             await conn.execute("DROP TRIGGER reject_completion ON side_effect_outbox")
         assert await store.complete_attention(completed, delivery, expected_sequence=0, expected_claim_token="stale", lease_token=lease) is None
         results = await asyncio.gather(*[
-            store.complete_attention(completed, delivery, expected_sequence=0, expected_claim_token="owner", lease_token=lease)
+            store.complete_attention(completed, delivery, expected_sequence=0, expected_claim_token="owner", lease_token=lease, report_event=report_event)
             for _ in range(2)
         ])
         assert sum(result is not None for result in results) == 1
         async with pool.acquire() as conn:
             assert await conn.fetchval("SELECT count(*) FROM case_attention_lease") == 0
+        case.last_reported_at = report_event.occurred_at
+        case.last_reported_signature = "delivered-facts"
+        case.updated_at = report_event.occurred_at
+        case.policy_version = report_event.policy_version
         assert (await store.get_case(case.case_id)).model_dump() == case.model_dump()
+        assert await store.case_events(case.case_id) == [report_event]
         await pool.close()
         pool = await asyncpg.create_pool(host=SOCKET, user="postgres", database="postgres", min_size=1, max_size=1,
                                         server_settings={"search_path": schema})
