@@ -243,3 +243,12 @@ def _jsonish_dict(value: dict[str, Any]) -> dict[str, Any]:
     import json
 
     return json.loads(json.dumps(value, default=str))
+
+
+async def close_graph_runtime() -> None:
+    """Release compiled graph references before closing their shared database pool."""
+    global _GRAPH
+    from app.graph.checkpointing import close_checkpointers
+    _GRAPH = None
+    _THREAD_GRAPHS.clear()
+    await close_checkpointers()
