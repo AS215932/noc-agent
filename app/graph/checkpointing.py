@@ -7,8 +7,6 @@ from weakref import WeakKeyDictionary
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
-from psycopg.rows import dict_row
-from psycopg_pool import AsyncConnectionPool
 
 from app.db.config import load_database_settings
 
@@ -19,8 +17,12 @@ except Exception:  # pragma: no cover
 
 try:  # pragma: no cover - optional production dependency
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg.rows import dict_row
+    from psycopg_pool import AsyncConnectionPool
 except Exception:  # pragma: no cover
     AsyncPostgresSaver = None
+    AsyncConnectionPool = None
+    dict_row = None
 
 
 async def build_checkpointer():
@@ -39,6 +41,14 @@ async def build_checkpointer():
     if db.require_postgres:
         raise RuntimeError("Postgres is required; refusing to fall back to in-memory LangGraph checkpoints")
     return InMemorySaver()
+
+
+async def initialize_checkpointer() -> None:
+    # Optional database deployments retain lazy graph initialization: a
+    # checkpoint outage must not prevent their API or bot from starting.
+    # Required PostgreSQL deployments must prove readiness before serving.
+    if load_database_settings().require_postgres:
+        await build_checkpointer()
 
 
 @dataclass

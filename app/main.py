@@ -195,10 +195,10 @@ async def _case_outbox_loop(runtime):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.graph.checkpointing import build_checkpointer
+    from app.graph.checkpointing import initialize_checkpointer
     from app.graph_runtime import close_graph_runtime
     try:
-        await build_checkpointer()
+        await initialize_checkpointer()
         async with _runtime_lifespan(app):
             yield
     finally:

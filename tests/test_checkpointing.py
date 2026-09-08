@@ -144,3 +144,50 @@ async def test_setup_failure_or_cancellation_closes_pool_and_allows_retry(monkey
     saver = await checkpointing._build_postgres_saver(Saver, "fixture")
     assert saver.conn is pools[1]
     assert not pools[1].closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('required', [False, True])
+async def test_startup_only_requires_checkpoint_connection_when_postgres_required(monkeypatch, required):
+    from unittest.mock import AsyncMock
+    monkeypatch.setenv('NOC_DATABASE_URL', 'postgresql://noc/example')
+    monkeypatch.setenv('NOC_REQUIRE_POSTGRES', str(required).lower())
+    build = AsyncMock(side_effect=RuntimeError('database unavailable'))
+    monkeypatch.setattr(checkpointing, 'build_checkpointer', build)
+    if required:
+        with pytest.raises(RuntimeError, match='database unavailable'):
+            await checkpointing.initialize_checkpointer()
+        build.assert_awaited_once()
+    else:
+        await checkpointing.initialize_checkpointer()
+        build.assert_not_awaited()
+
+
+def test_module_import_and_optional_memory_work_without_postgres_driver():
+    import subprocess
+    import sys
+    script = '''
+import asyncio
+import importlib.abc
+import os
+import sys
+class NoPostgres(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'psycopg' or fullname.startswith('psycopg.'):
+            raise ImportError('simulated missing libpq')
+sys.meta_path.insert(0, NoPostgres())
+for key in ('NOC_DATABASE_URL', 'DATABASE_URL', 'NOC_REDIS_URL', 'NOC_REQUIRE_POSTGRES'):
+    os.environ.pop(key, None)
+from app.graph.checkpointing import build_checkpointer, AsyncPostgresSaver
+assert AsyncPostgresSaver is None
+assert asyncio.run(build_checkpointer()).__class__.__name__ == 'InMemorySaver'
+os.environ['NOC_REQUIRE_POSTGRES'] = 'true'
+os.environ['NOC_DATABASE_URL'] = 'postgresql://noc/example'
+try:
+    asyncio.run(build_checkpointer())
+except RuntimeError as exc:
+    assert 'unavailable' in str(exc)
+else:
+    raise AssertionError('required PostgreSQL must not fall back')
+'''
+    subprocess.run([sys.executable, '-c', script], check=True, timeout=30)
