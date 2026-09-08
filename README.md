@@ -168,7 +168,7 @@ Proactive config (in-code defaults are conservative; the deployment env enables 
 - `NOC_PROACTIVE_SHADOW` (in-code default `1`, **deployed `0`**; `1` = report hotspots only)
 - `NOC_PROACTIVE_INTERVAL_S` (default `120`) / `NOC_PROACTIVE_DEEP_SCAN_S` (default `900`)
 - `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_CYCLE` (default `1`)
-- `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_DAY` (default `12`)
+- `NOC_PROACTIVE_MAX_INVESTIGATIONS_PER_DAY` (default `12`; this is a hard attempt cap: successful and failed graph runs consume it, while a case-gate skip does not)
 - `NOC_PROACTIVE_MAX_COST_USD_PER_DAY` (default `10`)
 - `NOC_PROACTIVE_COST_USD_PER_INVESTIGATION` (default `0.05`; flat estimate charged to the daily $ cap until per-run token→USD metering lands — the count cap is the primary budget)
 - `NOC_PROACTIVE_INVESTIGATION_COOLDOWN_S` (default `21600`, six hours): minimum interval before the same successfully investigated hotspot fingerprint is re-investigated
@@ -177,6 +177,12 @@ Proactive config (in-code defaults are conservative; the deployment env enables 
 - `NOC_PROACTIVE_HANDOFF_ENABLED` (default `0`) + `NOC_PROACTIVE_HANDOFF_REPO` (default `AS215932/network-operations`)
 - `NOC_PROACTIVE_SEVERITY_FLOOR` (default `MEDIUM`)
 - `NOC_PROACTIVE_MEMORY_DIR` (default `/var/lib/noc-agent/memory`) / `NOC_PROACTIVE_STATE_DIR` (default `/var/lib/noc-agent/proactive`)
+
+The daily ledger reserves an attempt before graph execution, so cancellation or
+process loss cannot restore spent capacity. The digest reports attempted,
+succeeded, failed, and skipped counts separately. Old success-only ledgers are
+migrated conservatively, and a malformed ledger fails closed instead of resetting
+the budget to zero.
 - Handoff auth (only needed when `NOC_PROACTIVE_HANDOFF_ENABLED=1`), in preference order:
   - **GitHub App (recommended):** `NOC_GITHUB_APP_ID` + the private key via `NOC_GITHUB_APP_PRIVATE_KEY_PATH` (a PEM file; Vault Agent renders it on `noc`) or inline `NOC_GITHUB_APP_PRIVATE_KEY`. The installation is auto-resolved from the repo; override with `NOC_GITHUB_APP_INSTALLATION_ID`. The app mints short-lived installation tokens at call time (cached). App needs Issues: read/write + Metadata: read on the handoff repo.
   - **PAT fallback:** `NOC_GITHUB_TOKEN` (fine-grained, issues-scoped).

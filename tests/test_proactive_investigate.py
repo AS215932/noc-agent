@@ -137,7 +137,9 @@ async def test_investigator_runs_graph_and_returns_outcome(monkeypatch):
     case_runtime = CaseServiceRuntime(service=case_service, store=store)
     captured = {}
 
-    async def fake_investigate(payload, model=None, case=None, *, mcp_runtime=None, graph_memory=None, case_runtime=None):
+    async def fake_investigate(
+        payload, model=None, case=None, *, mcp_runtime=None, graph_memory=None, case_runtime=None
+    ):
         captured["payload"] = payload
         captured["case"] = case
         captured["runtime"] = mcp_runtime
@@ -169,7 +171,7 @@ async def test_investigator_runs_graph_and_returns_outcome(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_investigator_does_not_count_or_handoff_on_triage_failure(monkeypatch):
+async def test_investigator_returns_failed_outcome_without_handoff_on_triage_failure(monkeypatch):
     import app.main as main
     import app.proactive.handoff as handoff_mod
 
@@ -177,7 +179,9 @@ async def test_investigator_does_not_count_or_handoff_on_triage_failure(monkeypa
     case_service = CaseService(store)
     case_runtime = CaseServiceRuntime(service=case_service, store=store)
 
-    async def failed_investigate(payload, model=None, case=None, *, mcp_runtime=None, graph_memory=None, case_runtime=None):
+    async def failed_investigate(
+        payload, model=None, case=None, *, mcp_runtime=None, graph_memory=None, case_runtime=None
+    ):
         return None  # investigate_alert swallows graph errors and returns None
 
     def fail_handoff(repo):  # pragma: no cover - must not be reached
@@ -194,7 +198,8 @@ async def test_investigator_does_not_count_or_handoff_on_triage_failure(monkeypa
 
     hotspot = _hotspot(warrants_change=True)
     outcome = await investigator(hotspot, DecisionContext(cycle_id="cyc-1"))
-    assert outcome is None  # not counted as an investigation, no handoff
+    assert outcome is not None and outcome.status == "failed"
+    assert outcome.reason == "no_synthesis"
     case = await case_service.case_for_alias("source_fp", hotspot.fingerprint())
     assert case is not None
     assert case.investigation_status == "failed"
@@ -222,7 +227,9 @@ async def test_investigator_skips_when_case_service_gate_blocks(monkeypatch):
     investigator = build_investigator(_InnerRuntime(), ProactiveLoopSettings(), case_service_runtime=case_runtime)
     from app.proactive.models import DecisionContext
 
-    assert await investigator(hotspot, DecisionContext(cycle_id="cyc-1")) is None
+    outcome = await investigator(hotspot, DecisionContext(cycle_id="cyc-1"))
+    assert outcome is not None and outcome.status == "skipped"
+    assert outcome.reason == "case_service_gate"
 
 
 @pytest.mark.asyncio
@@ -239,7 +246,9 @@ async def test_investigator_skips_without_case_service_runtime(monkeypatch):
     investigator = build_investigator(_InnerRuntime(), ProactiveLoopSettings())
     from app.proactive.models import DecisionContext
 
-    assert await investigator(_hotspot(), DecisionContext(cycle_id="cyc-1")) is None
+    outcome = await investigator(_hotspot(), DecisionContext(cycle_id="cyc-1"))
+    assert outcome is not None and outcome.status == "skipped"
+    assert outcome.reason == "case_service_runtime_unavailable"
 
 
 @pytest.mark.asyncio
@@ -259,14 +268,26 @@ async def test_terminal_card_retry_uses_injected_case_store(monkeypatch, graph_f
     other_store = InMemoryCaseStore()
     other = CaseServiceRuntime(service=CaseService(other_store), store=other_store)
     monkeypatch.setattr(main, "case_service_runtime", other if global_present else None)
-    observed = await service.observe(ObservationRecord(
-        source="proactive", rule_id="disk", resource="rtr:/", status="firing", severity="HIGH",
-    ))
-    plan = SimpleNamespace(
-        incident_summary="Test result", confidence_score=0.8, severity="HIGH",
-        requires_human=False, human_escalation_reason=None, remediation_proposal=None,
+    observed = await service.observe(
+        ObservationRecord(
+            source="proactive",
+            rule_id="disk",
+            resource="rtr:/",
+            status="firing",
+            severity="HIGH",
+        )
     )
-    graph = AsyncMock(side_effect=RuntimeError("test graph failure")) if graph_fails else AsyncMock(return_value=(plan, {}))
+    plan = SimpleNamespace(
+        incident_summary="Test result",
+        confidence_score=0.8,
+        severity="HIGH",
+        requires_human=False,
+        human_escalation_reason=None,
+        remediation_proposal=None,
+    )
+    graph = (
+        AsyncMock(side_effect=RuntimeError("test graph failure")) if graph_fails else AsyncMock(return_value=(plan, {}))
+    )
     monkeypatch.setattr(main, "run_investigation_graph", graph)
     monkeypatch.setattr(main, "_take_ownership_ack", AsyncMock())
     monkeypatch.setattr(main, "_record_reactive_case_investigation", AsyncMock())
@@ -275,8 +296,10 @@ async def test_terminal_card_retry_uses_injected_case_store(monkeypatch, graph_f
     monkeypatch.setattr(main, "send_case_notification", notifier)
     result = await main.investigate_alert(
         {"source": "proactive", "status": "firing", "labels": {}},
-        case={"incident_id": observed.case.case_id}, mcp_runtime=object(),
-        graph_memory=object(), case_runtime=owner,
+        case={"incident_id": observed.case.case_id},
+        mcp_runtime=object(),
+        graph_memory=object(),
+        case_runtime=owner,
     )
     assert result is (None if graph_fails else plan)
     queued = await store.list_outbox()

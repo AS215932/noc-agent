@@ -159,6 +159,10 @@ def build_cycle_insights(
         "shadow": settings.shadow,
         "digest_due": digest_due,
         "digest_posted": posted,
+        "attempted": len(report.investigation_attempted),
+        "succeeded": len(report.investigated),
+        "failed": len(report.investigation_failed),
+        "skipped": len(report.investigation_skipped),
     }
     norm = max(1.0, settings.insight_score_norm)
     records: list[dict[str, Any]] = []
@@ -257,9 +261,7 @@ def build_cycle_insights(
                 why_now=f"suppressed ({operator}): {reason}"[:300],
                 support_facts=_support_facts(hotspot),
                 evidence_refs=_telemetry_refs(hotspot),
-                expected_utility=_score(
-                    hotspot.score / norm, {"hotspot_score": hotspot.score}, []
-                ),
+                expected_utility=_score(hotspot.score / norm, {"hotspot_score": hotspot.score}, []),
                 interruption_cost=_score(
                     _COST_NOTIFY + _COST_UNCHANGED_PENALTY,
                     {"base": _COST_NOTIFY, "suppressed": _COST_UNCHANGED_PENALTY},
@@ -318,7 +320,7 @@ class InsightEmissionState:
     def _load(self) -> dict[str, dict[str, Any]]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -330,7 +332,7 @@ class InsightEmissionState:
         utility = record.get("expected_utility") or {}
         try:
             utility_bucket = f"{float(utility.get('total') or 0.0):.1f}"
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             utility_bucket = "0.0"
         return _sha16(
             "|".join(
@@ -343,9 +345,7 @@ class InsightEmissionState:
             )
         )[:8]
 
-    def pending(
-        self, records: list[dict[str, Any]], *, now: float | None = None
-    ) -> list[dict[str, Any]]:
+    def pending(self, records: list[dict[str, Any]], *, now: float | None = None) -> list[dict[str, Any]]:
         """Records due for emission; does NOT stamp state."""
         now = time.time() if now is None else now
         state = self._load()
@@ -385,9 +385,7 @@ class InsightEmissionState:
         except OSError:
             log.info("proactive_insight_state_write_failed", path=str(self.path))
 
-    def filter_and_mark(
-        self, records: list[dict[str, Any]], *, now: float | None = None
-    ) -> list[dict[str, Any]]:
+    def filter_and_mark(self, records: list[dict[str, Any]], *, now: float | None = None) -> list[dict[str, Any]]:
         """pending() + mark() in one step (tests / callers without delivery
         feedback)."""
         due = self.pending(records, now=now)
@@ -396,9 +394,7 @@ class InsightEmissionState:
         return due
 
 
-def knowledge_refs_fn(
-    retriever: Any, *, limit: int = 3
-) -> KnowledgeRefsFn:
+def knowledge_refs_fn(retriever: Any, *, limit: int = 3) -> KnowledgeRefsFn:
     """Build the per-hotspot OKF citation lookup around a KnowledgeExportRetriever.
 
     Uses the agent-core adapter so refs stay joinable on the bare concept id;
@@ -429,9 +425,7 @@ def knowledge_refs_fn(
         for result in results:
             citation = result.citation
             refs.append(
-                source_ref_from_knowledge_citation(citation.as_trace_dict()).model_dump(
-                    mode="json", exclude_none=True
-                )
+                source_ref_from_knowledge_citation(citation.as_trace_dict()).model_dump(mode="json", exclude_none=True)
             )
             export_version = export_version or citation.export_version
         return refs, export_version
