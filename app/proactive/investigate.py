@@ -59,9 +59,9 @@ def build_investigator(
 ) -> Investigator:
     """Build the coroutine the proactive loop calls per eligible hotspot.
 
-    Returns ``None`` for hotspots that CaseService de-dupes/suppresses (e.g. the
-    same hotspot was just investigated), so the loop neither double-spends nor
-    spams. Proactive graph runs are case-grounded: they require a CaseService
+    Returns an explicit skipped result for hotspots that CaseService de-dupes or
+    cannot claim, so the loop can distinguish no-op skips from paid failures.
+    Proactive graph runs are case-grounded: they require a CaseService
     runtime and use :class:`CaseServiceGraphMemory` rather than legacy graph memory.
     """
 
@@ -71,14 +71,16 @@ def build_investigator(
         import app.main as main
 
         payload = hotspot_to_alert_payload(hotspot)
-        runtime_owner = case_service_runtime if case_service_runtime is not None else getattr(main, "case_service_runtime", None)
+        runtime_owner = (
+            case_service_runtime if case_service_runtime is not None else getattr(main, "case_service_runtime", None)
+        )
         if runtime_owner is None or not hasattr(runtime_owner, "service") or not hasattr(runtime_owner, "store"):
             log.info(
                 "proactive_investigation_skipped",
                 hotspot=hotspot.key,
                 reason="case_service_runtime_unavailable",
             )
-            return None
+            return InvestigationOutcome(status="skipped", reason="case_service_runtime_unavailable")
 
         claimed = await _claim_case_service_hotspot(runtime_owner, hotspot, decision)
         if claimed is None:
@@ -87,7 +89,7 @@ def build_investigator(
                 hotspot=hotspot.key,
                 reason="case_service_gate",
             )
-            return None
+            return InvestigationOutcome(status="skipped", reason="case_service_gate")
         case, graph_memory, graph_case = claimed
 
         runtime = HeavyProbeFilteredRuntime(mcp_runtime, allow_heavy=settings.auto_heavy_probes)
@@ -115,12 +117,15 @@ def build_investigator(
 
         if synthesis is None:
             # investigate_alert swallows graph/model errors and returns None on
-            # failure. Do NOT count a failed run as an investigation, and do not
-            # hand off on scanner evidence alone — only successful synthesis
-            # counts and is eligible for a loop:candidate issue.
+            # failure. It consumes an attempt but is not a successful
+            # investigation, and scanner evidence alone never creates a handoff.
             await _record_failed_case_service_investigation(runtime_owner, case, error="no_synthesis")
             log.info("proactive_investigation_unsuccessful", hotspot=hotspot.key, reason="no_synthesis")
-            return None
+            return InvestigationOutcome(
+                status="failed",
+                reason="no_synthesis",
+                cost_usd=settings.cost_usd_per_investigation,
+            )
 
         incident_id = str(graph_case.get("incident_id") or getattr(case, "case_id", ""))
         handoff_url = await _maybe_handoff(hotspot, settings, incident_id=incident_id, decision=decision)
@@ -194,6 +199,4 @@ async def _maybe_handoff(
     if client is None:
         log.info("proactive_handoff_skipped", reason="NOC_GITHUB_TOKEN-not-set", hotspot=hotspot.key)
         return None
-    return await client.ensure_candidate_issue(
-        hotspot, incident_id=incident_id, manifest_hash=decision.manifest_hash
-    )
+    return await client.ensure_candidate_issue(hotspot, incident_id=incident_id, manifest_hash=decision.manifest_hash)

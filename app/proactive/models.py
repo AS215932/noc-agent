@@ -205,7 +205,11 @@ class ProactiveCycleReport(BaseModel):
     outcome: CycleOutcome = "idle"
     detail: str = ""
     hotspots: list[Hotspot] = Field(default_factory=list)
+    investigation_attempted: list[str] = Field(default_factory=list)
     investigated: list[str] = Field(default_factory=list)
+    investigation_failed: list[str] = Field(default_factory=list)
+    investigation_skipped: list[str] = Field(default_factory=list)
+    budget_summary: str = ""
     auto_snoozed: list[str] = Field(default_factory=list)
     handoffs: list[str] = Field(default_factory=list)
     # hotspot key -> handoff URL, so insight records can tell draft from notify.

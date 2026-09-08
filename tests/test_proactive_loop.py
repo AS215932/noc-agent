@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 
 import pytest
@@ -102,6 +103,7 @@ async def test_shadow_cycle_scans_reports_but_does_not_investigate(tmp_path):
     assert cap.calls and cap.calls[0][1].max_investigations == 0
     assert load_ledger(tmp_path)["cycles"] == 1
     assert load_ledger(tmp_path)["investigations"] == 0
+    assert load_ledger(tmp_path)["attempts"] == 0
 
 
 @pytest.mark.asyncio
@@ -127,6 +129,91 @@ async def test_autonomous_cycle_investigates_top_hotspot(tmp_path):
     assert report.handoffs == ["https://gh/issue/1"]
     led = load_ledger(tmp_path)
     assert led["investigations"] == 1 and led["handoffs"] == 1
+    assert led["attempts"] == 1 and led["succeeded"] == 1 and led["failed"] == 0
+    assert (
+        report.budget_summary
+        == "Investigation attempts: 1/12 used today; this cycle: 1 attempted, 1 succeeded, 0 failed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_investigation_consumes_attempt_and_reports_truthfully(tmp_path):
+    calls = []
+    capture = _Capture()
+
+    async def investigator(hotspot, decision):
+        calls.append(hotspot.key)
+        return InvestigationOutcome(status="failed", reason="no_synthesis", cost_usd=0.05)
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(
+            tmp_path,
+            shadow=False,
+            max_investigations_per_cycle=1,
+            max_investigations_per_day=1,
+        ),
+        reporter=capture,
+        investigator=investigator,
+        model_chain=lambda: ["m"],
+    )
+
+    first = await lp.run_once(deep=True)
+    second = await lp.run_once(deep=True)
+
+    assert calls == [first.hotspots[0].key]
+    assert first.investigation_attempted == calls
+    assert first.investigation_failed == calls
+    assert not first.investigated
+    assert (
+        first.budget_summary
+        == "Investigation attempts: 1/1 used today; this cycle: 1 attempted, 0 succeeded, 1 failed."
+    )
+    assert second.outcome == "over_budget"
+    ledger = load_ledger(tmp_path)
+    assert ledger["attempts"] == 1 and ledger["failed"] == 1 and ledger["succeeded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_skipped_investigation_releases_attempt_reservation(tmp_path):
+    async def investigator(hotspot, decision):
+        return InvestigationOutcome(status="skipped", reason="case_service_gate")
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=False, max_investigations_per_cycle=1),
+        reporter=_Capture(),
+        investigator=investigator,
+        model_chain=lambda: ["m"],
+    )
+
+    report = await lp.run_once(deep=True)
+
+    assert not report.investigation_attempted
+    assert len(report.investigation_skipped) == 1
+    ledger = load_ledger(tmp_path)
+    assert ledger["attempts"] == 0 and ledger["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_investigation_keeps_reserved_attempt_and_backoff(tmp_path):
+    async def investigator(hotspot, decision):
+        raise asyncio.CancelledError
+
+    lp = ProactiveLoop(
+        _runtime(),
+        settings=_settings(tmp_path, shadow=False, max_investigations_per_cycle=1),
+        reporter=_Capture(),
+        investigator=investigator,
+        model_chain=lambda: ["m"],
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await lp.run_once(deep=True)
+
+    ledger = load_ledger(tmp_path)
+    assert ledger["attempts"] == 1 and ledger["failed"] == 1
+    assert (tmp_path / "investigations.json").exists()
 
 
 @pytest.mark.asyncio
@@ -247,7 +334,7 @@ async def test_lhp_disk_handoff_can_request_delivery_and_knowledge_context_with_
 
 @pytest.mark.asyncio
 async def test_over_budget_blocks_investigation(tmp_path):
-    update_ledger(tmp_path, investigations=12)  # at daily cap
+    update_ledger(tmp_path, attempts=12)  # at daily attempt cap
 
     async def investigator(hotspot, decision):  # pragma: no cover - must not run
         raise AssertionError("should not investigate over budget")
@@ -289,8 +376,10 @@ async def test_unchanged_hotspots_reported_once(tmp_path):
 async def test_investigation_does_not_repost_unchanged_hotspots(tmp_path):
     cap = _Capture()
     lp = ProactiveLoop(
-        _runtime(), settings=_settings(tmp_path, report_reassert_s=99999),
-        reporter=cap, model_chain=lambda: ["m"],
+        _runtime(),
+        settings=_settings(tmp_path, report_reassert_s=99999),
+        reporter=cap,
+        model_chain=lambda: ["m"],
     )
     report = await lp.run_once(deep=True)
     report.investigated.append("new-investigation-of-existing-hotspot")
@@ -379,10 +468,32 @@ def test_hotspot_field_shows_ack_id_and_case_link():
     from app.proactive.loop import _hotspot_field
     from app.proactive.models import Hotspot
 
-    h = Hotspot(rule_id="disk_fill", key="rtr:/", severity="MEDIUM", title="Disk / low", summary="15% free", resource="rtr")
+    h = Hotspot(
+        rule_id="disk_fill", key="rtr:/", severity="MEDIUM", title="Disk / low", summary="15% free", resource="rtr"
+    )
     field = _hotspot_field(h, case={"case_number": "NOC-20260617-007"}, public_url="https://noc.servify.network")
     assert f"ack id: `{h.fingerprint()[:12]}`" in field["value"]
     assert "[NOC-20260617-007](https://noc.servify.network/control/cases/NOC-20260617-007)" in field["value"]
+
+
+def test_hotspot_field_distinguishes_candidate_from_filed_handoff():
+    from app.proactive.loop import _hotspot_field
+    from app.proactive.models import Hotspot
+
+    hotspot = Hotspot(
+        rule_id="disk_fill",
+        key="rtr:/",
+        severity="HIGH",
+        title="Disk / low",
+        summary="5% free",
+        warrants_change=True,
+    )
+    candidate = _hotspot_field(hotspot)
+    filed = _hotspot_field(hotspot, handoff_url="https://github.example/issue/1")
+
+    assert "configuration change candidate" in candidate["value"]
+    assert "handoff" not in candidate["value"]
+    assert "configuration handoff filed" in filed["value"]
 
 
 @pytest.mark.asyncio
@@ -438,9 +549,7 @@ async def test_investigation_cooldown_skips_reinvestigation(tmp_path):
 
     lp = ProactiveLoop(
         _runtime(),
-        settings=_settings(
-            tmp_path, shadow=False, max_investigations_per_cycle=1, investigation_cooldown_s=3600
-        ),
+        settings=_settings(tmp_path, shadow=False, max_investigations_per_cycle=1, investigation_cooldown_s=3600),
         reporter=_Capture(),
         investigator=investigator,
         model_chain=lambda: ["m"],
@@ -450,6 +559,8 @@ async def test_investigation_cooldown_skips_reinvestigation(tmp_path):
     r3 = await lp.run_once(deep=True)  # both on cooldown → nothing
     assert len(seen) == 2 and len(set(seen)) == 2  # each fingerprint investigated once
     assert r3.outcome == "scanned" and not r3.investigated
+    assert len(r3.investigation_skipped) == 2
+    assert "0 attempted, 0 succeeded, 0 failed, 2 skipped" in r3.budget_summary
 
 
 @pytest.mark.asyncio
@@ -681,7 +792,8 @@ async def test_case_service_primary_marks_cases_reported_after_successful_digest
 async def test_default_reporter_retries_false_delivery(tmp_path, mocker):
     send = mocker.patch("app.proactive.loop.send_discord_notification", side_effect=[False, True])
     lp = ProactiveLoop(
-        _runtime(), settings=_settings(tmp_path, report_reassert_s=99999),
+        _runtime(),
+        settings=_settings(tmp_path, report_reassert_s=99999),
         model_chain=lambda: ["m"],
     )
     await lp.run_once(deep=True)
@@ -697,7 +809,8 @@ async def test_default_reporter_retries_failed_all_clear(tmp_path, mocker):
     send = mocker.patch("app.proactive.loop.send_discord_notification", side_effect=[True, False, True])
     runtime = _runtime()
     lp = ProactiveLoop(
-        runtime, settings=_settings(tmp_path, report_reassert_s=99999),
+        runtime,
+        settings=_settings(tmp_path, report_reassert_s=99999),
         model_chain=lambda: ["m"],
     )
     await lp.run_once(deep=True)

@@ -95,12 +95,12 @@ def evaluate_gate(
             eligible=eligible,
         )
 
-    done_today = int(ledger.get("investigations", 0))
-    remaining_day = settings.max_investigations_per_day - done_today
+    attempts_today = int(ledger.get("attempts", ledger.get("investigations", 0)))
+    remaining_day = settings.max_investigations_per_day - attempts_today
     if remaining_day <= 0:
         return GateDecision(
             0,
-            f"daily investigation budget reached ({settings.max_investigations_per_day})",
+            f"daily investigation attempt budget reached ({settings.max_investigations_per_day})",
             over_budget=True,
             eligible=eligible,
         )
@@ -108,6 +108,6 @@ def evaluate_gate(
     allowed = min(settings.max_investigations_per_cycle, remaining_day, len(eligible))
     return GateDecision(
         allowed,
-        f"{allowed} investigation(s) within budget ({done_today}/{settings.max_investigations_per_day} today)",
+        f"{allowed} attempt(s) available ({attempts_today}/{settings.max_investigations_per_day} used today)",
         eligible=eligible,
     )

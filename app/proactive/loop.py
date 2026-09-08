@@ -19,7 +19,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from app import log
 from app.cases.models import AtomicCaseProjection, SourceHealth
@@ -27,7 +27,7 @@ from app.config import LoopHandoffSettings, ProactiveLoopSettings, load_loop_han
 from app.discord import Verbosity, send_discord_notification
 from app.icinga_ack import acknowledge_icinga
 from app.proactive.governance import GateDecision, build_decision_context, evaluate_gate
-from app.proactive.ledger import acquire_lock, load_ledger, release_lock, update_ledger
+from app.proactive.ledger import acquire_lock, load_ledger, release_lock, today, update_ledger
 from app.proactive.models import (
     CycleOutcome,
     DecisionContext,
@@ -48,6 +48,8 @@ class InvestigationOutcome:
     incident_id: str | None = None
     cost_usd: float = 0.0
     handoff_url: str | None = None
+    status: Literal["succeeded", "failed", "skipped"] = "succeeded"
+    reason: str = ""
 
 
 # async (hotspot, decision_context) -> InvestigationOutcome | None
@@ -97,7 +99,9 @@ class ProactiveLoop:
             "yes",
             "on",
         }
-        requested_case_service_primary = env_case_service_control if case_service_primary is None else case_service_primary
+        requested_case_service_primary = (
+            env_case_service_control if case_service_primary is None else case_service_primary
+        )
         self.case_service_control = bool(self.case_service is not None and requested_case_service_primary)
         if active_lessons is not None:
             self._active_lessons = active_lessons
@@ -193,7 +197,8 @@ class ProactiveLoop:
             return report
 
         try:
-            ledger = load_ledger(self._state_dir)
+            ledger_day = today()
+            ledger = load_ledger(self._state_dir, ledger_day)
             do_deep = self._should_deep_scan() if deep is None else deep
             ctx = ScanContext(self.mcp_runtime, self.settings, lessons=self._active_lessons())
             raw_hotspots = await scan(ctx, deep=do_deep)
@@ -216,15 +221,17 @@ class ProactiveLoop:
             report.decision_id = decision.decision_id
 
             gate = evaluate_gate(self.settings, ledger, report.hotspots)
-            investigated = await self._investigate(gate, decision, report)
+            investigated = await self._investigate(gate, decision, report, ledger_day=ledger_day)
 
             update_ledger(
                 self._state_dir,
+                ledger_day,
                 cycles=1,
-                investigations=investigated,
                 cost_usd=report.cost_usd,
                 handoffs=len(report.handoffs),
             )
+            final_ledger = load_ledger(self._state_dir, ledger_day)
+            report.budget_summary = self._budget_summary(final_ledger, report)
             if do_deep:
                 self._last_deep_scan = time.time()
             report.outcome = self._classify_outcome(report, gate, investigated)
@@ -251,7 +258,12 @@ class ProactiveLoop:
         return report
 
     async def _investigate(
-        self, gate: GateDecision, decision: DecisionContext, report: ProactiveCycleReport
+        self,
+        gate: GateDecision,
+        decision: DecisionContext,
+        report: ProactiveCycleReport,
+        *,
+        ledger_day: str,
     ) -> int:
         if self._investigator is None or gate.max_investigations <= 0:
             return 0
@@ -266,21 +278,48 @@ class ProactiveLoop:
         else:
             recent = self._recent_investigation_fps()
             fresh = [h for h in gate.eligible if h.fingerprint() not in recent]
+        fresh_fingerprints = {hotspot.fingerprint() for hotspot in fresh}
+        report.investigation_skipped.extend(
+            hotspot.key for hotspot in gate.eligible if hotspot.fingerprint() not in fresh_fingerprints
+        )
         investigated = 0
         done: list[str] = []
         for hotspot in fresh[: gate.max_investigations]:
+            # Reserve before the await. A cancellation or process crash therefore
+            # cannot make an expensive attempt disappear from the daily cap.
+            update_ledger(self._state_dir, ledger_day, attempts=1)
+            report.investigation_attempted.append(hotspot.key)
             try:
                 outcome = await self._investigator(hotspot, decision)
+            except asyncio.CancelledError:
+                update_ledger(self._state_dir, ledger_day, failed=1)
+                if not use_case_service:
+                    self._record_investigations([hotspot.fingerprint()])
+                raise
             except Exception as exc:  # one bad investigation isn't fatal
                 safe = classify_exception(exc)
                 report.errors.append(safe.category)
+                report.investigation_failed.append(hotspot.key)
+                update_ledger(self._state_dir, ledger_day, failed=1)
+                done.append(hotspot.fingerprint())
                 log_exception("proactive_investigation_failed", exc, category=safe.category, hotspot=hotspot.key)
                 continue
-            if outcome is None:
+            if outcome is not None and outcome.status == "skipped":
+                report.investigation_attempted.pop()
+                report.investigation_skipped.append(hotspot.key)
+                update_ledger(self._state_dir, ledger_day, attempts=-1, skipped=1)
+                continue
+            if outcome is None or outcome.status == "failed":
+                report.investigation_failed.append(hotspot.key)
+                update_ledger(self._state_dir, ledger_day, failed=1)
+                done.append(hotspot.fingerprint())
+                if outcome is not None:
+                    report.cost_usd = round(report.cost_usd + outcome.cost_usd, 6)
                 continue
             investigated += 1
             done.append(hotspot.fingerprint())
             report.investigated.append(hotspot.key)
+            update_ledger(self._state_dir, ledger_day, investigations=1, succeeded=1)
             report.cost_usd = round(report.cost_usd + outcome.cost_usd, 6)
             if outcome.handoff_url:
                 report.handoffs.append(outcome.handoff_url)
@@ -290,6 +329,17 @@ class ProactiveLoop:
         if not use_case_service:
             self._record_investigations(done)
         return investigated
+
+    def _budget_summary(self, ledger: dict[str, Any], report: ProactiveCycleReport) -> str:
+        attempts = int(ledger.get("attempts", ledger.get("investigations", 0)))
+        limit = self.settings.max_investigations_per_day
+        cycle = (
+            f"this cycle: {len(report.investigation_attempted)} attempted, "
+            f"{len(report.investigated)} succeeded, {len(report.investigation_failed)} failed"
+        )
+        if report.investigation_skipped:
+            cycle += f", {len(report.investigation_skipped)} skipped"
+        return f"Investigation attempts: {attempts}/{limit} used today; {cycle}."
 
     async def _case_service_should_investigate(self, hotspot: Hotspot) -> bool:
         case_service = self.case_service
@@ -339,13 +389,11 @@ class ProactiveLoop:
         now = now if now is not None else time.time()
         try:
             data = json.loads(self._investigations_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             return set()
         if not isinstance(data, dict):
             return set()
-        return {
-            fp for fp, ts in data.items() if isinstance(ts, (int, float)) and (now - ts) < cooldown
-        }
+        return {fp for fp, ts in data.items() if isinstance(ts, (int, float)) and (now - ts) < cooldown}
 
     def _record_investigations(self, fingerprints: list[str], now: float | None = None) -> None:
         """Stamp fingerprints as just-investigated; prune entries past the
@@ -359,15 +407,11 @@ class ProactiveLoop:
                 data = json.loads(self._investigations_path.read_text(encoding="utf-8"))
                 if not isinstance(data, dict):
                     data = {}
-            except (OSError, json.JSONDecodeError):
+            except OSError, json.JSONDecodeError:
                 data = {}
             for fp in fingerprints:
                 data[fp] = now
-            data = {
-                fp: ts
-                for fp, ts in data.items()
-                if isinstance(ts, (int, float)) and (now - ts) < cooldown
-            }
+            data = {fp: ts for fp, ts in data.items() if isinstance(ts, (int, float)) and (now - ts) < cooldown}
             self._investigations_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._investigations_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -498,7 +542,7 @@ class ProactiveLoop:
                 continue
             try:
                 state = int(float(p.get("state")))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if state != 1:  # WARNING only — never auto-ack a CRITICAL (2)
                 continue
@@ -514,11 +558,7 @@ class ProactiveLoop:
     async def _report_auto_snooze(self, snoozed_keys: list[str], raw: list[Hotspot]) -> None:
         by_key = {h.key: h for h in raw}
         ttl_label = _format_ttl(self.settings.auto_snooze_ttl_s)
-        lines = [
-            f"• {by_key[k].title} ({by_key[k].severity})"
-            for k in snoozed_keys
-            if k in by_key
-        ]
+        lines = [f"• {by_key[k].title} ({by_key[k].severity})" for k in snoozed_keys if k in by_key]
         await send_discord_notification(
             title=f"🔕 Auto-snoozed {len(snoozed_keys)} non-urgent finding(s) for {ttl_label}",
             description="\n".join(lines) or "non-urgent findings muted",
@@ -526,9 +566,7 @@ class ProactiveLoop:
             level=Verbosity.INFO,
         )
 
-    async def _shadow_observe_hotspots(
-        self, raw: list[Hotspot], *, cycle_id: str, source_health: SourceHealth
-    ) -> None:
+    async def _shadow_observe_hotspots(self, raw: list[Hotspot], *, cycle_id: str, source_health: SourceHealth) -> None:
         """Best-effort shadow write of freshly scanned hotspots to CaseService.
 
         This intentionally observes only `raw` scanner output, not the effective
@@ -622,9 +660,7 @@ class ProactiveLoop:
                 return entry
         return None
 
-    def _merge_with_carried(
-        self, raw: list[Hotspot], *, do_deep: bool, degraded: bool
-    ) -> list[Hotspot]:
+    def _merge_with_carried(self, raw: list[Hotspot], *, do_deep: bool, degraded: bool) -> list[Hotspot]:
         """Don't read "didn't scan" / "scan failed" as "resolved".
 
         - **Degraded** (a query failed): the scan is untrustworthy → keep fresh
@@ -705,9 +741,7 @@ class ProactiveLoop:
 
     # --- reporting --------------------------------------------------------
 
-    def _report_decision(
-        self, report: ProactiveCycleReport
-    ) -> tuple[bool, frozenset[tuple[str, str]], float]:
+    def _report_decision(self, report: ProactiveCycleReport) -> tuple[bool, frozenset[tuple[str, str]], float]:
         """Decide whether to post a digest WITHOUT mutating de-dup state (state is
         committed only after a successful send). Posts when the hotspot set
         changes (new/resolved/severity),
@@ -723,9 +757,7 @@ class ProactiveLoop:
         stale = (now - self._last_report_ts) >= max(1, self.settings.report_reassert_s)
         return (changed or stale), signature, now
 
-    async def _safe_report(
-        self, report: ProactiveCycleReport, gate: GateDecision
-    ) -> tuple[bool, bool]:
+    async def _safe_report(self, report: ProactiveCycleReport, gate: GateDecision) -> tuple[bool, bool]:
         """Post the digest when due; return ``(due, posted)`` — the dedup
         gate's decision and whether delivery actually succeeded. The insight
         records need both: a failed send is still a notify decision, not
@@ -784,12 +816,12 @@ class ProactiveLoop:
             prefix += " (shadow)"
         worst = max((_sev_rank(h.severity) for h in top), default=0)
         color = 0xE74C3C if worst >= 3 else (0xF39C12 if worst == 2 else 0x2ECC71)
-        lines = [gate.reason]
+        lines = [report.budget_summary or gate.reason]
         if report.investigated:
             lines.append(f"Investigated: {', '.join(report.investigated)}")
         if report.handoffs:
             lines.append(f"Handoffs: {', '.join(report.handoffs)}")
-        lines.append("_Mute a known one:_ `POST /control/proactive/ack {\"fingerprint\": \"<ack id>\"}`")
+        lines.append('_Mute a known one:_ `POST /control/proactive/ack {"fingerprint": "<ack id>"}`')
         fields = []
         for hotspot in top:
             case = await self._case_for_hotspot(hotspot)
@@ -799,6 +831,7 @@ class ProactiveLoop:
                     case=case,
                     public_url=self.settings.control_public_url,
                     observatory_url=self.settings.observatory_public_url,
+                    handoff_url=report.handoffs_by_key.get(hotspot.key),
                 )
             )
         return await send_discord_notification(
@@ -943,6 +976,7 @@ def _hotspot_field(
     case: dict[str, Any] | None = None,
     public_url: str = "",
     observatory_url: str = "",
+    handoff_url: str | None = None,
 ) -> dict[str, Any]:
     emoji = _SEVERITY_EMOJI.get(hotspot.severity, "•")
     checks = "; ".join(hotspot.recommended_checks[:2])
@@ -950,12 +984,10 @@ def _hotspot_field(
     if checks:
         value += f"\nNext: {checks}"
     if hotspot.warrants_change:
-        value += "\n⚙️ candidate for config change (handoff)"
+        value += "\n⚙️ configuration handoff filed" if handoff_url else "\n⚙️ configuration change candidate"
     meta = [f"ack id: `{hotspot.fingerprint()[:12]}`"]
     if observatory_url:
-        meta.append(
-            f"[insights]({observatory_url.rstrip('/')}/insights?fingerprint={hotspot.fingerprint()})"
-        )
+        meta.append(f"[insights]({observatory_url.rstrip('/')}/insights?fingerprint={hotspot.fingerprint()})")
     if case:
         number = case.get("case_number") or case.get("incident_id") or ""
         if number:
@@ -999,7 +1031,9 @@ async def _heartbeat(report: ProactiveCycleReport) -> None:
         "exit_status": _OUTCOME_EXIT.get(report.outcome, 2),
         "plugin_output": (
             f"proactive {report.outcome}: {len(report.hotspots)} hotspot(s), "
-            f"{len(report.investigated)} investigated, {len(report.handoffs)} handoff(s)"
+            f"{len(report.investigation_attempted)} attempted, "
+            f"{len(report.investigated)} succeeded, "
+            f"{len(report.investigation_failed)} failed, {len(report.handoffs)} handoff(s)"
         ),
     }
     auth = b64encode(f"{user}:{password}".encode()).decode()

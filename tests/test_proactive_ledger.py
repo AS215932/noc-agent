@@ -1,24 +1,57 @@
 import json
 
+import pytest
+
 from app.proactive import ledger
 
 
 def test_load_empty_ledger(tmp_path):
     led = ledger.load_ledger(tmp_path, "2026-06-16")
-    assert led == {"cycles": 0, "investigations": 0, "cost_usd": 0.0, "handoffs": 0}
+    assert led == {
+        "cycles": 0,
+        "investigations": 0,
+        "attempts": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "cost_usd": 0.0,
+        "handoffs": 0,
+    }
 
 
 def test_update_ledger_accumulates_and_persists(tmp_path):
     ledger.update_ledger(tmp_path, "2026-06-16", cycles=1, investigations=1, cost_usd=0.5)
     led = ledger.update_ledger(tmp_path, "2026-06-16", cycles=1, investigations=2, cost_usd=0.25, handoffs=1)
-    assert led == {"cycles": 2, "investigations": 3, "cost_usd": 0.75, "handoffs": 1}
+    assert led["cycles"] == 2
+    assert led["investigations"] == 3
+    assert led["cost_usd"] == 0.75
+    assert led["handoffs"] == 1
     on_disk = json.loads((tmp_path / "ledger-2026-06-16.json").read_text())
     assert on_disk["investigations"] == 3
 
 
-def test_corrupt_ledger_resets(tmp_path):
+def test_corrupt_ledger_fails_closed(tmp_path):
     (tmp_path / "ledger-2026-06-16.json").write_text("{not json")
-    assert ledger.load_ledger(tmp_path, "2026-06-16")["investigations"] == 0
+    with pytest.raises(ledger.CorruptLedgerError):
+        ledger.load_ledger(tmp_path, "2026-06-16")
+
+
+def test_old_ledger_migrates_successes_to_attempts(tmp_path):
+    (tmp_path / "ledger-2026-06-16.json").write_text(
+        json.dumps({"cycles": 2, "investigations": 3, "cost_usd": 0.75, "handoffs": 1})
+    )
+    loaded = ledger.load_ledger(tmp_path, "2026-06-16")
+    assert loaded["attempts"] == 3
+    assert loaded["succeeded"] == 3
+
+
+def test_attempt_reservation_and_skip_release_are_atomic(tmp_path):
+    ledger.update_ledger(tmp_path, "2026-06-16", attempts=1)
+    ledger.update_ledger(tmp_path, "2026-06-16", attempts=-1, skipped=1)
+    loaded = ledger.load_ledger(tmp_path, "2026-06-16")
+    assert loaded["attempts"] == 0
+    assert loaded["skipped"] == 1
+    assert not list(tmp_path.glob(".ledger-*.json.*"))
 
 
 def test_lock_is_exclusive_then_released(tmp_path):
