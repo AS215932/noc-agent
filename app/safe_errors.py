@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 
 
 SECRET_FIELD_PATTERN = re.compile(
@@ -69,6 +69,9 @@ def classify_exception(exc: BaseException) -> SafeError:
             return _auth_failed(provider, model_name)
         if code >= 500:
             return _provider_unavailable(provider, model_name)
+
+    if type(relevant) is UnexpectedModelBehavior and "output validation" in message:
+        return _invalid_model_output(provider, model_name)
 
     if "quota" in message or "resource_exhausted" in message:
         return _quota_exhausted(provider, model_name)
@@ -224,5 +227,19 @@ def _mcp_unavailable() -> SafeError:
         operator_next_steps=[
             "Check `/health/mcp` and the MCP child process logs.",
             "Run Prometheus or SSH diagnostics manually until MCP recovers.",
+        ],
+    )
+
+
+def _invalid_model_output(provider: str, model_name: str) -> SafeError:
+    return SafeError(
+        category="invalid_model_output",
+        provider=provider,
+        model_name=model_name,
+        public_message="The AI model repeatedly returned an invalid structured response.",
+        operator_next_steps=[
+            "Check `/health/model` and the configured fallback model chain.",
+            "Review sanitized model-failure metrics and recent `noc-agent` logs.",
+            "Run the alert triage manually if it may be customer-impacting.",
         ],
     )

@@ -528,6 +528,12 @@ fallbacks = ["openrouter:deepseek/deepseek-v4-flash"]
 
 Any OpenRouter model can be selected with `openrouter:<model-slug>`. Secrets stay in environment variables, not in the config file. `AGENT_MODEL` and `AGENT_FALLBACK_MODELS` still override the config file for emergency changes.
 
+Graph triage advances through the active model chain after request-level API
+failures and after a model exhausts structured-output validation retries. This
+keeps a primary model that returns an invalid `DiagnosticSynthesis` from
+preventing a configured secondary model from completing the investigation.
+Explicit per-run model overrides remain single-model runs.
+
 Venice.AI is supported as a provider-redundant fallback with `venice:<model-id>`
 (model IDs from `https://api.venice.ai/api/v1/models`). Venice entries are served
 through Venice's OpenAI-compatible endpoint and authenticate with `VENICE_API_KEY`

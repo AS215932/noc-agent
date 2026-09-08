@@ -3,12 +3,14 @@ import copy
 import pytest
 from fastapi import Response, status
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
 
+import app.agents.triage as triage_module
+from app.agents.triage import TriageAgentDeps
 from app.agent import DiagnosticSynthesis
 from app.cases import CaseService, InMemoryCaseStore
 from app.cases.graph_memory import CaseServiceGraphMemory
@@ -275,6 +277,101 @@ def test_safe_error_classifies_quota_without_leaking_body():
     assert safe.category == "quota_exhausted"
     assert "quota" in safe.public_message
     assert "https://ai.google.dev/secret" not in safe.public_message
+
+
+def test_safe_error_classifies_invalid_structured_model_output():
+    exc = UnexpectedModelBehavior("Exceeded maximum retries (2) for output validation")
+    setattr(exc, "model_name", "openrouter:tencent/hy3")
+
+    safe = classify_exception(exc)
+
+    assert safe.category == "invalid_model_output"
+    assert safe.provider == "openrouter"
+    assert safe.model_name == "openrouter:tencent/hy3"
+    assert "invalid structured response" in safe.public_message
+
+
+@pytest.mark.parametrize(
+    ("primary_error", "expected_category"),
+    [
+        (UnexpectedModelBehavior("Exceeded maximum retries (2) for output validation"), "invalid_model_output"),
+        (ModelHTTPError(429, "primary", body={"error": {"message": "provider busy"}}), "rate_limited"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_triage_falls_back_after_retryable_model_error(monkeypatch, primary_error, expected_category):
+    primary = object()
+    secondary = object()
+    successful_result = object()
+    calls = []
+    fallback_attempts = []
+
+    class FakeAgent:
+        def __init__(self, model):
+            self.model = model
+
+        async def run(self, prompt, **kwargs):
+            calls.append((self.model, prompt, kwargs))
+            if self.model is primary:
+                raise primary_error
+            return successful_result
+
+    monkeypatch.setattr(
+        triage_module,
+        "build_agent_model_chain",
+        lambda: [("openrouter:primary", primary), ("openrouter:secondary", secondary)],
+    )
+    monkeypatch.setattr(triage_module, "build_triage_agent", lambda model=None: FakeAgent(model))
+    monkeypatch.setattr(
+        triage_module,
+        "record_fallback_attempt",
+        lambda model, category: fallback_attempts.append((model, category)),
+    )
+    deps = TriageAgentDeps(perimeter_context="bounded")
+    toolsets = [object()]
+
+    result = await triage_module.run_triage_agent(
+        "investigate",
+        model_override=None,
+        deps=deps,
+        toolsets=toolsets,
+    )
+
+    assert result is successful_result
+    assert [call[0] for call in calls] == [primary, secondary]
+    assert all(call[2] == {"deps": deps, "toolsets": toolsets} for call in calls)
+    assert fallback_attempts == [("openrouter:primary", expected_category)]
+
+
+@pytest.mark.asyncio
+async def test_explicit_triage_model_override_remains_single_model(monkeypatch):
+    override = object()
+    successful_result = object()
+    calls = []
+
+    class FakeAgent:
+        async def run(self, prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return successful_result
+
+    monkeypatch.setattr(
+        triage_module,
+        "build_agent_model_chain",
+        lambda: pytest.fail("explicit override must not load the configured fallback chain"),
+    )
+    monkeypatch.setattr(
+        triage_module, "build_triage_agent", lambda model=None: FakeAgent() if model is override else pytest.fail()
+    )
+
+    result = await triage_module.run_triage_agent(
+        "investigate",
+        model_override=override,
+        deps=TriageAgentDeps(),
+        toolsets=[],
+    )
+
+    assert result is successful_result
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio

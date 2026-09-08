@@ -13,7 +13,7 @@ from uuid import uuid4
 from langgraph.types import interrupt
 from pydantic_ai.toolsets import FunctionToolset
 
-from app.agents.triage import DiagnosticEvidence, DiagnosticSynthesis, TriageAgentDeps, build_triage_agent
+from app.agents.triage import DiagnosticEvidence, DiagnosticSynthesis, TriageAgentDeps, run_triage_agent
 from app.deps.runtime import RuntimeDeps
 from app.golden_state import drift_findings_for, load_supervisor_context
 from app.graph.routing import is_direct_measurement, supervisor_route
@@ -90,13 +90,12 @@ class NodeRunner:
             f"Investigate this normalized alert payload and return DiagnosticSynthesis:\n"
             f"{state['normalized_alert']}"
         )
-        agent = build_triage_agent()
         toolsets = self.runtime.mcp_runtime.toolsets_for(specialist) if self.runtime.mcp_runtime is not None else []
         toolsets = list(toolsets)
         toolsets.append(self._case_link_toolset(state))
-        result = await agent.run(
+        result = await run_triage_agent(
             prompt,
-            model=self.runtime.model_override,
+            model_override=self.runtime.model_override,
             deps=TriageAgentDeps(perimeter_context=perimeter),
             toolsets=toolsets,
         )
