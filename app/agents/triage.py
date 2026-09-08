@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
 
-from app.model_config import build_agent_model
+from app.model_config import build_agent_model, build_agent_model_chain
+from app.model_metrics import record_fallback_attempt
+from app.safe_errors import classify_exception
 
 
 load_dotenv()
@@ -208,6 +211,51 @@ def build_triage_agent(model=None) -> Agent[TriageAgentDeps, DiagnosticSynthesis
             "Never execute, claim, or imply remediation. executed_actions must stay empty."
         ),
     )
+
+
+async def run_triage_agent(
+    prompt: str,
+    *,
+    model_override: Any | None,
+    deps: TriageAgentDeps,
+    toolsets: list[Any],
+):
+    """Run triage and advance to the next model after retryable model failures.
+
+    PydanticAI's ``FallbackModel`` handles request-level provider failures, but
+    structured-output validation happens in ``Agent.run`` after a model request
+    returns. Running each configured candidate at this level lets a secondary
+    model recover when the primary repeatedly returns an invalid
+    ``DiagnosticSynthesis``. Explicit model overrides remain single-model runs.
+    """
+    if model_override is not None:
+        return await build_triage_agent(model_override).run(prompt, deps=deps, toolsets=toolsets)
+
+    candidates = build_agent_model_chain()
+    for index, (model_name, model) in enumerate(candidates):
+        try:
+            return await build_triage_agent(model).run(prompt, deps=deps, toolsets=toolsets)
+        except Exception as exc:
+            if not _fallback_after_agent_error(exc) or index == len(candidates) - 1:
+                _tag_model_error(exc, model_name)
+                raise
+            _tag_model_error(exc, model_name)
+            record_fallback_attempt(model_name, classify_exception(exc).category)
+
+    raise RuntimeError("model candidate chain is empty")  # pragma: no cover
+
+
+def _fallback_after_agent_error(exc: Exception) -> bool:
+    if isinstance(exc, ModelAPIError):
+        return True
+    return type(exc) is UnexpectedModelBehavior and "output validation" in str(exc).lower()
+
+
+def _tag_model_error(exc: Exception, model_name: str) -> None:
+    # Provider SDKs often expose only the provider-local model ID. Keep the
+    # configured, provider-qualified name so health and failure metrics identify
+    # the candidate that actually failed.
+    setattr(exc, "model_name", model_name)
 
 
 noc_triage_agent = build_triage_agent()

@@ -90,8 +90,7 @@ def load_model_config() -> AgentModelConfig:
 
 
 def build_agent_model() -> Model | KnownModelName | str:
-    config = load_model_config()
-    chain = [_resolve_model(name) for name in config.active_model_chain]
+    chain = [model for _name, model in build_agent_model_chain()]
     if len(chain) < 2:
         return chain[0]
     return FallbackModel(
@@ -99,6 +98,12 @@ def build_agent_model() -> Model | KnownModelName | str:
         *chain[1:],
         fallback_on=[_record_fallback_exception, ModelAPIError],
     )
+
+
+def build_agent_model_chain() -> list[tuple[str, Model | KnownModelName | str]]:
+    """Return resolved active models with their configured names in priority order."""
+    config = load_model_config()
+    return [(name, _resolve_model(name)) for name in config.active_model_chain]
 
 
 def _resolve_model(model_name: str) -> Model | str:
