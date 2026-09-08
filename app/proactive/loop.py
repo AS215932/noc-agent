@@ -339,7 +339,7 @@ class ProactiveLoop:
         )
         if report.investigation_skipped:
             cycle += f", {len(report.investigation_skipped)} skipped"
-        return f"Investigation attempts: {attempts}/{limit} used today; {cycle}."
+        return f"Recorded investigation attempts: {attempts}/{limit} today; {cycle}."
 
     async def _case_service_should_investigate(self, hotspot: Hotspot) -> bool:
         case_service = self.case_service

@@ -108,6 +108,6 @@ def evaluate_gate(
     allowed = min(settings.max_investigations_per_cycle, remaining_day, len(eligible))
     return GateDecision(
         allowed,
-        f"{allowed} attempt(s) available ({attempts_today}/{settings.max_investigations_per_day} used today)",
+        f"{allowed} attempt(s) available ({attempts_today}/{settings.max_investigations_per_day} recorded today)",
         eligible=eligible,
     )

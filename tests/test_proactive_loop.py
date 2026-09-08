@@ -132,7 +132,7 @@ async def test_autonomous_cycle_investigates_top_hotspot(tmp_path):
     assert led["attempts"] == 1 and led["succeeded"] == 1 and led["failed"] == 0
     assert (
         report.budget_summary
-        == "Investigation attempts: 1/12 used today; this cycle: 1 attempted, 1 succeeded, 0 failed."
+        == "Recorded investigation attempts: 1/12 today; this cycle: 1 attempted, 1 succeeded, 0 failed."
     )
 
 
@@ -167,7 +167,7 @@ async def test_failed_investigation_consumes_attempt_and_reports_truthfully(tmp_
     assert not first.investigated
     assert (
         first.budget_summary
-        == "Investigation attempts: 1/1 used today; this cycle: 1 attempted, 0 succeeded, 1 failed."
+        == "Recorded investigation attempts: 1/1 today; this cycle: 1 attempted, 0 succeeded, 1 failed."
     )
     assert second.outcome == "over_budget"
     ledger = load_ledger(tmp_path)
