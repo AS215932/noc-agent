@@ -195,6 +195,18 @@ async def _case_outbox_loop(runtime):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.graph.checkpointing import build_checkpointer
+    from app.graph_runtime import close_graph_runtime
+    try:
+        await build_checkpointer()
+        async with _runtime_lifespan(app):
+            yield
+    finally:
+        await close_graph_runtime()
+
+
+@asynccontextmanager
+async def _runtime_lifespan(app: FastAPI):
     global mcp_runtime
     global mail_poller_task
     global mail_poller_lock_fd
@@ -3092,6 +3104,15 @@ def _provider_from_model_name(model_name: str) -> str:
     if model_name.startswith(("gpt", "o1", "o3")):
         return "openai"
     return "unknown"
+
+
+@app.get("/health/checkpoints")
+async def health_checkpoints(response: Response):
+    from app.graph.checkpointing import checkpoint_health
+    result = await checkpoint_health()
+    if result["status"] == "degraded":
+        response.status_code = 503
+    return result
 
 
 @app.get("/health/cases")

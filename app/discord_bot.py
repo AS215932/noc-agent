@@ -626,7 +626,13 @@ async def amain() -> None:
     if bot is None:
         log.info("discord_bot_disabled", reason="DISCORD_BOT_TOKEN-not-set")
         return
-    await bot.start()
+    from app.graph.checkpointing import build_checkpointer
+    from app.graph_runtime import close_graph_runtime
+    try:
+        await build_checkpointer()
+        await bot.start()
+    finally:
+        await close_graph_runtime()
 
 
 def main() -> None:

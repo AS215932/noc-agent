@@ -1,4 +1,7 @@
+import asyncio
+
 import pytest
+import pytest_asyncio
 
 from app.graph import checkpointing
 
@@ -8,11 +11,8 @@ async def test_build_checkpointer_uses_postgres_when_available(monkeypatch):
     class _Saver:
         setup_called = False
 
-        @classmethod
-        def from_conn_string(cls, url):
-            inst = cls()
-            inst.url = url
-            return inst
+        def __init__(self, conn):
+            self.conn = conn
 
         async def setup(self):
             self.setup_called = True
@@ -20,11 +20,16 @@ async def test_build_checkpointer_uses_postgres_when_available(monkeypatch):
     monkeypatch.setenv("NOC_DATABASE_URL", "postgresql://noc/example")
     monkeypatch.delenv("NOC_REDIS_URL", raising=False)
     monkeypatch.setattr(checkpointing, "AsyncPostgresSaver", _Saver)
+    monkeypatch.setattr(checkpointing, "AsyncConnectionPool", FakePool)
 
     saver = await checkpointing.build_checkpointer()
 
     assert isinstance(saver, _Saver)
-    assert saver.url == "postgresql://noc/example"
+    assert saver.conn.url == "postgresql://noc/example"
+    assert saver.conn.opened
+    assert await checkpointing.build_checkpointer() is saver
+    await checkpointing.close_checkpointers()
+    assert saver.conn.closed
     assert saver.setup_called is True
 
 
@@ -64,3 +69,78 @@ async def test_build_checkpointer_still_falls_back_to_memory_by_default(monkeypa
     saver = await checkpointing.build_checkpointer()
 
     assert saver.__class__.__name__ == "InMemorySaver"
+
+
+class FakePool:
+    check_connection = None
+
+    def __init__(self, url, **kwargs):
+        self.url = url
+        self.opened = False
+        self.closed = False
+
+    async def open(self, **kwargs):
+        self.opened = True
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def close_pool_after_test():
+    yield
+    await checkpointing.close_checkpointers()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_builds_share_one_owned_pool(monkeypatch):
+    pools = []
+
+    class Pool(FakePool):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            pools.append(self)
+
+    class Saver:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def setup(self):
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(checkpointing, "AsyncConnectionPool", Pool)
+    savers = await asyncio.gather(*[
+        checkpointing._build_postgres_saver(Saver, "fixture") for _ in range(8)
+    ])
+    assert len(pools) == 1
+    assert all(s is savers[0] for s in savers)
+    assert not pools[0].closed
+    await checkpointing.close_checkpointers()
+    assert pools[0].closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("setup failed"), asyncio.CancelledError()])
+async def test_setup_failure_or_cancellation_closes_pool_and_allows_retry(monkeypatch, error):
+    pools = []
+
+    class Pool(FakePool):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            pools.append(self)
+
+    class Saver:
+        def __init__(self, conn):
+            self.conn = conn
+
+        async def setup(self):
+            if len(pools) == 1:
+                raise error
+
+    monkeypatch.setattr(checkpointing, "AsyncConnectionPool", Pool)
+    with pytest.raises(type(error)):
+        await checkpointing._build_postgres_saver(Saver, "fixture")
+    assert pools[0].closed
+    saver = await checkpointing._build_postgres_saver(Saver, "fixture")
+    assert saver.conn is pools[1]
+    assert not pools[1].closed
