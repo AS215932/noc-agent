@@ -146,31 +146,33 @@ class CaseServiceGraphMemory:
 
     async def put_summary(self, incident_id: str, summary: dict[str, Any]) -> None:
         case = await self._require_case(incident_id)
-        rendered = _summary_payload(summary)
-        diagnosis = dict(case.last_diagnosis or {})
-        diagnosis["graph_summary"] = rendered
-        if rendered.get("thread_id"):
-            diagnosis["thread_id"] = _safe_string(rendered.get("thread_id"), limit=128)
-        case.last_diagnosis = diagnosis
-        rendered_status = str(rendered.get("status") or "")
-        if rendered_status in _GRAPH_AUTHORED_CASE_STATUSES:
-            case.status = cast(CaseStatus, rendered_status)
-        if rendered.get("title"):
-            case.summary = _safe_string(rendered.get("title"), limit=1000)
-        case.updated_at = utc_now()
-        await self.store.upsert_case(case)
-        await self.store.append_event(
-            CaseEvent(
-                case_id=case.case_id,
-                event_type="graph_summary_recorded",
-                actor_type="graph",
-                payload={
-                    "status": _safe_string(rendered.get("status"), limit=64),
-                    "thread_id": _safe_string(rendered.get("thread_id"), limit=128),
-                    "title": _safe_string(rendered.get("title"), limit=500),
-                },
+        async with self.store.case_write_guard(case.case_id):
+            case = await self._require_case(case.case_id)
+            rendered = _summary_payload(summary)
+            diagnosis = dict(case.last_diagnosis or {})
+            diagnosis["graph_summary"] = rendered
+            if rendered.get("thread_id"):
+                diagnosis["thread_id"] = _safe_string(rendered.get("thread_id"), limit=128)
+            case.last_diagnosis = diagnosis
+            rendered_status = str(rendered.get("status") or "")
+            if rendered_status in _GRAPH_AUTHORED_CASE_STATUSES:
+                case.status = cast(CaseStatus, rendered_status)
+            if rendered.get("title"):
+                case.summary = _safe_string(rendered.get("title"), limit=1000)
+            case.updated_at = utc_now()
+            await self.store.upsert_case(case)
+            await self.store.append_event(
+                CaseEvent(
+                    case_id=case.case_id,
+                    event_type="graph_summary_recorded",
+                    actor_type="graph",
+                    payload={
+                        "status": _safe_string(rendered.get("status"), limit=64),
+                        "thread_id": _safe_string(rendered.get("thread_id"), limit=128),
+                        "title": _safe_string(rendered.get("title"), limit=500),
+                    },
+                )
             )
-        )
 
     async def get_summary(self, incident_id: str) -> dict[str, Any] | None:
         case = await self._case(incident_id)
@@ -193,43 +195,45 @@ class CaseServiceGraphMemory:
 
     async def update_case(self, incident_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         case = await self._require_case(incident_id)
-        safe_fields = cast(dict[str, Any], _bounded_json(fields))
-        status = str(safe_fields.get("status") or "")
-        if status:
-            case.status = cast(CaseStatus, _case_status(status, fallback=case.status))
-            if case.status in _TERMINAL and case.resolved_at is None:
-                case.resolved_at = utc_now()
-        if safe_fields.get("diagnostic_summary"):
-            case.summary = _safe_string(safe_fields.get("diagnostic_summary"), limit=1000)
-        diagnosis = dict(case.last_diagnosis or {})
-        stored_graph_summary = diagnosis.get("graph_summary")
-        graph_summary: dict[str, Any] = stored_graph_summary if isinstance(stored_graph_summary, dict) else {}
-        graph_update = dict(safe_fields)
-        graph_update.pop("case_context", None)
-        if graph_update.get("decision_status"):
-            graph_update["status"] = str(graph_update.get("decision_status") or "")
-        graph_summary = {**graph_summary, **graph_update}
-        graph_summary.setdefault("incident_id", case.case_id)
-        graph_summary.setdefault("case_number", case.case_number)
-        diagnosis["graph_summary"] = _summary_payload(graph_summary)
-        if safe_fields.get("thread_id"):
-            diagnosis["thread_id"] = _safe_string(safe_fields.get("thread_id"), limit=128)
-        case.last_diagnosis = diagnosis
-        case.updated_at = utc_now()
-        case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
-        await self.store.append_event(
-            CaseEvent(
-                case_id=case.case_id,
-                event_type="graph_case_updated",
-                actor_type="graph",
-                payload={
-                    "status": _safe_string(status, limit=64),
-                    "thread_id": _safe_string(safe_fields.get("thread_id"), limit=128),
-                    "diagnostic_summary": _safe_string(safe_fields.get("diagnostic_summary"), limit=500),
-                },
+        async with self.store.case_write_guard(case.case_id):
+            case = await self._require_case(case.case_id)
+            safe_fields = cast(dict[str, Any], _bounded_json(fields))
+            status = str(safe_fields.get("status") or "")
+            if status:
+                case.status = cast(CaseStatus, _case_status(status, fallback=case.status))
+                if case.status in _TERMINAL and case.resolved_at is None:
+                    case.resolved_at = utc_now()
+            if safe_fields.get("diagnostic_summary"):
+                case.summary = _safe_string(safe_fields.get("diagnostic_summary"), limit=1000)
+            diagnosis = dict(case.last_diagnosis or {})
+            stored_graph_summary = diagnosis.get("graph_summary")
+            graph_summary: dict[str, Any] = stored_graph_summary if isinstance(stored_graph_summary, dict) else {}
+            graph_update = dict(safe_fields)
+            graph_update.pop("case_context", None)
+            if graph_update.get("decision_status"):
+                graph_update["status"] = str(graph_update.get("decision_status") or "")
+            graph_summary = {**graph_summary, **graph_update}
+            graph_summary.setdefault("incident_id", case.case_id)
+            graph_summary.setdefault("case_number", case.case_number)
+            diagnosis["graph_summary"] = _summary_payload(graph_summary)
+            if safe_fields.get("thread_id"):
+                diagnosis["thread_id"] = _safe_string(safe_fields.get("thread_id"), limit=128)
+            case.last_diagnosis = diagnosis
+            case.updated_at = utc_now()
+            case = cast(AtomicCaseProjection, await self.store.upsert_case(case))
+            await self.store.append_event(
+                CaseEvent(
+                    case_id=case.case_id,
+                    event_type="graph_case_updated",
+                    actor_type="graph",
+                    payload={
+                        "status": _safe_string(status, limit=64),
+                        "thread_id": _safe_string(safe_fields.get("thread_id"), limit=128),
+                        "diagnostic_summary": _safe_string(safe_fields.get("diagnostic_summary"), limit=500),
+                    },
+                )
             )
-        )
-        return _case_dict(case)
+            return _case_dict(case)
 
     async def set_case_thread(self, incident_id: str, thread_id: str) -> dict[str, Any] | None:
         return await self.update_case(incident_id, {"thread_id": thread_id})

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app.case_cards import CardDeliveryOutcome
+from app.cases.attention import AttentionDelivery, attention_enabled
+from app.cases.attention_handler import build_attention_handler
+from app.cases.attention_sender import build_attention_sender
 from app.cases.lhp import TERMINAL_HANDOFF_STATUSES, HandoffTransportDelivery, lhp_payload_hash, sanitize_lhp_text
 from app.monitor_text import safe_monitor_text
-from app.cases.models import AtomicCaseProjection, OutboxIntent
+from app.cases.models import AtomicCaseProjection, CaseEvent, OutboxIntent
 from app.cases.outbox import OutboxHandler, OutboxHandlerResult
 from app.cases.reporting import reactive_reporting_owns_cards
 from app.cases.service import CaseService
@@ -79,7 +83,16 @@ def build_report_handler(
     reminder_notifier=send_discord_notification,
     control_public_url: str = "",
 ) -> OutboxHandler:
-    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+    attention_handler = build_attention_handler(case_service.store, sender=build_attention_sender(notifier=notifier),
+                                                 reminder_seconds=case_service.policy.report_reassert_s)
+
+    async def deliver(intent: OutboxIntent, *, attention_sequence: int | None = None,
+                      lease_token: str = "") -> OutboxHandlerResult:
+        if "attention_request" in intent.payload:
+            result = await attention_handler(intent)
+            if result is None:
+                raise RuntimeError("attention handler omitted delivery result")
+            return result
         if not intent.case_id:
             raise ValueError("report intent requires case_id")
         case = await case_service.store.get_case(intent.case_id)
@@ -87,6 +100,11 @@ def build_report_handler(
             raise KeyError(f"atomic case not found for report intent: {intent.case_id}")
         state_signature = intent.state_signature or case_service.report_state_signature(case)
         reminder_since = intent.payload.get("reminder_since")
+        if reminder_since:
+            reminder_case = await case_service.legacy_reminder_projection(case)
+            if reminder_case is None:
+                return OutboxHandlerResult(payload_updates={"notification_suppressed": "reminder_no_longer_due"})
+            case = reminder_case
         if reminder_since and (
             reminder_since != case.last_reported_at
             or state_signature != case_service.report_state_signature(case)
@@ -186,12 +204,57 @@ def build_report_handler(
             # Other investigation updates do not advance the facts projection.
             return OutboxHandlerResult(payload_updates={"card_update_delivered": True})
         reasserted = bool(case.last_reported_signature and case.last_reported_signature == state_signature)
-        await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
+        report_event = None
+        if attention_sequence is None:
+            await case_service.mark_reported(case.case_id, state_signature=state_signature, reasserted=reasserted)
+        else:
+            report_event = CaseEvent(case_id=case.case_id,
+                event_type="case_reasserted" if reasserted else "case_reported",
+                policy_version=case_service.policy.policy_version, payload={"state_signature": state_signature})
         return OutboxHandlerResult(
+            report_event=report_event,
+            attention_delivery=(AttentionDelivery(
+                case_id=case.case_id, generation=case.report_generation, phase="firing",
+                severity=case.severity, delivered_at=datetime.now(timezone.utc),
+                sequence=attention_sequence + 1,
+            ) if attention_sequence is not None else None),
+            attention_lease_token=lease_token,
             external_id=case.case_number or case.case_id,
             external_url=_case_url(case, control_public_url),
             payload_updates={"state_signature": state_signature, "case_number": case.case_number},
         )
+
+    async def handle(intent: OutboxIntent) -> OutboxHandlerResult:
+        if ("attention_request" in intent.payload or not intent.case_id
+                or (not intent.payload.get("reminder_since")
+                    and (not attention_enabled() or isinstance(intent.payload.get("card_update"), dict)))):
+            return await deliver(intent)
+        store = case_service.store
+        case = await store.get_case(intent.case_id)
+        if not isinstance(case, AtomicCaseProjection) or case.identity.get("source") not in {"alertmanager", "icinga2"}:
+            return await deliver(intent)
+        # Both send paths share ownership even during a mixed-configuration
+        # rollout. Fresh eligibility is checked inside deliver after the lease.
+        previous = await store.get_attention(case.case_id)
+        if previous is not None and not intent.payload.get("reminder_since"):
+            return await deliver(intent)
+        sequence = previous.sequence if previous else 0
+        lease = await store.claim_attention(intent, expected_sequence=sequence, lease_seconds=120)
+        if lease is None:
+            raise RuntimeError("incident notification already claimed or superseded")
+        success = False
+        try:
+            async with asyncio.timeout(60):
+                result = await deliver(intent, attention_sequence=sequence, lease_token=lease)
+            success = result.attention_delivery is not None
+            return result
+        finally:
+            if not success:
+                try:
+                    async with asyncio.timeout(5):
+                        await store.release_attention(case.case_id, lease)
+                except Exception:
+                    pass
 
     return handle
 

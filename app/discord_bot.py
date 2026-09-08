@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from app import log
-from app.case_cards import CardDeliveryOutcome, CardNotFound, deliver_case_card
+from app.case_cards import CardDeliveryOutcome, CardNotFound, SupersededCardDelivery, deliver_case_card
 from app.cases.graph_memory import CaseServiceGraphMemory
 from app.cases.models import ObservationRecord
 from app.cases.runtime import build_case_service_runtime_from_env
@@ -163,7 +163,8 @@ class NOCDiscordBot:
         fields: list[dict[str, Any]] | None = None,
         revision: float | None = None,
         force_refresh: bool = False,
-    ) -> bool | CardDeliveryOutcome:
+        superseded_receipt: bool = False,
+    ) -> bool | CardDeliveryOutcome | SupersededCardDelivery:
         if self.channel_id is None or self.client.user is None:
             return False
         channel = self.client.get_channel(self.channel_id)
@@ -195,6 +196,7 @@ class NOCDiscordBot:
             case_id=case_id,
             payload=embed.to_dict(),
             force_refresh=force_refresh,
+            superseded_receipt=superseded_receipt,
             revision=revision,
             create=create,
             edit=edit,

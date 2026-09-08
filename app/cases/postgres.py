@@ -8,9 +8,11 @@ the schema in :mod:`app.db.schema`.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any, AsyncIterator, cast
+from uuid import uuid4
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -32,6 +34,7 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    Severity,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
@@ -39,6 +42,7 @@ from app.cases.models import (
     TraceRecord,
 )
 from app.cases.store import (
+    apply_report_completion,
     OutboxHealth,
     CallbackClaimResult,
     CaseLinkResult,
@@ -50,6 +54,7 @@ from app.cases.store import (
 )
 from app.db.config import DatabaseSettings, load_database_settings
 from app.db.schema import SCHEMA_STATEMENTS
+from app.cases.attention import AttentionDelivery
 
 
 class _GuardAwareAcquire:
@@ -208,6 +213,34 @@ class PostgresCaseStore:
                 case.schema_version,
             )
         return _case_from_payload(_row_payload(row))
+
+    @asynccontextmanager
+    async def case_write_guard(self, case_id: str) -> AsyncIterator[None]:
+        """Serialize a short case read/modify/write and its event on one connection."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            found = await conn.fetchval("SELECT case_id FROM cases WHERE case_id=$1 FOR UPDATE", case_id)
+            if found is None:
+                raise KeyError("case not found")
+            token = self._guarded_connection.set(conn)
+            try:
+                yield
+            finally:
+                self._guarded_connection.reset(token)
+
+    async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO case_acknowledgement_scope(case_id, acknowledged_at, severity) VALUES($1,$2,$3)
+                   ON CONFLICT(case_id) DO UPDATE SET acknowledged_at=EXCLUDED.acknowledged_at, severity=EXCLUDED.severity""",
+                case_id, acknowledged_at, severity,
+            )
+
+    async def acknowledgement_scope(self, case_id: str, acknowledged_at: str) -> Severity | None:
+        async with self.pool.acquire() as conn:
+            return cast(Severity | None, await conn.fetchval(
+                "SELECT severity FROM case_acknowledgement_scope WHERE case_id=$1 AND acknowledged_at=$2",
+                case_id, acknowledged_at,
+            ))
 
     async def create_atomic_case(
         self,
@@ -387,6 +420,46 @@ class PostgresCaseStore:
                      AND COALESCE(payload->>'last_reported_at', '') <> ''
                    ORDER BY case_id ASC LIMIT $2""",
                 after_case_id, max(0, min(limit, 1000)),
+            )
+        return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
+
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100,
+                                        now: datetime | None = None, reminder_seconds: int = 21600) -> list[AtomicCaseProjection]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT c.payload FROM cases c
+                   LEFT JOIN case_attention_delivery a ON a.case_id=c.case_id
+                   WHERE c.kind='atomic' AND c.case_id > $1
+                   AND c.payload#>>'{identity,source}' IN ('alertmanager', 'icinga2')
+                   AND c.status NOT IN ('closed','expired','linked','recovered_pending')
+                   AND (c.payload->>'covered_by_meta_case' IS DISTINCT FROM 'true'
+                        OR c.payload->>'independent_action_required'='true')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM (VALUES(c.payload->>'suppressed_until'),
+                                            (c.payload->>'snoozed_until')) AS deadlines(value)
+                       WHERE CASE WHEN value ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ]|$)'
+                                       AND pg_input_is_valid(value, 'timestamp with time zone')
+                                  THEN CASE WHEN value ~ '[T ].*(Z|[+-][0-9]{2}(:?[0-9]{2})?)$'
+                                            THEN value::timestamptz
+                                            ELSE value::timestamp AT TIME ZONE 'UTC' END
+                             END > $3)
+                   AND ((c.status='resolved'
+                         AND c.payload->>'resolution_reason'='positive_clean_observation'
+                         AND a.payload->>'phase'='firing')
+                        OR (c.status<>'resolved'
+                            AND coalesce(c.payload->>'acknowledged_at','')=''
+                            AND coalesce(c.payload->>'acknowledged_by','')=''
+                            AND (a.case_id IS NULL OR a.payload->>'phase'='recovered'
+                                 OR CASE c.payload->>'severity' WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2
+                                                               WHEN 'LOW' THEN 1 ELSE 0 END
+                                    > CASE a.payload->>'severity' WHEN 'HIGH' THEN 3 WHEN 'MEDIUM' THEN 2
+                                                                 WHEN 'LOW' THEN 1 ELSE 0 END
+                                 OR coalesce(c.payload->>'report_generation','0') <> a.payload->>'generation'
+                                 OR (c.payload->>'severity'='HIGH'
+                                     AND a.delivered_at <= $3 - make_interval(secs => $4)))))
+                   ORDER BY c.case_id LIMIT $2""",
+                after_case_id, max(0, min(limit, 1000)), now or datetime.now(timezone.utc),
+                max(21600, reminder_seconds),
             )
         return [cast(AtomicCaseProjection, _case_from_payload(_row_payload(row))) for row in rows]
 
@@ -686,6 +759,100 @@ class PostgresCaseStore:
         if not row:
             raise KeyError(f"outbox intent not found: {intent.outbox_id}")
         return OutboxIntent.model_validate(_row_payload(row))
+
+    async def get_attention(self, case_id: str) -> AttentionDelivery | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM case_attention_delivery WHERE case_id = $1", case_id)
+        return AttentionDelivery.model_validate(_row_payload(row)) if row else None
+
+    async def has_pending_attention(self, case_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM side_effect_outbox WHERE case_id=$1 AND intent_type='report'
+                   AND status IN ('pending','failed','in_progress') AND payload->'payload' ? 'attention_request')""",
+                case_id,
+            ))
+
+    async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None:
+        if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:
+            raise ValueError("invalid attention lease")
+        async with self.pool.acquire() as conn, conn.transaction():
+            parent = await conn.fetchrow("SELECT payload FROM cases WHERE case_id=$1 FOR UPDATE", intent.case_id)
+            if parent is None:
+                return None
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", "case-attention:" + intent.case_id)
+            row = await conn.fetchrow(
+                """SELECT outbox_id FROM side_effect_outbox
+                   WHERE outbox_id=$1 AND case_id=$2 AND status='in_progress'
+                     AND COALESCE(payload->>'claim_token', '')=$3
+                     AND EXISTS(SELECT 1 FROM cases WHERE case_id=$2 AND kind='atomic') FOR UPDATE""",
+                intent.outbox_id, intent.case_id, intent.claim_token,
+            )
+            previous = await conn.fetchval("SELECT sequence FROM case_attention_delivery WHERE case_id=$1", intent.case_id)
+            if row is None or (previous or 0) != expected_sequence:
+                return None
+            token = uuid4().hex
+            return await conn.fetchval(
+                """INSERT INTO case_attention_lease(case_id, lease_token, outbox_id, claim_token, expires_at)
+                   VALUES($1,$2,$3,$4,clock_timestamp()+make_interval(secs => $5))
+                   ON CONFLICT(case_id) DO UPDATE SET lease_token=EXCLUDED.lease_token,
+                     outbox_id=EXCLUDED.outbox_id, claim_token=EXCLUDED.claim_token, expires_at=EXCLUDED.expires_at
+                   WHERE case_attention_lease.expires_at <= clock_timestamp() RETURNING lease_token""",
+                intent.case_id, token, intent.outbox_id, intent.claim_token, lease_seconds,
+            )
+
+    async def release_attention(self, case_id: str, lease_token: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2", case_id, lease_token)
+
+    async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str,
+                                 report_event: CaseEvent | None = None) -> OutboxIntent | None:
+        if intent.status != "succeeded" or intent.case_id != delivery.case_id or delivery.sequence != expected_sequence + 1:
+            raise ValueError("invalid attention completion")
+        async with self.pool.acquire() as conn, conn.transaction():
+            parent = await conn.fetchrow("SELECT payload FROM cases WHERE case_id=$1 FOR UPDATE", delivery.case_id)
+            if parent is None:
+                return None
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", "case-attention:" + delivery.case_id)
+            row = await conn.fetchrow(
+                """SELECT outbox_id FROM side_effect_outbox
+                   WHERE outbox_id=$1 AND case_id=$2 AND status='in_progress'
+                     AND COALESCE(payload->>'claim_token', '')=$3 FOR UPDATE""",
+                intent.outbox_id, delivery.case_id, expected_claim_token,
+            )
+            previous = await conn.fetchval("SELECT sequence FROM case_attention_delivery WHERE case_id=$1", delivery.case_id)
+            lease = await conn.fetchrow(
+                """SELECT case_id FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2
+                   AND outbox_id=$3 AND claim_token=$4 AND expires_at > clock_timestamp() FOR UPDATE""",
+                delivery.case_id, lease_token, intent.outbox_id, expected_claim_token,
+            )
+            if row is None or (previous or 0) != expected_sequence or lease is None:
+                return None
+            if report_event is not None:
+                case = _case_from_payload(_row_payload(parent))
+                if not isinstance(case, AtomicCaseProjection):
+                    raise ValueError("report completion requires atomic case")
+                case = apply_report_completion(case, report_event)
+                await conn.execute("""UPDATE cases SET payload=$2::jsonb, updated_at=$3,
+                                   row_version=row_version+1 WHERE case_id=$1""",
+                                   case.case_id, case.model_dump_json(), case.updated_at)
+                await _insert_case_event(conn, report_event)
+            await conn.execute(
+                """INSERT INTO case_attention_delivery(case_id, sequence, delivered_at, payload)
+                   VALUES($1,$2,$3,$4::jsonb) ON CONFLICT(case_id) DO UPDATE
+                   SET sequence=EXCLUDED.sequence, delivered_at=EXCLUDED.delivered_at, payload=EXCLUDED.payload""",
+                delivery.case_id, delivery.sequence, delivery.delivered_at, delivery.model_dump_json(),
+            )
+            row = await conn.fetchrow(
+                """UPDATE side_effect_outbox SET status=$2, attempts=$3, next_attempt_at=$4,
+                   completed_at=$5, external_id=$6, external_url=$7, error=$8, payload=$9::jsonb,
+                   schema_version=$10 WHERE outbox_id=$1 RETURNING payload""",
+                intent.outbox_id, intent.status, intent.attempts, intent.next_attempt_at, intent.completed_at,
+                intent.external_id, intent.external_url, intent.error, intent.model_dump_json(), intent.schema_version,
+            )
+            await conn.execute("DELETE FROM case_attention_lease WHERE case_id=$1 AND lease_token=$2", delivery.case_id, lease_token)
+            return OutboxIntent.model_validate(_row_payload(row))
 
     async def update_outbox_if_status(
         self, intent: OutboxIntent, *, expected_status: str, expected_claim_token: str | None = None

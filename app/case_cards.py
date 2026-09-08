@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 from enum import Enum
+from dataclasses import dataclass
+import math
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -28,6 +30,11 @@ class CardDeliveryOutcome(Enum):
     SUPERSEDED = "superseded"
 
 
+@dataclass(frozen=True)
+class SupersededCardDelivery:
+    verified_at: float
+
+
 class CardNotFound(Exception):
     """The transport confirmed that the previous card was deleted."""
 
@@ -39,9 +46,10 @@ async def deliver_case_card(
     payload: dict[str, Any],
     revision: float | None = None,
     force_refresh: bool = False,
+    superseded_receipt: bool = False,
     create: Callable[[], Awaitable[int | None]],
     edit: Callable[[int], Awaitable[bool]],
-) -> bool | CardDeliveryOutcome:
+) -> bool | CardDeliveryOutcome | SupersededCardDelivery:
     revision = time.time() if revision is None else revision
     directory = os.getenv("DISCORD_CASE_STATE_DIR") or str(
         Path(os.getenv("MAIL_DRAFT_DIR", "data/mail-drafts")) / ".notifications" / "case-cards"
@@ -83,6 +91,9 @@ async def deliver_case_card(
                 verified_now = time.time()
                 if message_id is not None:
                     if revision < previous_revision:
+                        if (superseded_receipt and type(verified_at) in (int, float)
+                                and math.isfinite(verified_at) and 0 < verified_at <= verified_now):
+                            return SupersededCardDelivery(verified_at=float(verified_at))
                         return CardDeliveryOutcome.SUPERSEDED
                     if not force_refresh and previous == digest and 0 <= verified_now - verified_at < CARD_REFRESH_S:
                         if revision == previous_revision:

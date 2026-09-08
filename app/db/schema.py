@@ -151,6 +151,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         WHERE status IN ('pending', 'failed', 'in_progress')
     """,
     """
+    CREATE INDEX IF NOT EXISTS side_effect_outbox_attention_case_idx ON side_effect_outbox(case_id)
+        WHERE intent_type='report' AND status IN ('pending','failed','in_progress')
+          AND payload->'payload' ? 'attention_request'
+    """,
+    """
     CREATE TABLE IF NOT EXISTS meta_case_correlation_evidence (
         evidence_id TEXT PRIMARY KEY,
         meta_case_id TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
@@ -407,6 +412,30 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS handoff_transport_deliveries_status_idx
         ON handoff_transport_deliveries (status, next_attempt_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS case_attention_delivery (
+        case_id TEXT PRIMARY KEY REFERENCES cases(case_id),
+        sequence BIGINT NOT NULL CHECK (sequence > 0),
+        delivered_at TIMESTAMPTZ NOT NULL,
+        payload JSONB NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS case_attention_lease (
+        case_id TEXT PRIMARY KEY REFERENCES cases(case_id),
+        lease_token TEXT NOT NULL,
+        outbox_id TEXT NOT NULL REFERENCES side_effect_outbox(outbox_id),
+        claim_token TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS case_acknowledgement_scope (
+        case_id TEXT PRIMARY KEY REFERENCES cases(case_id),
+        acknowledged_at TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ('UNKNOWN','LOW','MEDIUM','HIGH'))
+    )
     """,
 )
 

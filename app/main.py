@@ -1752,37 +1752,38 @@ async def _apply_case_service_primary_decision_state(
         return case
     from app.cases.models import CaseEvent, utc_now
 
-    now = utc_now()
-    latest = await case_service_runtime.store.get_case(case.case_id)
-    if latest is not None:
-        case = latest
-    summary_status = str((graph_summary or {}).get("status") or request_body.decision)
-    case.status = "waiting_approval" if summary_status == "waiting_approval" else "resolved"
-    if case.status == "resolved":
-        case.resolved_at = now
-        case.resolution_reason = f"operator_{request_body.decision}"
-    case.updated_at = now
-    diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
-    if isinstance(graph_summary, dict):
-        diagnosis["graph_summary"] = _safe_case_service_output_value(graph_summary)
-    diagnosis["operator_decision"] = _safe_case_service_output_value(request_body.model_dump())
-    diagnosis["decision_status"] = _safe_monitor_token(summary_status, limit=64)
-    case.last_diagnosis = diagnosis
-    case = await case_service_runtime.store.upsert_case(case)
-    event_payload = {
-        "case_id": case.case_id,
-        "event_type": "operator_decision_recorded",
-        "actor_type": "operator",
-        "actor_id": _safe_monitor_token(request_body.operator, limit=120),
-        "payload": {
-            "decision": _safe_monitor_token(request_body.decision, limit=32),
-            "summary_status": _safe_monitor_token(summary_status, limit=64),
-        },
-    }
-    if event_id:
-        event_payload["event_id"] = event_id
-    await case_service_runtime.store.append_event(CaseEvent(**event_payload))
-    return case
+    async with case_service_runtime.store.case_write_guard(case.case_id):
+        now = utc_now()
+        latest = await case_service_runtime.store.get_case(case.case_id)
+        if latest is not None:
+            case = latest
+        summary_status = str((graph_summary or {}).get("status") or request_body.decision)
+        case.status = "waiting_approval" if summary_status == "waiting_approval" else "resolved"
+        if case.status == "resolved":
+            case.resolved_at = now
+            case.resolution_reason = f"operator_{request_body.decision}"
+        case.updated_at = now
+        diagnosis = dict(getattr(case, "last_diagnosis", {}) or {})
+        if isinstance(graph_summary, dict):
+            diagnosis["graph_summary"] = _safe_case_service_output_value(graph_summary)
+        diagnosis["operator_decision"] = _safe_case_service_output_value(request_body.model_dump())
+        diagnosis["decision_status"] = _safe_monitor_token(summary_status, limit=64)
+        case.last_diagnosis = diagnosis
+        case = await case_service_runtime.store.upsert_case(case)
+        event_payload = {
+            "case_id": case.case_id,
+            "event_type": "operator_decision_recorded",
+            "actor_type": "operator",
+            "actor_id": _safe_monitor_token(request_body.operator, limit=120),
+            "payload": {
+                "decision": _safe_monitor_token(request_body.decision, limit=32),
+                "summary_status": _safe_monitor_token(summary_status, limit=64),
+            },
+        }
+        if event_id:
+            event_payload["event_id"] = event_id
+        await case_service_runtime.store.append_event(CaseEvent(**event_payload))
+        return case
 
 
 def _reactive_observations_from_alert_payload(alert_payload: dict):

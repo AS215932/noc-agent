@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from app.cases.models import OutboxIntent, utc_now
+from app.cases.models import CaseEvent, OutboxIntent, utc_now
+from app.cases.attention import AttentionDelivery
 from app.cases.store import CaseStore
 from app.model_metrics import record_case_service_outbox_processed, record_sanitized_discord_failure
 
@@ -25,6 +26,9 @@ class OutboxHandlerResult:
     external_id: str = ""
     external_url: str = ""
     payload_updates: dict[str, Any] = field(default_factory=dict)
+    attention_delivery: AttentionDelivery | None = None
+    attention_lease_token: str = ""
+    report_event: CaseEvent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,9 +110,18 @@ class OutboxProcessor:
                 completed.external_url = result.external_url
                 if result.payload_updates:
                     completed.payload.update(result.payload_updates)
-            stored_completion = await self.store.update_outbox_if_status(
-                completed, expected_status="in_progress", expected_claim_token=claimed.claim_token,
-            )
+            if result is not None and result.attention_delivery is not None:
+                stored_completion = await self.store.complete_attention(
+                    completed, result.attention_delivery,
+                    expected_sequence=result.attention_delivery.sequence - 1,
+                    expected_claim_token=claimed.claim_token,
+                    lease_token=result.attention_lease_token,
+                    report_event=result.report_event,
+                )
+            else:
+                stored_completion = await self.store.update_outbox_if_status(
+                    completed, expected_status="in_progress", expected_claim_token=claimed.claim_token,
+                )
             if stored_completion is None:
                 skipped += 1
                 record_case_service_outbox_processed(intent_type=intent.intent_type, outcome="skipped")

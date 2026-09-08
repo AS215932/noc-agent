@@ -10,8 +10,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from typing import AsyncContextManager, AsyncIterator, Protocol, cast, runtime_checkable
+from app.cases.attention import AttentionDelivery, attention_due
+
 
 from app.cases.lhp import (
     CallbackInboxRecord,
@@ -32,6 +35,7 @@ from app.cases.models import (
     CaseEvent,
     CaseIdentityAlias,
     CaseStatus,
+    Severity,
     MetaCaseProjection,
     ObservationRecord,
     OperatorFeedback,
@@ -41,6 +45,20 @@ from app.cases.models import (
 
 CaseProjection = AtomicCaseProjection | MetaCaseProjection
 TERMINAL_CASE_STATUSES = frozenset({"resolved", "closed", "expired", "linked"})
+
+
+def apply_report_completion(case: AtomicCaseProjection, event: CaseEvent) -> AtomicCaseProjection:
+    """Apply report fields to a fresh locked case, preserving concurrent state."""
+    if event.case_id != case.case_id or event.event_type not in {"case_reported", "case_reasserted"}:
+        raise ValueError("invalid report completion event")
+    updated = case.model_copy(deep=True)
+    updated.last_reported_at = event.occurred_at
+    updated.last_reported_signature = str(event.payload["state_signature"])
+    if event.event_type == "case_reasserted":
+        updated.last_reasserted_at = event.occurred_at
+    updated.updated_at = event.occurred_at
+    updated.policy_version = event.policy_version
+    return updated
 
 
 @dataclass(frozen=True)
@@ -112,6 +130,12 @@ class CaseStore(Protocol):
 
     async def upsert_case(self, case: CaseProjection) -> CaseProjection: ...
 
+    def case_write_guard(self, case_id: str) -> AsyncContextManager[None]: ...
+
+    async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None: ...
+
+    async def acknowledgement_scope(self, case_id: str, acknowledged_at: str) -> Severity | None: ...
+
     async def create_atomic_case(
         self,
         case: AtomicCaseProjection,
@@ -141,6 +165,9 @@ class CaseStore(Protocol):
 
     async def list_reminder_candidates(self, *, after_case_id: str = "", limit: int = 100) -> list[AtomicCaseProjection]: ...
 
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100,
+                                        now: datetime | None = None, reminder_seconds: int = 21600) -> list[AtomicCaseProjection]: ...
+
     async def append_event(self, event: CaseEvent) -> CaseEvent: ...
 
     async def case_events(
@@ -164,6 +191,18 @@ class CaseStore(Protocol):
     ) -> CaseLinkResult | None: ...
 
     async def enqueue_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
+
+    async def get_attention(self, case_id: str) -> AttentionDelivery | None: ...
+
+    async def has_pending_attention(self, case_id: str) -> bool: ...
+
+    async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None: ...
+
+    async def release_attention(self, case_id: str, lease_token: str) -> None: ...
+
+    async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str,
+                                 report_event: CaseEvent | None = None) -> OutboxIntent | None: ...
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent: ...
 
@@ -292,6 +331,27 @@ class CaseStore(Protocol):
     async def count_traces(self, *, case_id: str | None = None, meta_case_id: str | None = None) -> int: ...
 
 
+class _TaskReentrantLock:
+    """Reference-backend transaction lock; nested store calls reuse ownership."""
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    async def __aenter__(self) -> None:
+        task = asyncio.current_task()
+        if task is not self._owner:
+            await self._lock.acquire()
+            self._owner = task
+        self._depth += 1
+
+    async def __aexit__(self, *_exc) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+
 class InMemoryCaseStore:
     """Reference implementation for tests and local service development.
 
@@ -301,7 +361,7 @@ class InMemoryCaseStore:
     """
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock = _TaskReentrantLock()
         self._observations: dict[str, ObservationRecord] = {}
         self._cases: dict[str, CaseProjection] = {}
         self._events: dict[str, CaseEvent] = {}
@@ -310,6 +370,9 @@ class InMemoryCaseStore:
         self._alias_index: dict[tuple[str, str], str] = {}
         self._outbox: dict[str, OutboxIntent] = {}
         self._outbox_index: dict[str, str] = {}
+        self._attention: dict[str, AttentionDelivery] = {}
+        self._acknowledgement_scopes: dict[str, tuple[str, Severity]] = {}
+        self._attention_leases: dict[str, tuple[str, str, str, datetime]] = {}
         self._handoffs: dict[str, CaseHandoff] = {}
         self._handoff_idempotency_index: dict[str, str] = {}
         self._active_handoff_index: dict[tuple[str, str, str], str] = {}
@@ -347,6 +410,23 @@ class InMemoryCaseStore:
             stored = case.model_copy(deep=True)
             self._cases[stored.case_id] = stored
             return stored.model_copy(deep=True)
+
+    @asynccontextmanager
+    async def case_write_guard(self, case_id: str) -> AsyncIterator[None]:
+        async with self._lock:
+            if case_id not in self._cases:
+                raise KeyError("case not found")
+            yield
+
+    async def record_acknowledgement_scope(self, case_id: str, acknowledged_at: str, severity: Severity) -> None:
+        async with self._lock:
+            self._require_atomic_case_locked(case_id)
+            self._acknowledgement_scopes[case_id] = (acknowledged_at, severity)
+
+    async def acknowledgement_scope(self, case_id: str, acknowledged_at: str) -> Severity | None:
+        async with self._lock:
+            scope = self._acknowledgement_scopes.get(case_id)
+            return scope[1] if scope is not None and scope[0] == acknowledged_at else None
 
     async def create_atomic_case(
         self,
@@ -442,6 +522,18 @@ class InMemoryCaseStore:
                  and case.case_id > after_case_id and case.severity == "HIGH" and case.last_reported_at),
                 key=lambda case: case.case_id,
             )
+            return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
+
+    async def list_attention_candidates(self, *, after_case_id: str = "", limit: int = 100,
+                                        now: datetime | None = None, reminder_seconds: int = 21600) -> list[AtomicCaseProjection]:
+        now = now or datetime.now(timezone.utc)
+        async with self._lock:
+            cases = sorted((case for case in self._cases.values()
+                            if isinstance(case, AtomicCaseProjection) and case.case_id > after_case_id
+                            and case.identity.get("source") in {"alertmanager", "icinga2"}
+                            and attention_due(case, self._attention.get(case.case_id), now=now,
+                                              reminder_seconds=reminder_seconds) is not None),
+                           key=lambda case: case.case_id)
             return [case.model_copy(deep=True) for case in cases[:max(0, min(limit, 1000))]]
 
     async def append_event(self, event: CaseEvent) -> CaseEvent:
@@ -622,6 +714,65 @@ class InMemoryCaseStore:
         self._outbox[stored.outbox_id] = stored
         self._outbox_index[stored.idempotency_key] = stored.outbox_id
         return stored
+
+    async def get_attention(self, case_id: str) -> AttentionDelivery | None:
+        async with self._lock:
+            value = self._attention.get(case_id)
+            return value.model_copy(deep=True) if value else None
+
+    async def has_pending_attention(self, case_id: str) -> bool:
+        async with self._lock:
+            return any(item.case_id == case_id and item.intent_type == "report"
+                       and item.status in {"pending", "failed", "in_progress"}
+                       and "attention_request" in item.payload for item in self._outbox.values())
+
+    async def claim_attention(self, intent: OutboxIntent, *, expected_sequence: int, lease_seconds: int = 120) -> str | None:
+        if not intent.case_id or not intent.claim_token or not 1 <= lease_seconds <= 300:
+            raise ValueError("invalid attention lease")
+        async with self._lock:
+            current = self._outbox.get(intent.outbox_id)
+            previous = self._attention.get(intent.case_id)
+            lease = self._attention_leases.get(intent.case_id)
+            now = datetime.now(timezone.utc)
+            if (current is None or current.status != "in_progress" or current.claim_token != intent.claim_token
+                    or current.case_id != intent.case_id or (previous.sequence if previous else 0) != expected_sequence
+                    or (lease is not None and lease[3] > now)):
+                return None
+            self._require_atomic_case_locked(intent.case_id)
+            token = uuid4().hex
+            self._attention_leases[intent.case_id] = (token, intent.outbox_id, intent.claim_token,
+                                                     now + timedelta(seconds=lease_seconds))
+            return token
+
+    async def release_attention(self, case_id: str, lease_token: str) -> None:
+        async with self._lock:
+            lease = self._attention_leases.get(case_id)
+            if lease is not None and lease[0] == lease_token:
+                del self._attention_leases[case_id]
+
+    async def complete_attention(self, intent: OutboxIntent, delivery: AttentionDelivery, *,
+                                 expected_sequence: int, expected_claim_token: str, lease_token: str,
+                                 report_event: CaseEvent | None = None) -> OutboxIntent | None:
+        if intent.status != "succeeded" or intent.case_id != delivery.case_id or delivery.sequence != expected_sequence + 1:
+            raise ValueError("invalid attention completion")
+        async with self._lock:
+            current = self._outbox.get(intent.outbox_id)
+            previous = self._attention.get(delivery.case_id)
+            lease = self._attention_leases.get(delivery.case_id)
+            if (current is None or current.status != "in_progress" or current.claim_token != expected_claim_token
+                    or current.case_id != delivery.case_id or (previous.sequence if previous else 0) != expected_sequence
+                    or lease is None or lease[:3] != (lease_token, intent.outbox_id, expected_claim_token)
+                    or lease[3] <= datetime.now(timezone.utc)):
+                return None
+            case = self._require_atomic_case_locked(delivery.case_id)
+            if report_event is not None:
+                case = apply_report_completion(case, report_event)
+                self._cases[case.case_id] = case
+                self._store_event_locked(report_event)
+            self._attention[delivery.case_id] = delivery.model_copy(deep=True)
+            self._outbox[intent.outbox_id] = intent.model_copy(deep=True)
+            del self._attention_leases[delivery.case_id]
+            return intent.model_copy(deep=True)
 
     async def update_outbox(self, intent: OutboxIntent) -> OutboxIntent:
         async with self._lock:
