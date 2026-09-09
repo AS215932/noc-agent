@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 from app.model_metrics import (
     metrics_response,
+    model_result_metadata,
     record_case_service_outbox_processed,
     record_case_service_shadow_failure,
     record_case_service_shadow_observation,
@@ -9,8 +12,19 @@ from app.model_metrics import (
     record_lhp_handoff_verified,
     record_lhp_knowledge_event,
     record_lhp_verification_result,
+    record_fallback_attempt,
+    record_success,
     set_case_service_runtime_enabled,
+    start_run,
 )
+
+
+class _ModelResult:
+    def new_messages(self):
+        return [SimpleNamespace(model_name="openrouter:unit-secondary")]
+
+    def usage(self):
+        return None
 
 
 def test_case_service_metrics_are_exported():
@@ -62,3 +76,28 @@ def test_lhp_metrics_are_exported():
     assert 'noc_agent_lhp_handoffs_verified_total{target_loop="engineering"}' in text
     assert 'noc_agent_lhp_cases_resolved_total{case_type="proactive_disk_condition"}' in text
     assert 'noc_agent_lhp_knowledge_events_total{kind="artifact_proposed",outcome="enqueued"}' in text
+
+
+def test_graph_model_metadata_records_selected_fallback_success():
+    started = start_run("unit-graph-triage")
+    record_fallback_attempt("openrouter:unit-primary", "invalid_model_output")
+    model_name, fallback_from = model_result_metadata(_ModelResult())
+
+    record_success(
+        "unit-graph-triage",
+        started,
+        None,
+        model_name=model_name,
+        fallback_from=fallback_from,
+    )
+
+    body, _ = metrics_response()
+    text = body.decode()
+    assert (
+        'noc_agent_model_run_successes_total{agent="unit-graph-triage",model="openrouter:unit-secondary"} 1.0'
+        in text
+    )
+    assert (
+        'noc_agent_model_fallback_successes_total{from_model="openrouter:unit-primary",'
+        'to_model="openrouter:unit-secondary"} 1.0' in text
+    )

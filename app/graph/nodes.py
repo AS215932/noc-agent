@@ -28,6 +28,7 @@ from app.graph.state import (
     json_safe_model_dump,
     utc_now,
 )
+from app.model_metrics import model_result_metadata
 
 
 class NodeRunner:
@@ -99,6 +100,7 @@ class NodeRunner:
             deps=TriageAgentDeps(perimeter_context=perimeter),
             toolsets=toolsets,
         )
+        model_name, fallback_from = model_result_metadata(result)
         synthesis = result.data if hasattr(result, "data") else result.output
         evidence = [_evidence_item(item) for item in synthesis.evidence_chain]
         finding = SpecialistFinding(
@@ -118,6 +120,8 @@ class NodeRunner:
             "evidence_log": [json_safe_model_dump(item) for item in evidence],
             "perimeter_context_version": self.runtime.perimeter_context.schema_version if self.runtime.perimeter_context else "",
             "manifest_hash": self.runtime.perimeter_context.manifest_hash if self.runtime.perimeter_context else "",
+            "model_name": model_name,
+            "model_fallback_from": fallback_from,
         }
         assert_json_serializable_state(update)
         return update

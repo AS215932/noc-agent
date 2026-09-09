@@ -17,7 +17,7 @@ from app.cases.graph_memory import CaseServiceGraphMemory
 from app.cases.notifications import observations_from_alertmanager
 from app.main import health_model, investigate_alert, metrics
 from app.model_config import build_agent_model, load_model_config
-from app.model_metrics import STATE
+from app.model_metrics import STATE, model_result_metadata
 from app.safe_errors import classify_exception
 
 
@@ -338,6 +338,7 @@ async def test_triage_falls_back_after_retryable_model_error(monkeypatch, primar
     )
 
     assert result is successful_result
+    assert model_result_metadata(result)[0] == "openrouter:secondary"
     assert [call[0] for call in calls] == [primary, secondary]
     assert all(call[2] == {"deps": deps, "toolsets": toolsets} for call in calls)
     assert fallback_attempts == [("openrouter:primary", expected_category)]
