@@ -710,7 +710,13 @@ async def investigate_alert(
             case=case,
             graph_memory=graph_memory,
         )
-        record_success("triage", run_started, _SyntheticRunResult())
+        record_success(
+            "triage",
+            run_started,
+            None,
+            model_name=str(graph_state.get("model_name") or "unknown"),
+            fallback_from=list(graph_state.get("model_fallback_from") or []),
+        )
     except Exception as e:
         safe = classify_exception(e)
         record_failure("triage", run_started, safe)
@@ -3269,14 +3275,6 @@ async def health_mail(response: Response):
             "status": "degraded",
             "error": safe_health_error(e),
         }
-
-
-class _SyntheticRunResult:
-    def new_messages(self):
-        return []
-
-    def usage(self):
-        return None
 
 
 def _require_control_token(header_value: str | None) -> None:

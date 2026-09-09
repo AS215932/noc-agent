@@ -70,6 +70,8 @@ async def test_graph_routes_bgp_alert_and_creates_pending_summary(monkeypatch):
     assert "perimeter_context" not in state
     assert state["perimeter_context_version"]
     assert state["manifest_hash"]
+    assert state["model_name"] != "unknown"
+    assert state["model_fallback_from"] == []
     assert emitted == [("investigation", state["incident_id"])]
     summary = await graph_memory.get_summary(state["incident_id"])
     assert summary is not None

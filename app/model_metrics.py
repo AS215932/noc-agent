@@ -119,6 +119,7 @@ LHP_KNOWLEDGE_EVENTS = Counter(
 )
 
 _fallback_failures: ContextVar[list[str]] = ContextVar("fallback_failures", default=[])
+_selected_model: ContextVar[str | None] = ContextVar("selected_model", default=None)
 _case_service_runtime_backend: str | None = None
 RECENT_RUNTIME_FAILURE_WINDOW_SECONDS = 600.0
 
@@ -178,6 +179,7 @@ def set_model_config(
 def start_run(agent: str) -> float:
     MODEL_RUN_ATTEMPTS.labels(agent=agent).inc()
     _fallback_failures.set([])
+    _selected_model.set(None)
     return time.perf_counter()
 
 
@@ -188,8 +190,20 @@ def record_fallback_attempt(from_model: str, category: str) -> None:
     _fallback_failures.set(failures)
 
 
-def record_success(agent: str, started_at: float, result: Any) -> str:
-    model = selected_model_name(result)
+def record_model_selection(model_name: str) -> None:
+    _selected_model.set(str(model_name or "unknown"))
+
+
+def record_success(
+    agent: str,
+    started_at: float,
+    result: Any,
+    *,
+    model_name: str | None = None,
+    fallback_from: list[str] | None = None,
+) -> str:
+    model = str(model_name or selected_model_name(result) or "unknown")
+    failed_models = list(_fallback_failures.get()) if fallback_from is None else list(fallback_from)
     now = time.time()
     duration = max(0.0, time.perf_counter() - started_at)
     STATE.last_success_at = now
@@ -201,10 +215,11 @@ def record_success(agent: str, started_at: float, result: Any) -> str:
     MODEL_REQUEST_DURATION.labels(agent=agent, model=model).observe(duration)
     MODEL_LAST_SUCCESS.labels(agent=agent, model=model).set(now)
     _record_usage(agent, model, result)
-    for failed_model in _fallback_failures.get():
+    for failed_model in failed_models:
         if failed_model != model:
             MODEL_FALLBACK_SUCCESSES.labels(from_model=failed_model, to_model=model).inc()
     _fallback_failures.set([])
+    _selected_model.set(None)
     return model
 
 
@@ -224,6 +239,7 @@ def record_failure(agent: str, started_at: float, safe: SafeError) -> None:
     MODEL_RUN_DURATION.labels(agent=agent, outcome="failure").observe(duration)
     MODEL_LAST_FAILURE.labels(agent=agent, category=safe.category).set(now)
     _fallback_failures.set([])
+    _selected_model.set(None)
 
 
 def record_sanitized_discord_failure(category: str) -> None:
@@ -299,6 +315,11 @@ def selected_model_name(result: Any) -> str:
     except Exception:
         pass
     return "unknown"
+
+
+def model_result_metadata(result: Any) -> tuple[str, list[str]]:
+    """Return JSON-safe model attribution from the current model-run context."""
+    return (_selected_model.get() or selected_model_name(result)), list(_fallback_failures.get())
 
 
 def metrics_response() -> tuple[bytes, str]:

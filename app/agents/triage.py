@@ -9,7 +9,7 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
 
 from app.model_config import build_agent_model, build_agent_model_chain
-from app.model_metrics import record_fallback_attempt
+from app.model_metrics import record_fallback_attempt, record_model_selection, selected_model_name
 from app.safe_errors import classify_exception
 
 
@@ -229,12 +229,16 @@ async def run_triage_agent(
     ``DiagnosticSynthesis``. Explicit model overrides remain single-model runs.
     """
     if model_override is not None:
-        return await build_triage_agent(model_override).run(prompt, deps=deps, toolsets=toolsets)
+        result = await build_triage_agent(model_override).run(prompt, deps=deps, toolsets=toolsets)
+        record_model_selection(selected_model_name(result))
+        return result
 
     candidates = build_agent_model_chain()
     for index, (model_name, model) in enumerate(candidates):
         try:
-            return await build_triage_agent(model).run(prompt, deps=deps, toolsets=toolsets)
+            result = await build_triage_agent(model).run(prompt, deps=deps, toolsets=toolsets)
+            record_model_selection(model_name)
+            return result
         except Exception as exc:
             if not _fallback_after_agent_error(exc) or index == len(candidates) - 1:
                 _tag_model_error(exc, model_name)

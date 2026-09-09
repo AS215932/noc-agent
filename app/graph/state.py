@@ -133,6 +133,8 @@ class WorkflowState(TypedDict, total=False):
     errors: list[JsonDict]
     perimeter_context_version: str
     manifest_hash: str
+    model_name: str
+    model_fallback_from: list[str]
 
 
 NOCState = WorkflowState

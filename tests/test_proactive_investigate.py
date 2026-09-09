@@ -256,7 +256,7 @@ async def test_investigator_skips_without_case_service_runtime(monkeypatch):
 @pytest.mark.parametrize("global_present", [False, True])
 async def test_terminal_card_retry_uses_injected_case_store(monkeypatch, graph_fails, global_present):
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
     import app.main as main
     from app.cases.models import ObservationRecord
 
@@ -286,9 +286,21 @@ async def test_terminal_card_retry_uses_injected_case_store(monkeypatch, graph_f
         remediation_proposal=None,
     )
     graph = (
-        AsyncMock(side_effect=RuntimeError("test graph failure")) if graph_fails else AsyncMock(return_value=(plan, {}))
+        AsyncMock(side_effect=RuntimeError("test graph failure"))
+        if graph_fails
+        else AsyncMock(
+            return_value=(
+                plan,
+                {
+                    "model_name": "openrouter:secondary",
+                    "model_fallback_from": ["openrouter:primary"],
+                },
+            )
+        )
     )
     monkeypatch.setattr(main, "run_investigation_graph", graph)
+    record_success = Mock()
+    monkeypatch.setattr(main, "record_success", record_success)
     monkeypatch.setattr(main, "_take_ownership_ack", AsyncMock())
     monkeypatch.setattr(main, "_record_reactive_case_investigation", AsyncMock())
     monkeypatch.setattr(main, "_triage_fields", lambda *args: [])
@@ -308,3 +320,10 @@ async def test_terminal_card_retry_uses_injected_case_store(monkeypatch, graph_f
     assert ("safe_category" in queued[0].payload) is True
     assert not await other_store.list_outbox()
     assert notifier.await_count == 2  # starting card + one durably retryable terminal attempt
+    if graph_fails:
+        record_success.assert_not_called()
+    else:
+        assert record_success.call_args.kwargs == {
+            "model_name": "openrouter:secondary",
+            "fallback_from": ["openrouter:primary"],
+        }
