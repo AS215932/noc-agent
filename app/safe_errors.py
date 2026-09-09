@@ -45,6 +45,8 @@ def classify_exception(exc: BaseException) -> SafeError:
     message = f"{type(relevant).__name__}: {_safe_text(relevant)} {body_text}".lower()
 
     if isinstance(relevant, ModelHTTPError):
+        if status_code == 402:
+            return _quota_exhausted(provider, model_name)
         if status_code == 429:
             if any(word in message for word in ("quota", "resource_exhausted", "exceeded")):
                 return _quota_exhausted(provider, model_name)
@@ -63,6 +65,8 @@ def classify_exception(exc: BaseException) -> SafeError:
 
     if isinstance(relevant, httpx.HTTPStatusError):
         code = relevant.response.status_code
+        if code == 402:
+            return _quota_exhausted(provider, model_name)
         if code == 429:
             return _rate_limited(provider, model_name)
         if code in {401, 403}:

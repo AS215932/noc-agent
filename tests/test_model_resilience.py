@@ -1,3 +1,4 @@
+import httpx
 import copy
 
 import pytest
@@ -490,3 +491,26 @@ async def test_metrics_endpoint_exposes_model_metrics():
     assert "noc_agent_model_run_attempts_total" in body
     assert "noc_agent_openrouter_credit_probe_ok" in body
     assert response.media_type.startswith("text/plain")
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("httpx_error", [False, True])
+def test_payment_required_is_quota_without_backend_details(wrapped, httpx_error):
+    if httpx_error:
+        request = httpx.Request("POST", "https://provider.invalid/inference")
+        response = httpx.Response(402, request=request)
+        exc = httpx.HTTPStatusError("private account details", request=request, response=response)
+    else:
+        exc = ModelHTTPError(
+            402, "venice:deepseek-v4-flash",
+            body={"error": "private account details", "token": "fixture-secret"},
+        )
+    if wrapped:
+        exc = ExceptionGroup("model invocation failed", [exc])
+    safe = classify_exception(exc)
+    assert safe.category == "quota_exhausted"
+    assert "private account details" not in safe.discord_description("Triage")
+    assert "fixture-secret" not in safe.discord_description("Triage")
+    if not httpx_error:
+        assert safe.provider == "venice"
+        assert safe.model_name == "venice:deepseek-v4-flash"
