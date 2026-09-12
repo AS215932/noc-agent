@@ -157,6 +157,106 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
     assert failed_hs.severity == "MEDIUM" and "failed state within the last 2h" in failed_hs.summary
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job", ["blackbox-dns", "blackbox-icmp", "blackbox"])
+@pytest.mark.parametrize("instance,host", [("ns1.example:53", "ns1.example"),
+                                         ("[2001:db8::53]:53", "2001:db8::53"),
+                                         ("ns😀.example:53", "ns😀.example")])
+async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, host):
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(({"instance": instance, "job": job}, "5")),
+    })
+    hotspots = await scanner.rule_scrape_flap(_ctx(runtime))
+    assert len(hotspots) == 1
+    hotspot = hotspots[0]
+    assert hotspot.key == f"{host}:{job}"
+    assert hotspot.category == "scrape" and hotspot.severity == "MEDIUM"
+    assert hotspot.warrants_change is False
+    assert "collection health" in hotspot.summary
+    assert "does not establish" in hotspot.summary
+    assert any("probe_success" in check and "not necessarily the exporter" in check
+               for check in hotspot.recommended_checks)
+    assert not any("ns1.example exporter logs" in check for check in hotspot.recommended_checks)
+    assert len(runtime.calls) == 1  # No probe result was queried or invented.
+    from app.proactive.loop import _hotspot_field
+    field = _hotspot_field(hotspot)
+    assert "probe_success" in field["value"] and "up == 1" in field["value"]
+    assert f'instance="{instance}"' in field["value"]
+    assert f'job="{job}"' in field["value"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instance", ["https://example.test/" + "a" * 150,
+                                      "https://example.test/" + "a" * 500,
+                                      "https://example.test/a  b",
+                                      "https://example.test/a\u00a0b",
+                                      "https://user:dummy-password@example.test/health",
+                                      "https://example.test/health?api_key=dummy-key"])
+async def test_sanitized_blackbox_target_digest_never_contains_altered_selector(instance):
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(({"instance": instance, "job": "blackbox-http"}, "5")),
+    })
+    hotspot, = await scanner.rule_scrape_flap(_ctx(runtime))
+    from app.proactive.loop import _hotspot_field
+    rendered = _hotspot_field(hotspot)["value"]
+    assert "probe_success using exact job/instance labels from Prometheus Targets" in rendered
+    assert "up == 1" in rendered
+    assert "not necessarily the exporter" in rendered
+    assert "probe_success{" not in rendered
+    assert "dummy-password" not in rendered
+    assert "dummy-key" not in rendered
+    assert instance not in " ".join(hotspot.recommended_checks)
+    assert len(hotspot.recommended_checks[0]) <= 200
+
+
+@pytest.mark.asyncio
+async def test_url_probe_identities_remain_distinct_without_exposing_credentials():
+    instances = [
+        "http://api.example:8080/health",
+        "https://api.example:8443/health",
+        "https://api.example:8443/ready",
+        "https://api.example:8443/ready?api_key=dummy-key",
+        "https://user:dummy-password@api.example:8443/ready",
+    ]
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(*(
+            ({"instance": instance, "job": "blackbox-http"}, "5")
+            for instance in instances
+        )),
+    })
+    hotspots = await scanner.rule_scrape_flap(_ctx(runtime))
+    assert len({hotspot.fingerprint() for hotspot in hotspots}) == len(instances)
+    assert {hotspot.resource for hotspot in hotspots} == {"api.example"}
+    assert [hotspot.key for hotspot in hotspots] == [
+        hotspot.key for hotspot in await scanner.rule_scrape_flap(_ctx(runtime))
+    ]
+    import hashlib
+
+    from app.proactive.loop import _hotspot_field
+    for instance, hotspot in zip(instances, hotspots, strict=True):
+        rendered = _hotspot_field(hotspot)["value"]
+        assert hashlib.sha256(instance.encode("utf-8")).hexdigest() in rendered
+        assert "SHA-256 of exact UTF-8 instance" in rendered
+        assert "match target ID by SHA-256 hashing exact instance labels" in rendered
+        assert "dummy-key" not in hotspot.model_dump_json()
+        assert "dummy-password" not in hotspot.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job", ["node-infra", "blackbox-exporter", "blackbox-metrics"])
+async def test_node_scrape_flap_preserves_host_diagnostic_and_identity(job):
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(({"instance": "api:9100", "job": job}, "9")),
+    })
+    hotspot, = await scanner.rule_scrape_flap(_ctx(runtime))
+    assert hotspot.key == f"api:{job}"
+    assert hotspot.severity == "HIGH" and hotspot.resource == "api"
+    assert any("api exporter logs" in check for check in hotspot.recommended_checks)
+    assert not any("probe_success" in check for check in hotspot.recommended_checks)
+    from app.proactive.loop import _hotspot_field
+    assert "api exporter logs" in _hotspot_field(hotspot)["value"]
+
+
 def test_benign_unit_matcher_filters_known_noise():
     m = scanner._benign_unit_matcher()
     for unit in ("cloud-init-main.service", "cloud-init-network", "unbound-resolvconf.service", "openipmi", "cloud-final.service"):

@@ -16,15 +16,18 @@ via :meth:`MCPRuntime.call_tool`), wrapped so a single rule failure degrades to
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from app import log
 from app.config import ProactiveLoopSettings
 from app.graph.routing import instance_host
-from app.proactive.models import Hotspot, HotspotEvidence, Severity
+from app.proactive.models import Hotspot, HotspotEvidence, Severity, sanitize_label
 from app.safe_errors import classify_exception, log_exception
 
 
@@ -290,23 +293,66 @@ async def rule_disk_fill(ctx: ScanContext) -> list[Hotspot]:
 
 
 async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
-    """A scrape target flapping up/down (instability before a hard outage)."""
+    """Prometheus scrape availability changes, not proof of probe/service failure."""
     hotspots: list[Hotspot] = []
     for sample in await ctx.prom("changes(up[2h]) >= 4"):
-        host = instance_host(sample.labels.get("instance", "")) or sample.labels.get("instance", "target")
+        instance = sample.labels.get("instance", "")
+        host = instance_host(instance) or instance or "target"
+        identity = host
+        if "://" in instance:
+            # Opaque identity preserves distinct URL targets without publishing
+            # credentials or collapsing ports, paths, or query variants.
+            identity = "url-" + hashlib.sha256(instance.encode("utf-8")).hexdigest()
+            try:
+                host = urlsplit(instance).hostname or "URL target"
+            except ValueError:
+                host = "URL target"
         job = sample.labels.get("job", "")
         flaps = int(sample.value)
         sev: Severity = "HIGH" if flaps >= 8 else "MEDIUM"
+        blackbox = bool(re.fullmatch(
+            r"blackbox(?:-(?:dns|icmp|http|tcp|bgpalerter)(?:-.*)?)?", job
+        ))
+        exporter = "blackbox exporter" if blackbox else "exporter"
+        checks = [
+            f"correlate Prometheus scrape errors with {exporter} availability and maintenance",
+            f"check shared scraper/{exporter} resource pressure and scraper-to-exporter reachability",
+        ]
+        if blackbox:
+            probe_query = f"probe_success{{job={json.dumps(job, ensure_ascii=False)},instance={json.dumps(instance, ensure_ascii=False)}}}"
+            probe_check = (
+                f"compare {probe_query} when matching up == 1; "
+                "the instance label identifies the probe target, not necessarily the exporter"
+            )
+            # URL targets may carry credentials in userinfo, path, or query.
+            # Keep only non-URL selectors that downstream sanitization preserves
+            # exactly, including label whitespace and the length bound.
+            if "://" in instance or sanitize_label(probe_check, limit=200) != probe_check:
+                probe_check = (
+                    "compare probe_success using exact job/instance labels from Prometheus Targets "
+                    "when matching up == 1; instance is the probe target, not necessarily the exporter"
+                )
+            checks.insert(0, probe_check)
+        else:
+            checks.insert(0, f"check {host} exporter logs and host reboot/OOM history")
+        target_ref = ""
+        if "://" in instance:
+            target_ref = f"Target ID (SHA-256 of exact UTF-8 instance): {identity[4:]}. "
+            checks.insert(1, "match target ID by SHA-256 hashing exact instance labels from Prometheus Targets locally")
         hotspots.append(
             Hotspot(
                 rule_id="scrape_flap",
-                key=f"{host}:{job}",
+                key=f"{identity}:{job}",
                 category="scrape",
                 severity=sev,
                 score=(300.0 if sev == "HIGH" else 220.0),
                 title=f"Scrape target {host} flapping",
                 resource=host,
-                summary=f"Target {host} (job {job}) changed up/down {flaps} times in 2h.",
+                summary=(
+                    target_ref
+                    + f"Prometheus scrape availability for {host} (job {job}) changed {flaps} times in 2h. "
+                    "This measures collection health; it does not establish a DNS, BGP, or other service outage."
+                ),
                 evidence=[
                     HotspotEvidence(
                         label=f"up changes/2h {host}",
@@ -315,7 +361,7 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
                         threshold=">=4",
                     )
                 ],
-                recommended_checks=[f"check {host} resource pressure / exporter logs", "look for reboot/OOM/network blips"],
+                recommended_checks=checks,
                 suggested_specialist="infrastructure",
             )
         )
