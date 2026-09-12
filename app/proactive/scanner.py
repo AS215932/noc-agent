@@ -335,6 +335,10 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
             checks.insert(0, probe_check)
         else:
             checks.insert(0, f"check {host} exporter logs and host reboot/OOM history")
+        target_ref = ""
+        if "://" in instance:
+            target_ref = f"Target ID (SHA-256 of exact UTF-8 instance): {identity[4:]}. "
+            checks.insert(1, "match target ID by SHA-256 hashing exact instance labels from Prometheus Targets locally")
         hotspots.append(
             Hotspot(
                 rule_id="scrape_flap",
@@ -345,7 +349,8 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
                 title=f"Scrape target {host} flapping",
                 resource=host,
                 summary=(
-                    f"Prometheus scrape availability for {host} (job {job}) changed {flaps} times in 2h. "
+                    target_ref
+                    + f"Prometheus scrape availability for {host} (job {job}) changed {flaps} times in 2h. "
                     "This measures collection health; it does not establish a DNS, BGP, or other service outage."
                 ),
                 evidence=[

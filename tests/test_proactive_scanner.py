@@ -225,12 +225,19 @@ async def test_url_probe_identities_remain_distinct_without_exposing_credentials
         )),
     })
     hotspots = await scanner.rule_scrape_flap(_ctx(runtime))
-    assert len({hotspot.fingerprint for hotspot in hotspots}) == len(instances)
+    assert len({hotspot.fingerprint() for hotspot in hotspots}) == len(instances)
     assert {hotspot.resource for hotspot in hotspots} == {"api.example"}
     assert [hotspot.key for hotspot in hotspots] == [
         hotspot.key for hotspot in await scanner.rule_scrape_flap(_ctx(runtime))
     ]
-    for hotspot in hotspots:
+    import hashlib
+
+    from app.proactive.loop import _hotspot_field
+    for instance, hotspot in zip(instances, hotspots, strict=True):
+        rendered = _hotspot_field(hotspot)["value"]
+        assert hashlib.sha256(instance.encode("utf-8")).hexdigest() in rendered
+        assert "SHA-256 of exact UTF-8 instance" in rendered
+        assert "match target ID by SHA-256 hashing exact instance labels" in rendered
         assert "dummy-key" not in hotspot.model_dump_json()
         assert "dummy-password" not in hotspot.model_dump_json()
 
