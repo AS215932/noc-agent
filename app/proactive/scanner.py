@@ -16,6 +16,7 @@ via :meth:`MCPRuntime.call_tool`), wrapped so a single rule failure degrades to
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -297,7 +298,11 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
     for sample in await ctx.prom("changes(up[2h]) >= 4"):
         instance = sample.labels.get("instance", "")
         host = instance_host(instance) or instance or "target"
+        identity = host
         if "://" in instance:
+            # Opaque identity preserves distinct URL targets without publishing
+            # credentials or collapsing ports, paths, or query variants.
+            identity = "url-" + hashlib.sha256(instance.encode("utf-8")).hexdigest()
             try:
                 host = urlsplit(instance).hostname or "URL target"
             except ValueError:
@@ -333,7 +338,7 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
         hotspots.append(
             Hotspot(
                 rule_id="scrape_flap",
-                key=f"{host}:{job}",
+                key=f"{identity}:{job}",
                 category="scrape",
                 severity=sev,
                 score=(300.0 if sev == "HIGH" else 220.0),

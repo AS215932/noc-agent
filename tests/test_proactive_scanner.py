@@ -210,6 +210,32 @@ async def test_sanitized_blackbox_target_digest_never_contains_altered_selector(
 
 
 @pytest.mark.asyncio
+async def test_url_probe_identities_remain_distinct_without_exposing_credentials():
+    instances = [
+        "http://api.example:8080/health",
+        "https://api.example:8443/health",
+        "https://api.example:8443/ready",
+        "https://api.example:8443/ready?api_key=dummy-key",
+        "https://user:dummy-password@api.example:8443/ready",
+    ]
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(*(
+            ({"instance": instance, "job": "blackbox-http"}, "5")
+            for instance in instances
+        )),
+    })
+    hotspots = await scanner.rule_scrape_flap(_ctx(runtime))
+    assert len({hotspot.fingerprint for hotspot in hotspots}) == len(instances)
+    assert {hotspot.resource for hotspot in hotspots} == {"api.example"}
+    assert [hotspot.key for hotspot in hotspots] == [
+        hotspot.key for hotspot in await scanner.rule_scrape_flap(_ctx(runtime))
+    ]
+    for hotspot in hotspots:
+        assert "dummy-key" not in hotspot.model_dump_json()
+        assert "dummy-password" not in hotspot.model_dump_json()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("job", ["node-infra", "blackbox-exporter", "blackbox-metrics"])
 async def test_node_scrape_flap_preserves_host_diagnostic_and_identity(job):
     runtime = FakeMCPRuntime({
