@@ -175,6 +175,9 @@ async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job):
                for check in hotspot.recommended_checks)
     assert not any("ns1.example exporter logs" in check for check in hotspot.recommended_checks)
     assert len(runtime.calls) == 1  # No probe result was queried or invented.
+    from app.proactive.loop import _hotspot_field
+    field = _hotspot_field(hotspot)
+    assert "probe_success" in field["value"] and "up == 1" in field["value"]
 
 
 @pytest.mark.asyncio
@@ -187,6 +190,8 @@ async def test_node_scrape_flap_preserves_host_diagnostic_and_identity():
     assert hotspot.severity == "HIGH" and hotspot.resource == "api"
     assert any("api exporter logs" in check for check in hotspot.recommended_checks)
     assert not any("probe_success" in check for check in hotspot.recommended_checks)
+    from app.proactive.loop import _hotspot_field
+    assert "api exporter logs" in _hotspot_field(hotspot)["value"]
 
 
 def test_benign_unit_matcher_filters_known_noise():

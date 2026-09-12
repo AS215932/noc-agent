@@ -304,12 +304,12 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
             f"check shared scraper/{exporter} resource pressure and scraper-to-exporter reachability",
         ]
         if blackbox:
-            checks.append(
-                "compare probe_success for the same job and instance when up == 1; "
+            checks.insert(
+                0, "compare probe_success for the same job and instance when up == 1; "
                 "the instance label identifies the probe target, not necessarily the exporter"
             )
         else:
-            checks.append(f"check {host} exporter logs and host reboot/OOM history")
+            checks.insert(0, f"check {host} exporter logs and host reboot/OOM history")
         hotspots.append(
             Hotspot(
                 rule_id="scrape_flap",
