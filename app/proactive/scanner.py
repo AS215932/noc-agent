@@ -290,13 +290,24 @@ async def rule_disk_fill(ctx: ScanContext) -> list[Hotspot]:
 
 
 async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
-    """A scrape target flapping up/down (instability before a hard outage)."""
+    """Prometheus scrape availability changes, not proof of probe/service failure."""
     hotspots: list[Hotspot] = []
     for sample in await ctx.prom("changes(up[2h]) >= 4"):
         host = instance_host(sample.labels.get("instance", "")) or sample.labels.get("instance", "target")
         job = sample.labels.get("job", "")
         flaps = int(sample.value)
         sev: Severity = "HIGH" if flaps >= 8 else "MEDIUM"
+        checks = [
+            "correlate Prometheus scrape errors with exporter availability and maintenance",
+            "check shared scraper/exporter resource pressure and network reachability",
+        ]
+        if job == "blackbox" or job.startswith("blackbox-"):
+            checks.append(
+                "compare probe_success for the same job and instance during successful scrapes; "
+                "the instance label identifies the probe target, not necessarily the exporter"
+            )
+        else:
+            checks.append(f"check {host} exporter logs and host reboot/OOM history")
         hotspots.append(
             Hotspot(
                 rule_id="scrape_flap",
@@ -306,7 +317,10 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
                 score=(300.0 if sev == "HIGH" else 220.0),
                 title=f"Scrape target {host} flapping",
                 resource=host,
-                summary=f"Target {host} (job {job}) changed up/down {flaps} times in 2h.",
+                summary=(
+                    f"Prometheus scrape availability for {host} (job {job}) changed {flaps} times in 2h. "
+                    "This measures collection health; it does not establish a DNS, BGP, or other service outage."
+                ),
                 evidence=[
                     HotspotEvidence(
                         label=f"up changes/2h {host}",
@@ -315,7 +329,7 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
                         threshold=">=4",
                     )
                 ],
-                recommended_checks=[f"check {host} resource pressure / exporter logs", "look for reboot/OOM/network blips"],
+                recommended_checks=checks,
                 suggested_specialist="infrastructure",
             )
         )

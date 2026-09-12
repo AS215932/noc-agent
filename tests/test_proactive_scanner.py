@@ -157,6 +157,38 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
     assert failed_hs.severity == "MEDIUM" and "failed state within the last 2h" in failed_hs.summary
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job", ["blackbox-dns", "blackbox-icmp", "blackbox"])
+async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job):
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(({"instance": "ns1.example:53", "job": job}, "5")),
+    })
+    hotspots = await scanner.rule_scrape_flap(_ctx(runtime))
+    assert len(hotspots) == 1
+    hotspot = hotspots[0]
+    assert hotspot.key == f"ns1.example:{job}"
+    assert hotspot.category == "scrape" and hotspot.severity == "MEDIUM"
+    assert hotspot.warrants_change is False
+    assert "collection health" in hotspot.summary
+    assert "does not establish" in hotspot.summary
+    assert any("probe_success" in check and "not necessarily the exporter" in check
+               for check in hotspot.recommended_checks)
+    assert not any("ns1.example exporter logs" in check for check in hotspot.recommended_checks)
+    assert len(runtime.calls) == 1  # No probe result was queried or invented.
+
+
+@pytest.mark.asyncio
+async def test_node_scrape_flap_preserves_host_diagnostic_and_identity():
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(({"instance": "api:9100", "job": "node-infra"}, "9")),
+    })
+    hotspot, = await scanner.rule_scrape_flap(_ctx(runtime))
+    assert hotspot.key == "api:node-infra"
+    assert hotspot.severity == "HIGH" and hotspot.resource == "api"
+    assert any("api exporter logs" in check for check in hotspot.recommended_checks)
+    assert not any("probe_success" in check for check in hotspot.recommended_checks)
+
+
 def test_benign_unit_matcher_filters_known_noise():
     m = scanner._benign_unit_matcher()
     for unit in ("cloud-init-main.service", "cloud-init-network", "unbound-resolvconf.service", "openipmi", "cloud-final.service"):
