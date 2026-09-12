@@ -187,8 +187,10 @@ async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("instance", ["https://example.test/" + "a" * 150,
-                                      "https://example.test/" + "a" * 500])
-async def test_long_blackbox_target_digest_never_contains_truncated_selector(instance):
+                                      "https://example.test/" + "a" * 500,
+                                      "https://example.test/a  b",
+                                      "https://example.test/a\u00a0b"])
+async def test_sanitized_blackbox_target_digest_never_contains_altered_selector(instance):
     runtime = FakeMCPRuntime({
         "changes(up[2h])": _vector(({"instance": instance, "job": "blackbox-http"}, "5")),
     })

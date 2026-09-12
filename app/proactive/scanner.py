@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable
 from app import log
 from app.config import ProactiveLoopSettings
 from app.graph.routing import instance_host
-from app.proactive.models import Hotspot, HotspotEvidence, Severity
+from app.proactive.models import Hotspot, HotspotEvidence, Severity, sanitize_label
 from app.safe_errors import classify_exception, log_exception
 
 
@@ -313,9 +313,9 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
                 f"compare {probe_query} when matching up == 1; "
                 "the instance label identifies the probe target, not necessarily the exporter"
             )
-            # Hotspot bounds each check to 200 characters. Never publish a
-            # selector that this bound would cut inside a quoted label value.
-            if len(probe_check) > 200:
+            # Keep a selector only if downstream text sanitization preserves
+            # it exactly, including label whitespace and the length bound.
+            if sanitize_label(probe_check, limit=200) != probe_check:
                 probe_check = (
                     "compare probe_success using exact job/instance labels from Prometheus Targets "
                     "when matching up == 1; instance is the probe target, not necessarily the exporter"
