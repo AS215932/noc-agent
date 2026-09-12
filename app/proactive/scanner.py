@@ -16,6 +16,7 @@ via :meth:`MCPRuntime.call_tool`), wrapped so a single rule failure degrades to
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -293,7 +294,8 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
     """Prometheus scrape availability changes, not proof of probe/service failure."""
     hotspots: list[Hotspot] = []
     for sample in await ctx.prom("changes(up[2h]) >= 4"):
-        host = instance_host(sample.labels.get("instance", "")) or sample.labels.get("instance", "target")
+        instance = sample.labels.get("instance", "")
+        host = instance_host(instance) or instance or "target"
         job = sample.labels.get("job", "")
         flaps = int(sample.value)
         sev: Severity = "HIGH" if flaps >= 8 else "MEDIUM"
@@ -304,8 +306,9 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
             f"check shared scraper/{exporter} resource pressure and scraper-to-exporter reachability",
         ]
         if blackbox:
+            probe_query = f"probe_success{{job={json.dumps(job)},instance={json.dumps(instance)}}}"
             checks.insert(
-                0, "compare probe_success for the same job and instance when up == 1; "
+                0, f"compare {probe_query} when matching up == 1; "
                 "the instance label identifies the probe target, not necessarily the exporter"
             )
         else:

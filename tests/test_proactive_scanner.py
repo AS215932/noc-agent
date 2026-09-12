@@ -159,14 +159,16 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job", ["blackbox-dns", "blackbox-icmp", "blackbox"])
-async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job):
+@pytest.mark.parametrize("instance,host", [("ns1.example:53", "ns1.example"),
+                                         ("[2001:db8::53]:53", "2001:db8::53")])
+async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, host):
     runtime = FakeMCPRuntime({
-        "changes(up[2h])": _vector(({"instance": "ns1.example:53", "job": job}, "5")),
+        "changes(up[2h])": _vector(({"instance": instance, "job": job}, "5")),
     })
     hotspots = await scanner.rule_scrape_flap(_ctx(runtime))
     assert len(hotspots) == 1
     hotspot = hotspots[0]
-    assert hotspot.key == f"ns1.example:{job}"
+    assert hotspot.key == f"{host}:{job}"
     assert hotspot.category == "scrape" and hotspot.severity == "MEDIUM"
     assert hotspot.warrants_change is False
     assert "collection health" in hotspot.summary
@@ -178,6 +180,8 @@ async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job):
     from app.proactive.loop import _hotspot_field
     field = _hotspot_field(hotspot)
     assert "probe_success" in field["value"] and "up == 1" in field["value"]
+    assert f'instance="{instance}"' in field["value"]
+    assert f'job="{job}"' in field["value"]
 
 
 @pytest.mark.asyncio
