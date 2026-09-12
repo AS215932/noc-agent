@@ -185,6 +185,23 @@ async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("instance", ["https://example.test/" + "a" * 150,
+                                      "https://example.test/" + "a" * 500])
+async def test_long_blackbox_target_digest_never_contains_truncated_selector(instance):
+    runtime = FakeMCPRuntime({
+        "changes(up[2h])": _vector(({"instance": instance, "job": "blackbox-http"}, "5")),
+    })
+    hotspot, = await scanner.rule_scrape_flap(_ctx(runtime))
+    from app.proactive.loop import _hotspot_field
+    rendered = _hotspot_field(hotspot)["value"]
+    assert "probe_success using exact job/instance labels from Prometheus Targets" in rendered
+    assert "up == 1" in rendered
+    assert "not necessarily the exporter" in rendered
+    assert "probe_success{" not in rendered
+    assert len(hotspot.recommended_checks[0]) <= 200
+
+
+@pytest.mark.asyncio
 async def test_node_scrape_flap_preserves_host_diagnostic_and_identity():
     runtime = FakeMCPRuntime({
         "changes(up[2h])": _vector(({"instance": "api:9100", "job": "node-infra"}, "9")),

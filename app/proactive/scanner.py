@@ -307,10 +307,18 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
         ]
         if blackbox:
             probe_query = f"probe_success{{job={json.dumps(job)},instance={json.dumps(instance)}}}"
-            checks.insert(
-                0, f"compare {probe_query} when matching up == 1; "
+            probe_check = (
+                f"compare {probe_query} when matching up == 1; "
                 "the instance label identifies the probe target, not necessarily the exporter"
             )
+            # Hotspot bounds each check to 200 characters. Never publish a
+            # selector that this bound would cut inside a quoted label value.
+            if len(probe_check) > 200:
+                probe_check = (
+                    "compare probe_success using exact job/instance labels from Prometheus Targets "
+                    "when matching up == 1; instance is the probe target, not necessarily the exporter"
+                )
+            checks.insert(0, probe_check)
         else:
             checks.insert(0, f"check {host} exporter logs and host reboot/OOM history")
         hotspots.append(
