@@ -161,7 +161,7 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
 @pytest.mark.parametrize("job", ["blackbox-dns", "blackbox-icmp", "blackbox"])
 @pytest.mark.parametrize("instance,host", [("ns1.example:53", "ns1.example"),
                                          ("[2001:db8::53]:53", "2001:db8::53"),
-                                         ("https://example.test/😀", "https")])
+                                         ("ns😀.example:53", "ns😀.example")])
 async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, host):
     runtime = FakeMCPRuntime({
         "changes(up[2h])": _vector(({"instance": instance, "job": job}, "5")),
@@ -189,7 +189,9 @@ async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, 
 @pytest.mark.parametrize("instance", ["https://example.test/" + "a" * 150,
                                       "https://example.test/" + "a" * 500,
                                       "https://example.test/a  b",
-                                      "https://example.test/a\u00a0b"])
+                                      "https://example.test/a\u00a0b",
+                                      "https://user:dummy-password@example.test/health",
+                                      "https://example.test/health?api_key=dummy-key"])
 async def test_sanitized_blackbox_target_digest_never_contains_altered_selector(instance):
     runtime = FakeMCPRuntime({
         "changes(up[2h])": _vector(({"instance": instance, "job": "blackbox-http"}, "5")),
@@ -201,6 +203,9 @@ async def test_sanitized_blackbox_target_digest_never_contains_altered_selector(
     assert "up == 1" in rendered
     assert "not necessarily the exporter" in rendered
     assert "probe_success{" not in rendered
+    assert "dummy-password" not in rendered
+    assert "dummy-key" not in rendered
+    assert instance not in " ".join(hotspot.recommended_checks)
     assert len(hotspot.recommended_checks[0]) <= 200
 
 

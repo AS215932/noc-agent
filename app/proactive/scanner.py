@@ -21,6 +21,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from app import log
 from app.config import ProactiveLoopSettings
@@ -296,6 +297,11 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
     for sample in await ctx.prom("changes(up[2h]) >= 4"):
         instance = sample.labels.get("instance", "")
         host = instance_host(instance) or instance or "target"
+        if "://" in instance:
+            try:
+                host = urlsplit(instance).hostname or "URL target"
+            except ValueError:
+                host = "URL target"
         job = sample.labels.get("job", "")
         flaps = int(sample.value)
         sev: Severity = "HIGH" if flaps >= 8 else "MEDIUM"
@@ -313,9 +319,10 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
                 f"compare {probe_query} when matching up == 1; "
                 "the instance label identifies the probe target, not necessarily the exporter"
             )
-            # Keep a selector only if downstream text sanitization preserves
-            # it exactly, including label whitespace and the length bound.
-            if sanitize_label(probe_check, limit=200) != probe_check:
+            # URL targets may carry credentials in userinfo, path, or query.
+            # Keep only non-URL selectors that downstream sanitization preserves
+            # exactly, including label whitespace and the length bound.
+            if "://" in instance or sanitize_label(probe_check, limit=200) != probe_check:
                 probe_check = (
                     "compare probe_success using exact job/instance labels from Prometheus Targets "
                     "when matching up == 1; instance is the probe target, not necessarily the exporter"
