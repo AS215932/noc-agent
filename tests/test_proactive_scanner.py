@@ -160,7 +160,8 @@ async def test_scrape_flap_and_service_churn_and_failed_unit():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job", ["blackbox-dns", "blackbox-icmp", "blackbox"])
 @pytest.mark.parametrize("instance,host", [("ns1.example:53", "ns1.example"),
-                                         ("[2001:db8::53]:53", "2001:db8::53")])
+                                         ("[2001:db8::53]:53", "2001:db8::53"),
+                                         ("https://example.test/😀", "https")])
 async def test_blackbox_scrape_flap_does_not_infer_probe_failure(job, instance, host):
     runtime = FakeMCPRuntime({
         "changes(up[2h])": _vector(({"instance": instance, "job": job}, "5")),
@@ -202,12 +203,13 @@ async def test_long_blackbox_target_digest_never_contains_truncated_selector(ins
 
 
 @pytest.mark.asyncio
-async def test_node_scrape_flap_preserves_host_diagnostic_and_identity():
+@pytest.mark.parametrize("job", ["node-infra", "blackbox-exporter", "blackbox-metrics"])
+async def test_node_scrape_flap_preserves_host_diagnostic_and_identity(job):
     runtime = FakeMCPRuntime({
-        "changes(up[2h])": _vector(({"instance": "api:9100", "job": "node-infra"}, "9")),
+        "changes(up[2h])": _vector(({"instance": "api:9100", "job": job}, "9")),
     })
     hotspot, = await scanner.rule_scrape_flap(_ctx(runtime))
-    assert hotspot.key == "api:node-infra"
+    assert hotspot.key == f"api:{job}"
     assert hotspot.severity == "HIGH" and hotspot.resource == "api"
     assert any("api exporter logs" in check for check in hotspot.recommended_checks)
     assert not any("probe_success" in check for check in hotspot.recommended_checks)
