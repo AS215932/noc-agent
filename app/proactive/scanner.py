@@ -297,13 +297,15 @@ async def rule_scrape_flap(ctx: ScanContext) -> list[Hotspot]:
         job = sample.labels.get("job", "")
         flaps = int(sample.value)
         sev: Severity = "HIGH" if flaps >= 8 else "MEDIUM"
+        blackbox = job == "blackbox" or job.startswith("blackbox-")
+        exporter = "blackbox exporter" if blackbox else "exporter"
         checks = [
-            "correlate Prometheus scrape errors with exporter availability and maintenance",
-            "check shared scraper/exporter resource pressure and network reachability",
+            f"correlate Prometheus scrape errors with {exporter} availability and maintenance",
+            f"check shared scraper/{exporter} resource pressure and scraper-to-exporter reachability",
         ]
-        if job == "blackbox" or job.startswith("blackbox-"):
+        if blackbox:
             checks.append(
-                "compare probe_success for the same job and instance during successful scrapes; "
+                "compare probe_success for the same job and instance when up == 1; "
                 "the instance label identifies the probe target, not necessarily the exporter"
             )
         else:
