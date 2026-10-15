@@ -15,10 +15,16 @@ concurrency:
 jobs:
   test:
     name: test
-    runs-on: [self-hosted, linux, x64, hyrule-public-pr]
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+
+        with:
+
+          python-version: '3.14'
 
       - name: Install uv
         run: |

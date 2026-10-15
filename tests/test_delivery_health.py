@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -60,6 +61,9 @@ async def test_health_endpoint_detects_stuck_running_task(monkeypatch):
     import app.main as main
 
     state = runtime()
+    # Real monotonic clock: make the worker look old regardless of host uptime
+    # (fresh GitHub-hosted VMs have a small monotonic clock).
+    state.started_monotonic = time.monotonic() - 10_000
     monkeypatch.setattr(main, "case_service_runtime", state)
     monkeypatch.setenv("NOC_CASE_OUTBOX_ENABLED", "1")
 
